@@ -89,7 +89,7 @@ class SRDiffusionConfig(PretrainedConfig):
                 "initializer_range": 0.02,
                 "layer_norm_eps": 1e-06,
                 "layerscale_value": 1.0,
-                "mlp_ratio": 4.0,
+                "mlp_ratio": 4,
                 "num_attention_heads": 24,
                 "num_channels": 3,
                 "num_hidden_layers": 40,
@@ -296,8 +296,20 @@ class DinoEncoder(nn.Module):
     ) -> Tensor:
         B = lr_flat.size(0)
 
+        # Handle variable image sizes — interpolate eig_tokens to match eig_proj
+        H_actual = eig_tokens.size(2)
+        H_expected = self.eig_proj.in_features
+        if H_actual != H_expected:
+            B_eig, N_eig = eig_tokens.shape[0], eig_tokens.shape[1]
+            eig_tokens = eig_tokens.reshape(B_eig * N_eig, 1, H_actual)
+            eig_tokens = F.interpolate(
+                eig_tokens, size=H_expected,
+                mode="linear", align_corners=False
+            )
+            eig_tokens = eig_tokens.reshape(B_eig, N_eig, H_expected)
+
         lr_tok = self.tok_proj(lr_flat).unsqueeze(1)     # (B, 1, H)
-        eig_tok = self.eig_proj(eig_tokens)               # (B, N, H)
+        eig_tok = self.eig_proj(eig_tokens)               # (B, N, H_expected)
         tokens = torch.cat([lr_tok, eig_tok], dim=1)     # (B, 1+N, H)
 
         cls_tok = self.cls.expand(B, -1, -1)
@@ -407,9 +419,18 @@ class SRDiffusion(PreTrainedModel):
     """
     config_class = SRDiffusionConfig
 
+    # ── PreTrainedModel compatibility helpers ──
+    @property
+    def _tied_weights_keys(self):
+        return []
+
     def __init__(self, config: SRDiffusionConfig):
         super().__init__(config)
         self.config = config
+
+        # Ensure all_tied_weights_keys exists (compat with transformers 5.x)
+        if not hasattr(self, 'all_tied_weights_keys') or self.all_tied_weights_keys is None:
+            self.all_tied_weights_keys = {}
 
         # ── 注册 noise schedule buffers — 保证 save/load 一致 ──
         betas = torch.linspace(
@@ -534,7 +555,14 @@ class SRDiffusion(PreTrainedModel):
     def forward(self, hr: Tensor, return_dict: bool = True, **kwargs):
         """Training forward: hr (B,3,H,W) → {loss, pred, noise}"""
         B, device = hr.size(0), hr.device
-        cfg = self.config  # 之前写成了 self.cfg — fixed
+        cfg = self.config
+
+        # Resize input to expected resolution if needed
+        if hr.shape[2] != cfg.image_size or hr.shape[3] != cfg.image_size:
+            hr = F.interpolate(
+                hr, size=(cfg.image_size, cfg.image_size),
+                mode="bicubic", align_corners=False
+            )
 
         # ── 1. SVD tokens via DINOv2 ──
         lr_flat, eig_tokens, n_list = build_tokens(
@@ -582,7 +610,14 @@ class SRDiffusion(PreTrainedModel):
     def sample(self, hr: Tensor, steps: int = 25) -> Tensor:
         """DDIM sampling for inference."""
         B, device = hr.size(0), hr.device
-        cfg = self.config  # 之前写成了 self.cfg — fixed
+        cfg = self.config
+
+        # Resize input to expected resolution if needed
+        if hr.shape[2] != cfg.image_size or hr.shape[3] != cfg.image_size:
+            hr = F.interpolate(
+                hr, size=(cfg.image_size, cfg.image_size),
+                mode="bicubic", align_corners=False
+            )
 
         lr_flat, eig_tokens, n_list = build_tokens(
             hr, cfg.lr_size, cfg.energy_threshold, cfg.max_eig, cfg.min_eig,
