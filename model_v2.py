@@ -63,82 +63,92 @@ class SRDiffusionConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
 
-        # ── DINOv2-giant 默认配置 ──
+        # ── DINOv2-giant 默认配置（对齐实际 config.json）──
         if dino is None:
             dino = {
                 "model_id": "dinov2-giant",
-                "hidden_size": 1536,
-                "num_hidden_layers": 40,
-                "num_attention_heads": 24,
-                "mlp_ratio": 4.0,
-                "image_size": 224,
-                "patch_size": 14,
-                "num_channels": 3,
-                "qkv_bias": True,
-                "layer_norm_eps": 1e-6,
-                "hidden_act": "gelu",
-                "use_swiglu_ffn": False,
-                "apply_layernorm": True,
+                "attention_probs_dropout_prob": 0.0,
                 "drop_path_rate": 0.0,
+                "hidden_act": "gelu",
+                "hidden_dropout_prob": 0.0,
+                "hidden_size": 1536,
+                "image_size": 518,
+                "initializer_range": 0.02,
+                "layer_norm_eps": 1e-06,
+                "layerscale_value": 1.0,
+                "mlp_ratio": 4.0,
+                "num_attention_heads": 24,
+                "num_channels": 3,
+                "num_hidden_layers": 40,
+                "patch_size": 14,
+                "qkv_bias": True,
+                "use_swiglu_ffn": True,
             }
         self.dino = dino
 
-        # ── SD 2.1 U-Net 默认配置 ──
+        # ── SD 2.1 U-Net 默认配置（对齐实际 config.json）──
         if sd_unet is None:
             sd_unet = {
                 "model_id": "stabilityai/stable-diffusion-2-1",
-                "in_channels": 4,
-                "out_channels": 4,
-                "cross_attention_dim": 1024,
+                "act_fn": "silu",
+                "attention_head_dim": [5, 10, 20, 20],
                 "block_out_channels": [320, 640, 1280, 1280],
-                "layers_per_block": 2,
+                "center_input_sample": False,
+                "cross_attention_dim": 1024,
                 "down_block_types": [
                     "CrossAttnDownBlock2D",
                     "CrossAttnDownBlock2D",
                     "CrossAttnDownBlock2D",
                     "DownBlock2D",
                 ],
+                "downsample_padding": 1,
+                "dual_cross_attention": False,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "in_channels": 4,
+                "layers_per_block": 2,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-05,
+                "norm_num_groups": 32,
+                "num_class_embeds": None,
+                "only_cross_attention": False,
+                "out_channels": 4,
+                "sample_size": 96,
                 "up_block_types": [
                     "UpBlock2D",
                     "CrossAttnUpBlock2D",
                     "CrossAttnUpBlock2D",
                     "CrossAttnUpBlock2D",
                 ],
-                "attention_head_dim": [5, 10, 20, 20],
-                "norm_num_groups": 32,
-                "sample_size": 128,
-                "act_fn": "silu",
-                "center_input_sample": False,
-                "conv_in_kernel": 3,
-                "conv_out_kernel": 3,
-                "dropout": 0.0,
-                "flip_sin_to_cos": True,
-                "freq_shift": 0,
-                "mid_block_scale_factor": 1,
-                "norm_eps": 1e-5,
-                "only_cross_attention": [False, False, False, True],
-                "resnet_time_scale_shift": "default",
-                "time_embedding_type": "positional",
-                "transformer_layers_per_block": 1,
-                "upcast_attention": False,
-                "use_linear_projection": False,
+                "use_linear_projection": True,
+                "upcast_attention": True,
             }
         self.sd_unet = sd_unet
 
-        # ── SD 2.1 VAE 默认配置 ──
+        # ── SD 2.1 VAE 默认配置（对齐实际 config.json）──
         if sd_vae is None:
             sd_vae = {
                 "model_id": "stabilityai/stable-diffusion-2-1",
-                "in_channels": 3,
-                "out_channels": 3,
-                "latent_channels": 4,
-                "block_out_channels": [128, 256, 512, 512],
-                "layers_per_block": 2,
-                "sample_size": 1024,
-                "scaling_factor": 0.18215,
                 "act_fn": "silu",
+                "block_out_channels": [128, 256, 512, 512],
+                "down_block_types": [
+                    "DownEncoderBlock2D",
+                    "DownEncoderBlock2D",
+                    "DownEncoderBlock2D",
+                    "DownEncoderBlock2D",
+                ],
+                "in_channels": 3,
+                "latent_channels": 4,
+                "layers_per_block": 2,
                 "norm_num_groups": 32,
-                "force_upcast": True,
+                "out_channels": 3,
+                "sample_size": 768,
+                "up_block_types": [
+                    "UpDecoderBlock2D",
+                    "UpDecoderBlock2D",
+                    "UpDecoderBlock2D",
+                    "UpDecoderBlock2D",
+                ],
             }
         self.sd_vae = sd_vae
 
