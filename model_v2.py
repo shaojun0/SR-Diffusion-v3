@@ -317,7 +317,17 @@ class SRDiffusion(nn.Module):
         # ── 4. U-Net predict noise ──
         pred = self.decoder(noisy, cond, t, cross)
 
-        return F.mse_loss(pred, noise), pred, noise
+        # ── 5. Loss: ε-MSE + latent KL constraint ──
+        loss_noise = F.mse_loss(pred, noise)
+
+        # x₀ prediction from noise → KL-style latent reconstruction
+        alpha_bar = self.noise_schedule.alphas_cumprod[t].to(device).view(-1, 1, 1, 1)
+        x0_pred = (noisy - (1.0 - alpha_bar).sqrt() * pred) / alpha_bar.sqrt().clamp(min=1e-8)
+        loss_recon = F.mse_loss(x0_pred, hr_z)  # VAE latent KL constraint
+
+        loss = loss_noise + loss_recon * 0.5
+
+        return loss, pred, noise
 
     @torch.no_grad()
     def sample(self, hr: Tensor, steps: int = 25) -> Tensor:
