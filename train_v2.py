@@ -13,12 +13,11 @@ Pipeline:
 import os, sys
 import torch
 import bitsandbytes as bnb
-from accelerate import Accelerator
-from torch.utils.data import Dataset, DataLoader
+from transformers import Trainer, TrainingArguments
+from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
 from glob import glob
-from tqdm.auto import tqdm
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -78,21 +77,20 @@ class HRDataset(Dataset):
         img  = img.crop((left, top, left + self.size, top + self.size))
         return transforms.ToTensor()(img) * 2.0 - 1.0  # → [-1, 1]
 
+def collate_fn(batch):
+    return {"hr": torch.stack(batch, dim=0)}
+
 # ── Model ──────────────────────────────────────────────────────
 model = build_model(cfg)
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"  [Train] Trainable params: {trainable/1e9:.2f}B")
 
-# ── DataLoader ─────────────────────────────────────────────────
-dataset = HRDataset(DATA_DIR, cfg.image_size)
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=True,
-)
+# HF Trainer expects forward → {"loss": ...}
+_orig_forward = type(model).forward
+model.forward = lambda hr, labels=None, **kw: {"loss": _orig_forward(model, hr)[0]}
+
+# ── Dataset ────────────────────────────────────────────────────
+train_dataset = HRDataset(DATA_DIR, cfg.image_size)
 
 # ── Optimizer & Scheduler ──────────────────────────────────────
 opt = bnb.optim.AdamW8bit(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -100,63 +98,37 @@ sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
     opt, T_0=T0, T_mult=2, eta_min=LR * 0.01
 )
 
-# ── Accelerator (handles device, grad_accum, backward) ─────────
-accelerator = Accelerator(
-    gradient_accumulation_steps=GRAD_ACCUM,
-    mixed_precision="no",
-)
-model, opt, loader, sched = accelerator.prepare(model, opt, loader, sched)
-
 # ── Training ───────────────────────────────────────────────────
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    learning_rate=LR,
+    num_train_epochs=EPOCHS,
+    logging_steps=1,
+    save_steps=SAVE_EVERY,
+    save_total_limit=3,
+    max_grad_norm=MAX_GRAD_NORM,
+    weight_decay=WEIGHT_DECAY,
+    fp16=False,
+    dataloader_num_workers=NUM_WORKERS,
+    remove_unused_columns=False,
+    report_to="none",
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    data_collator=collate_fn,
+    optimizers=(opt, sched),
+)
+
 if __name__ == "__main__":
     print(f"\n{'='*60}")
-    print(f"Training: {len(dataset)} imgs | BS={BATCH_SIZE}×{GRAD_ACCUM} | LR={LR}")
+    print(f"Training: {len(train_dataset)} imgs | BS={BATCH_SIZE}×{GRAD_ACCUM} | LR={LR}")
     print(f"Resolution: {cfg.image_size}² | max_eig: {cfg.max_eig} | fp32")
     print(f"{'='*60}\n")
-
-    best_loss = float("inf")
-    step = 0
-
-    for epoch in range(EPOCHS):
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-        for hr in pbar:
-            with accelerator.accumulate(model):
-                loss, _, _ = model(hr)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-                opt.step()
-                sched.step()
-                opt.zero_grad()
-
-            if accelerator.sync_gradients:
-                step += 1
-                loss_val = loss.detach().item()
-                pbar.set_postfix(loss=f"{loss_val:.4f}", step=step)
-
-                # ── Best checkpoint ──
-                if loss_val < best_loss:
-                    best_loss = loss_val
-                    accelerator.save(
-                        accelerator.unwrap_model(model).state_dict(),
-                        os.path.join(OUTPUT_DIR, "best.pt"),
-                    )
-                    if accelerator.is_main_process:
-                        print(f"  best={best_loss:.6f} @ step {step}")
-
-                # ── Periodic checkpoint ──
-                if step % SAVE_EVERY == 0:
-                    accelerator.save(
-                        {
-                            "model": accelerator.unwrap_model(model).state_dict(),
-                            "optimizer": opt.state_dict(),
-                            "scheduler": sched.state_dict(),
-                            "step": step,
-                            "epoch": epoch,
-                            "best_loss": best_loss,
-                        },
-                        os.path.join(OUTPUT_DIR, f"ckpt_step{step}.pt"),
-                    )
-
-    accelerator.end_training()
+    trainer.train()
+    trainer.save_model(OUTPUT_DIR)
     print("Training complete.")
