@@ -15,7 +15,7 @@ from glob import glob
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
-from model_v2 import Config, build_model
+from model_v2 import SRDiffusionConfig as Config, build_model
 
 DATA_DIR      = "/root/autodl-tmp/DIV2K/HighResolution/DIV2K_train_HR"
 OUTPUT_DIR    = "/root/autodl-tmp/sr_diffusion_output"

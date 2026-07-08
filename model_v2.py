@@ -9,7 +9,7 @@ Pipeline:
   5. Loss: ε-MSE + 0.5·x₀-MSE — noise pred + latent KL constraint
 
 全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
-skip_pretrained=True → 从 config 创建空架构，靠 checkpoint 恢复权重。
+支持 AutoModel 加载: AutoModel.from_pretrained("path", trust_remote_code=True)
 """
 
 import os
@@ -17,45 +17,78 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from transformers import PreTrainedModel, PretrainedConfig
 
 
 # ═══════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════
 
-class Config:
+class SRDiffusionConfig(PretrainedConfig):
     """训练超参 & 模型结构参数"""
+    model_type = "sr_diffusion_v2"
 
-    # ── Paths ──
-    dino_dir: str = "dinov2-giant"
-    sd_model_id: str = "stabilityai/stable-diffusion-2-1"
+    def __init__(
+        self,
+        # ── Paths ──
+        dino_dir: str = "dinov2-giant",
+        sd_model_id: str = "stabilityai/stable-diffusion-2-1",
+        # ── Model dims ──
+        dino_hidden: int = 1536,
+        sd_cross_attn: int = 1024,
+        image_size: int = 1024,
+        latent_size: int = 128,
+        in_channels: int = 3,
+        latent_channels: int = 4,
+        # ── SVD ──
+        lr_size: int = 32,
+        max_eig: int = 64,
+        energy_threshold: float = 0.95,
+        min_eig: int = 16,
+        # ── Diffusion ──
+        train_timesteps: int = 1000,
+        inference_steps: int = 25,
+        beta_start: float = 0.00085,
+        beta_end: float = 0.012,
+        # ── Training ──
+        lr: float = 5e-5,
+        batch_size: int = 1,
+        grad_accum: int = 4,
+        max_grad_norm: float = 1.0,
+        cond_dropout: float = 0.15,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.dino_dir = dino_dir
+        self.sd_model_id = sd_model_id
+        self.dino_hidden = dino_hidden
+        self.sd_cross_attn = sd_cross_attn
+        self.image_size = image_size
+        self.latent_size = latent_size
+        self.in_channels = in_channels
+        self.latent_channels = latent_channels
+        self.lr_size = lr_size
+        self.max_eig = max_eig
+        self.energy_threshold = energy_threshold
+        self.min_eig = min_eig
+        self.train_timesteps = train_timesteps
+        self.inference_steps = inference_steps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.lr = lr
+        self.batch_size = batch_size
+        self.grad_accum = grad_accum
+        self.max_grad_norm = max_grad_norm
+        self.cond_dropout = cond_dropout
+        self.auto_map = {
+            "AutoConfig": "model_v2.SRDiffusionConfig",
+            "AutoModel": "model_v2.SRDiffusion",
+        }
 
-    # ── Model dims ──
-    dino_hidden: int = 1536
-    sd_cross_attn: int = 1024
-    image_size: int = 1024
-    latent_size: int = 128          # image_size / 8
-    in_channels: int = 3
-    latent_channels: int = 4
-
-    # ── SVD ──
-    lr_size: int = 32
-    max_eig: int = 64
-    energy_threshold: float = 0.95
-    min_eig: int = 16
-
-    # ── Diffusion ──
-    train_timesteps: int = 1000
-    inference_steps: int = 25
-    beta_start: float = 0.00085
-    beta_end: float = 0.012
-
-    # ── Training ──
-    lr: float = 5e-5
-    batch_size: int = 1
-    grad_accum: int = 4
-    max_grad_norm: float = 1.0
-    cond_dropout: float = 0.15  # CFG-style cross-attn dropout rate
+    @classmethod
+    def from_legacy(cls):
+        """兼容旧的 Config() 调用方式"""
+        return cls()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -117,15 +150,17 @@ def build_tokens(
 # Noise Schedule (DDPM, SD 2.1 params)
 # ═══════════════════════════════════════════════════════════════
 
-class NoiseSchedule:
+class NoiseSchedule(nn.Module):
+    """注册 buffer 以便 save_pretrained / from_pretrained 正确保存恢复"""
+
     def __init__(self, steps: int = 1000, beta_start: float = 0.00085, beta_end: float = 0.012):
+        super().__init__()
         betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, steps) ** 2
         alphas = 1.0 - betas
         alphas_cumprod = alphas.cumprod(0)
-        self.steps = steps
-        self.alphas_cumprod = alphas_cumprod
-        self.sqrt_alphas = alphas_cumprod.sqrt()
-        self.sqrt_one_minus = (1.0 - alphas_cumprod).sqrt()
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_alphas", alphas_cumprod.sqrt())
+        self.register_buffer("sqrt_one_minus", (1.0 - alphas_cumprod).sqrt())
 
     def add_noise(self, x0: Tensor, noise: Tensor, t: Tensor) -> Tensor:
         device = x0.device
@@ -141,7 +176,7 @@ class NoiseSchedule:
 class DinoEncoder(nn.Module):
     """DINOv2-giant encoder wrapper. All params trainable."""
 
-    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
+    def __init__(self, cfg: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         from transformers import Dinov2Model, Dinov2Config
 
@@ -215,7 +250,7 @@ class TokenProjector(nn.Module):
 class DiffusionDecoder(nn.Module):
     """SD 2.1 U-Net (noise prediction) + VAE (latent encode/decode). All trainable."""
 
-    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
+    def __init__(self, cfg: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         from diffusers import UNet2DConditionModel, AutoencoderKL
 
@@ -282,19 +317,36 @@ class DiffusionDecoder(nn.Module):
 # SRDiffusion — full DINOv2 + SD 2.1 pipeline
 # ═══════════════════════════════════════════════════════════════
 
-class SRDiffusion(nn.Module):
-    """DINOv2 + SD 2.1 U-Net diffusion 超分。全参数训练。"""
+class SRDiffusion(PreTrainedModel):
+    """DINOv2 + SD 2.1 U-Net diffusion 超分。全参数训练。
+    
+    用法:
+        # 新建
+        config = SRDiffusionConfig(...)
+        model = SRDiffusion(config)
+        
+        # 保存
+        model.save_pretrained("./checkpoint")
+        
+        # 加载 (AutoModel 兼容)
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained("./checkpoint", trust_remote_code=True)
+        
+        # 或直接用类
+        model = SRDiffusion.from_pretrained("./checkpoint")
+    """
+    config_class = SRDiffusionConfig
 
-    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
-        super().__init__()
-        self.cfg = cfg
+    def __init__(self, config: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
+        super().__init__(config)
+        self.config = config
         self.noise_schedule = NoiseSchedule(
-            cfg.train_timesteps, cfg.beta_start, cfg.beta_end
+            config.train_timesteps, config.beta_start, config.beta_end
         )
 
-        self.dino = DinoEncoder(cfg, device, skip_pretrained=skip_pretrained)
-        self.projector = TokenProjector(cfg.dino_hidden, cfg.sd_cross_attn).to(device)
-        self.decoder = DiffusionDecoder(cfg, device, skip_pretrained=skip_pretrained)
+        self.dino = DinoEncoder(config, device, skip_pretrained=skip_pretrained)
+        self.projector = TokenProjector(config.dino_hidden, config.sd_cross_attn).to(device)
+        self.decoder = DiffusionDecoder(config, device, skip_pretrained=skip_pretrained)
 
         self._log_params()
 
@@ -315,29 +367,29 @@ class SRDiffusion(nn.Module):
 
         # ── 1. SVD tokens via DINOv2 ──
         lr_flat, eig_tokens, n_list = build_tokens(
-            hr, self.cfg.lr_size, self.cfg.energy_threshold,
-            self.cfg.max_eig, self.cfg.min_eig,
+            hr, self.config.lr_size, self.config.energy_threshold,
+            self.config.max_eig, self.config.min_eig,
         )
         svd = self.dino(lr_flat, eig_tokens, n_list)
         cross = self.projector(svd)
 
         # CFG-style conditioning dropout (15%) — force U-Net to use cross-attn
-        if self.training and torch.rand(1).item() < self.cfg.cond_dropout:
+        if self.training and torch.rand(1).item() < self.config.cond_dropout:
             cross = torch.zeros_like(cross)
 
         # ── 2. LR condition latent ──
         lr_img = F.interpolate(
             F.interpolate(
-                hr, size=(self.cfg.lr_size, self.cfg.lr_size), mode="bicubic"
+                hr, size=(self.config.lr_size, self.config.lr_size), mode="bicubic"
             ),
-            size=(self.cfg.image_size, self.cfg.image_size), mode="bicubic",
+            size=(self.config.image_size, self.config.image_size), mode="bicubic",
         )
         cond = self.decoder.encode(lr_img)
 
         # ── 3. HR → latent → add noise ──
         hr_z = self.decoder.encode(hr)
         noise = torch.randn_like(hr_z)
-        t = torch.randint(0, self.cfg.train_timesteps, (B,), device=device)
+        t = torch.randint(0, self.config.train_timesteps, (B,), device=device)
         noisy = self.noise_schedule.add_noise(hr_z, noise, t)
 
         # ── 4. U-Net predict noise → ε-MSE + x₀ KL constraint ──
@@ -361,27 +413,27 @@ class SRDiffusion(nn.Module):
         B, device = hr.size(0), hr.device
 
         lr_flat, eig_tokens, n_list = build_tokens(
-            hr, self.cfg.lr_size, self.cfg.energy_threshold,
-            self.cfg.max_eig, self.cfg.min_eig,
+            hr, self.config.lr_size, self.config.energy_threshold,
+            self.config.max_eig, self.config.min_eig,
         )
         cross = self.projector(self.dino(lr_flat, eig_tokens, n_list))
 
         lr_img = F.interpolate(
             F.interpolate(
-                hr, size=(self.cfg.lr_size, self.cfg.lr_size), mode="bicubic"
+                hr, size=(self.config.lr_size, self.config.lr_size), mode="bicubic"
             ),
-            size=(self.cfg.image_size, self.cfg.image_size), mode="bicubic",
+            size=(self.config.image_size, self.config.image_size), mode="bicubic",
         )
         cond = self.decoder.encode(lr_img)
 
-        step_ratio = self.cfg.train_timesteps // steps
+        step_ratio = self.config.train_timesteps // steps
         timesteps = (
             torch.arange(steps - 1, -1, -1) * step_ratio
         ).long().to(device)
 
         z = torch.randn(
-            B, self.cfg.latent_channels,
-            self.cfg.latent_size, self.cfg.latent_size, device=device,
+            B, self.config.latent_channels,
+            self.config.latent_size, self.config.latent_size, device=device,
         )
 
         ac = self.noise_schedule.alphas_cumprod
@@ -399,9 +451,24 @@ class SRDiffusion(nn.Module):
         return self.decoder.decode(z)
 
 
-def build_model(cfg: Config, device: str = "cuda", skip_pretrained: bool = False) -> SRDiffusion:
+def build_model(
+    config: SRDiffusionConfig | None = None,
+    device: str = "cuda",
+    skip_pretrained: bool = False,
+) -> SRDiffusion:
+    """便捷构建函数。兼容旧接口 cfg=... 调用。
+    
+    新用法:
+        model = build_model(config=SRDiffusionConfig(), device="cuda")
+    
+    加载:
+        model = SRDiffusion.from_pretrained("./checkpoint")
+    """
+    if config is None:
+        config = SRDiffusionConfig()
+
     print("=" * 60)
     mode = "from config" if skip_pretrained else "from pretrained weights"
     print(f"SR-Diffusion v2: DINOv2-giant + SD 2.1 U-Net [{mode}]")
     print("=" * 60)
-    return SRDiffusion(cfg, device=device, skip_pretrained=skip_pretrained)
+    return SRDiffusion(config, device=device, skip_pretrained=skip_pretrained)
