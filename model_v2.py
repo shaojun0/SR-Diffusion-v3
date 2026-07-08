@@ -238,15 +238,18 @@ class DiffusionDecoder(nn.Module):
                 cfg.sd_model_id, subfolder="vae", low_cpu_mem_usage=False
             )
 
-        # ── Pre-fusion: 8ch (noisy+cond) → 4ch → vanilla conv_in ──
+        # ── Pre-fusion: concat(noisy, cond) → small CNN → 4ch → vanilla conv_in ──
         # 不改动 U-Net 预训练 conv_in，前置一个小型融合网络
-        # Conv2d 使用 PyTorch 默认 Kaiming uniform 初始化（与 U-Net 一致）
+        # 所有维度从 U-Net config 推导，不硬编码
+        latent_ch = self.unet.config.in_channels          # SD: 4
+        model_ch = self.unet.conv_in.out_channels          # SD: 320
+        hidden_ch = model_ch // 5                          # SD: 64
         self.cond_fusion = nn.Sequential(
-            nn.Conv2d(8, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(latent_ch * 2, hidden_ch, kernel_size=3, stride=1, padding=1),
             nn.SiLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(hidden_ch, hidden_ch, kernel_size=3, stride=1, padding=1),
             nn.SiLU(),
-            nn.Conv2d(64, 4, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(hidden_ch, latent_ch, kernel_size=3, stride=1, padding=1),
         )
         self.unet.enable_gradient_checkpointing()
 
