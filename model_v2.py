@@ -9,6 +9,7 @@ Pipeline:
   5. Loss: ε-MSE + 0.5·x₀-MSE — noise pred + latent KL constraint
 
 全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
+skip_pretrained=True → 从 config 创建空架构，靠 checkpoint 恢复权重。
 """
 
 import os
@@ -140,14 +141,20 @@ class NoiseSchedule:
 class DinoEncoder(nn.Module):
     """DINOv2-giant encoder wrapper. All params trainable."""
 
-    def __init__(self, cfg: Config, device: str = "cuda"):
+    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
-        from transformers import Dinov2Model
+        from transformers import Dinov2Model, Dinov2Config
 
-        print(f"  [DINO] Loading from {cfg.dino_dir} ...")
-        self.vit = Dinov2Model.from_pretrained(
-            cfg.dino_dir, local_files_only=True
-        ).to(device)
+        if skip_pretrained:
+            print(f"  [DINO] Creating from config (no pretrained weights) ...")
+            dino_cfg = Dinov2Config.from_pretrained(cfg.dino_dir)
+            self.vit = Dinov2Model(dino_cfg).to(device)
+        else:
+            print(f"  [DINO] Loading from {cfg.dino_dir} ...")
+            self.vit = Dinov2Model.from_pretrained(
+                cfg.dino_dir, local_files_only=True
+            ).to(device)
+
         self.vit.train()
         self.vit.requires_grad_(True)
         self.vit.gradient_checkpointing_enable()
@@ -208,27 +215,41 @@ class TokenProjector(nn.Module):
 class DiffusionDecoder(nn.Module):
     """SD 2.1 U-Net (noise prediction) + VAE (latent encode/decode). All trainable."""
 
-    def __init__(self, cfg: Config, device: str = "cuda"):
+    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         from diffusers import UNet2DConditionModel, AutoencoderKL
 
-        print(f"  [SD] Loading from {cfg.sd_model_id} ...")
-        self.unet = UNet2DConditionModel.from_pretrained(
-            cfg.sd_model_id, subfolder="unet", low_cpu_mem_usage=False
-        )
-        self.vae = AutoencoderKL.from_pretrained(
-            cfg.sd_model_id, subfolder="vae", low_cpu_mem_usage=False
-        )
+        if skip_pretrained:
+            print(f"  [SD] Creating from config (no pretrained weights) ...")
+            unet_cfg = UNet2DConditionModel.load_config(
+                cfg.sd_model_id, subfolder="unet"
+            )
+            self.unet = UNet2DConditionModel.from_config(unet_cfg)
+            vae_cfg = AutoencoderKL.load_config(
+                cfg.sd_model_id, subfolder="vae"
+            )
+            self.vae = AutoencoderKL.from_config(vae_cfg)
+        else:
+            print(f"  [SD] Loading from {cfg.sd_model_id} ...")
+            self.unet = UNet2DConditionModel.from_pretrained(
+                cfg.sd_model_id, subfolder="unet", low_cpu_mem_usage=False
+            )
+            self.vae = AutoencoderKL.from_pretrained(
+                cfg.sd_model_id, subfolder="vae", low_cpu_mem_usage=False
+            )
 
-        # ── Expand U-Net input 4→8 (noisy + condition latent) ──
-        old = self.unet.conv_in
-        new = nn.Conv2d(8, old.out_channels, **{
-            k: getattr(old, k) for k in ["kernel_size", "stride", "padding"]
-        })
-        new.weight.data[:, :4] = old.weight.data
-        new.weight.data[:, 4:] = old.weight.data[:, :4].clone() * 0.02
-        new.bias.data = old.bias.data.clone()
-        self.unet.conv_in = new
+        # ── Pre-fusion: 8ch (noisy+cond) → 4ch → vanilla conv_in ──
+        # 不改动 U-Net 预训练 conv_in，前置一个小型融合网络
+        self.cond_fusion = nn.Sequential(
+            nn.Conv2d(8, 64, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 4, kernel_size=3, stride=1, padding=1),
+        )
+        # 最后一层零初始化，训练初期 pre-fusion 输出 ≈ 0
+        nn.init.zeros_(self.cond_fusion[-1].weight)
+        nn.init.zeros_(self.cond_fusion[-1].bias)
         self.unet.enable_gradient_checkpointing()
 
         self.scale = self.vae.config.scaling_factor
@@ -251,8 +272,8 @@ class DiffusionDecoder(nn.Module):
         t: Tensor,
         cross_tokens: Tensor,
     ) -> Tensor:
-        """Predict noise. Input: (B,8,H,W), output: (B,4,H,W)"""
-        x = torch.cat([noisy, cond], dim=1)
+        """Predict noise. noisy/cond (B,4,H,W) → cond_fusion → (B,4,H,W) → U-Net"""
+        x = self.cond_fusion(torch.cat([noisy, cond], dim=1))
         return self.unet(x, t, encoder_hidden_states=cross_tokens, return_dict=False)[0]
 
 
@@ -263,16 +284,16 @@ class DiffusionDecoder(nn.Module):
 class SRDiffusion(nn.Module):
     """DINOv2 + SD 2.1 U-Net diffusion 超分。全参数训练。"""
 
-    def __init__(self, cfg: Config, device: str = "cuda"):
+    def __init__(self, cfg: Config, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         self.cfg = cfg
         self.noise_schedule = NoiseSchedule(
             cfg.train_timesteps, cfg.beta_start, cfg.beta_end
         )
 
-        self.dino = DinoEncoder(cfg, device)
+        self.dino = DinoEncoder(cfg, device, skip_pretrained=skip_pretrained)
         self.projector = TokenProjector(cfg.dino_hidden, cfg.sd_cross_attn).to(device)
-        self.decoder = DiffusionDecoder(cfg, device)
+        self.decoder = DiffusionDecoder(cfg, device, skip_pretrained=skip_pretrained)
 
         self._log_params()
 
@@ -377,8 +398,9 @@ class SRDiffusion(nn.Module):
         return self.decoder.decode(z)
 
 
-def build_model(cfg: Config, device: str = "cuda") -> SRDiffusion:
+def build_model(cfg: Config, device: str = "cuda", skip_pretrained: bool = False) -> SRDiffusion:
     print("=" * 60)
-    print("SR-Diffusion v2: DINOv2-giant + SD 2.1 U-Net")
+    mode = "from config" if skip_pretrained else "from pretrained weights"
+    print(f"SR-Diffusion v2: DINOv2-giant + SD 2.1 U-Net [{mode}]")
     print("=" * 60)
-    return SRDiffusion(cfg, device=device)
+    return SRDiffusion(cfg, device=device, skip_pretrained=skip_pretrained)
