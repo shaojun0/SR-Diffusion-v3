@@ -286,8 +286,8 @@ class SRDiffusion(nn.Module):
             f"DINO: {dino/1e6:.0f}M | U-Net: {unet/1e6:.0f}M | VAE: {vae/1e6:.0f}M"
         )
 
-    def forward(self, hr: Tensor):
-        """Training forward: hr (B,3,H,W) → loss, noise_pred, noise"""
+    def forward(self, hr: Tensor, return_dict: bool = True, **kwargs):
+        """Training forward: hr (B,3,H,W) → loss[dict], noise_pred, noise"""
         B, device = hr.size(0), hr.device
 
         # ── 1. SVD tokens via DINOv2 ──
@@ -321,6 +321,8 @@ class SRDiffusion(nn.Module):
         # ── 5. Loss: pure VAE latent reconstruction ──
         loss = F.mse_loss(x0_pred, hr_z)
 
+        if return_dict:
+            return {"loss": loss, "pred": pred, "noise": noise}
         return loss, pred, noise
 
     @torch.no_grad()

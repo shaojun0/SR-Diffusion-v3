@@ -85,10 +85,6 @@ model = build_model(cfg)
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"  [Train] Trainable params: {trainable/1e9:.2f}B")
 
-# HF Trainer expects forward → {"loss": ...}
-_orig_forward = type(model).forward
-model.forward = lambda hr, labels=None, **kw: {"loss": _orig_forward(model, hr)[0]}
-
 # ── Dataset ────────────────────────────────────────────────────
 train_dataset = HRDataset(DATA_DIR, cfg.image_size)
 
