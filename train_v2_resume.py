@@ -33,9 +33,9 @@ T0            = 1000
 MAX_GRAD_NORM = 1.0
 
 cfg = Config()
-cfg.dino_dir    = DINO_DIR
-cfg.sd_model_id = SD_MODEL
-cfg.output_dir  = OUTPUT_DIR
+cfg.dino["model_id"]     = DINO_DIR
+cfg.sd_unet["model_id"]   = SD_MODEL
+cfg.sd_vae["model_id"]    = SD_MODEL
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 class HRDataset(Dataset):

@@ -10,6 +10,7 @@ Pipeline:
 
 全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
 支持 AutoModel 加载: AutoModel.from_pretrained("path", trust_remote_code=True)
+子模型配置自包含在 config.json 中，无需外部 config 文件。
 """
 
 import os
@@ -25,17 +26,19 @@ from transformers import PreTrainedModel, PretrainedConfig
 # ═══════════════════════════════════════════════════════════════
 
 class SRDiffusionConfig(PretrainedConfig):
-    """训练超参 & 模型结构参数"""
+    """训练超参 & 模型结构参数. 子模型配置嵌套在 dino / sd_unet / sd_vae 中."""
     model_type = "sr_diffusion_v2"
 
     def __init__(
         self,
-        # ── Paths ──
-        dino_dir: str = "dinov2-giant",
-        sd_model_id: str = "stabilityai/stable-diffusion-2-1",
-        # ── Model dims ──
+        # ── 子模型配置（嵌套字典，自包含架构参数）──
+        dino: dict | None = None,
+        sd_unet: dict | None = None,
+        sd_vae: dict | None = None,
+        # ── 便捷维度字段（从子模型配置提取）──
         dino_hidden: int = 1536,
         sd_cross_attn: int = 1024,
+        # ── Image / Latent ──
         image_size: int = 1024,
         latent_size: int = 128,
         in_channels: int = 3,
@@ -59,8 +62,87 @@ class SRDiffusionConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.dino_dir = dino_dir
-        self.sd_model_id = sd_model_id
+
+        # ── DINOv2-giant 默认配置 ──
+        if dino is None:
+            dino = {
+                "model_id": "dinov2-giant",
+                "hidden_size": 1536,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 24,
+                "mlp_ratio": 4.0,
+                "image_size": 224,
+                "patch_size": 14,
+                "num_channels": 3,
+                "qkv_bias": True,
+                "layer_norm_eps": 1e-6,
+                "hidden_act": "gelu",
+                "use_swiglu_ffn": False,
+                "apply_layernorm": True,
+                "drop_path_rate": 0.0,
+            }
+        self.dino = dino
+
+        # ── SD 2.1 U-Net 默认配置 ──
+        if sd_unet is None:
+            sd_unet = {
+                "model_id": "stabilityai/stable-diffusion-2-1",
+                "in_channels": 4,
+                "out_channels": 4,
+                "cross_attention_dim": 1024,
+                "block_out_channels": [320, 640, 1280, 1280],
+                "layers_per_block": 2,
+                "down_block_types": [
+                    "CrossAttnDownBlock2D",
+                    "CrossAttnDownBlock2D",
+                    "CrossAttnDownBlock2D",
+                    "DownBlock2D",
+                ],
+                "up_block_types": [
+                    "UpBlock2D",
+                    "CrossAttnUpBlock2D",
+                    "CrossAttnUpBlock2D",
+                    "CrossAttnUpBlock2D",
+                ],
+                "attention_head_dim": [5, 10, 20, 20],
+                "norm_num_groups": 32,
+                "sample_size": 128,
+                "act_fn": "silu",
+                "center_input_sample": False,
+                "conv_in_kernel": 3,
+                "conv_out_kernel": 3,
+                "dropout": 0.0,
+                "flip_sin_to_cos": True,
+                "freq_shift": 0,
+                "mid_block_scale_factor": 1,
+                "norm_eps": 1e-5,
+                "only_cross_attention": [False, False, False, True],
+                "resnet_time_scale_shift": "default",
+                "time_embedding_type": "positional",
+                "transformer_layers_per_block": 1,
+                "upcast_attention": False,
+                "use_linear_projection": False,
+            }
+        self.sd_unet = sd_unet
+
+        # ── SD 2.1 VAE 默认配置 ──
+        if sd_vae is None:
+            sd_vae = {
+                "model_id": "stabilityai/stable-diffusion-2-1",
+                "in_channels": 3,
+                "out_channels": 3,
+                "latent_channels": 4,
+                "block_out_channels": [128, 256, 512, 512],
+                "layers_per_block": 2,
+                "sample_size": 1024,
+                "scaling_factor": 0.18215,
+                "act_fn": "silu",
+                "norm_num_groups": 32,
+                "force_upcast": True,
+            }
+        self.sd_vae = sd_vae
+
+        # ── 便捷字段 ──
         self.dino_hidden = dino_hidden
         self.sd_cross_attn = sd_cross_attn
         self.image_size = image_size
@@ -80,15 +162,11 @@ class SRDiffusionConfig(PretrainedConfig):
         self.grad_accum = grad_accum
         self.max_grad_norm = max_grad_norm
         self.cond_dropout = cond_dropout
+
         self.auto_map = {
             "AutoConfig": "model_v2.SRDiffusionConfig",
             "AutoModel": "model_v2.SRDiffusion",
         }
-
-    @classmethod
-    def from_legacy(cls):
-        """兼容旧的 Config() 调用方式"""
-        return cls()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -176,31 +254,34 @@ class NoiseSchedule(nn.Module):
 class DinoEncoder(nn.Module):
     """DINOv2-giant encoder wrapper. All params trainable."""
 
-    def __init__(self, cfg: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
+    def __init__(self, config: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         from transformers import Dinov2Model, Dinov2Config
 
         if skip_pretrained:
-            print(f"  [DINO] Creating from config (no pretrained weights) ...")
-            dino_cfg = Dinov2Config.from_pretrained(cfg.dino_dir)
+            print(f"  [DINO] Creating from embedded config ...")
+            # 从嵌套字典提取架构参数，过滤掉 model_id
+            dino_kwargs = {k: v for k, v in config.dino.items() if k != "model_id"}
+            dino_cfg = Dinov2Config(**dino_kwargs)
             self.vit = Dinov2Model(dino_cfg).to(device)
         else:
-            print(f"  [DINO] Loading from {cfg.dino_dir} ...")
+            model_id = config.dino.get("model_id", "dinov2-giant")
+            print(f"  [DINO] Loading from {model_id} ...")
             self.vit = Dinov2Model.from_pretrained(
-                cfg.dino_dir, local_files_only=True
+                model_id, local_files_only=True
             ).to(device)
 
         self.vit.train()
         self.vit.requires_grad_(True)
         self.vit.gradient_checkpointing_enable()
 
-        self.tok_proj = nn.Linear(cfg.lr_size ** 2, cfg.dino_hidden).to(device)
-        self.eig_proj = nn.Linear(cfg.image_size, cfg.dino_hidden).to(device)
+        self.tok_proj = nn.Linear(config.lr_size ** 2, config.dino_hidden).to(device)
+        self.eig_proj = nn.Linear(config.image_size, config.dino_hidden).to(device)
         self.pos = nn.Parameter(
-            torch.randn(1, cfg.max_eig + 3, cfg.dino_hidden, device=device) * 0.02
+            torch.randn(1, config.max_eig + 3, config.dino_hidden, device=device) * 0.02
         )
         self.cls = nn.Parameter(
-            torch.randn(1, 1, cfg.dino_hidden, device=device)
+            torch.randn(1, 1, config.dino_hidden, device=device)
         )
 
     def forward(
@@ -250,27 +331,28 @@ class TokenProjector(nn.Module):
 class DiffusionDecoder(nn.Module):
     """SD 2.1 U-Net (noise prediction) + VAE (latent encode/decode). All trainable."""
 
-    def __init__(self, cfg: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
+    def __init__(self, config: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
         super().__init__()
         from diffusers import UNet2DConditionModel, AutoencoderKL
 
         if skip_pretrained:
-            print(f"  [SD] Creating from config (no pretrained weights) ...")
-            unet_cfg = UNet2DConditionModel.load_config(
-                cfg.sd_model_id, subfolder="unet"
-            )
-            self.unet = UNet2DConditionModel.from_config(unet_cfg)
-            vae_cfg = AutoencoderKL.load_config(
-                cfg.sd_model_id, subfolder="vae"
-            )
-            self.vae = AutoencoderKL.from_config(vae_cfg)
+            print(f"  [SD] Creating from embedded config ...")
+            self.unet = UNet2DConditionModel(**{
+                k: v for k, v in config.sd_unet.items() if k != "model_id"
+            })
+            self.vae = AutoencoderKL(**{
+                k: v for k, v in config.sd_vae.items() if k != "model_id"
+            })
         else:
-            print(f"  [SD] Loading from {cfg.sd_model_id} ...")
+            unet_id = config.sd_unet.get("model_id", "stabilityai/stable-diffusion-2-1")
+            vae_id  = config.sd_vae.get("model_id", "stabilityai/stable-diffusion-2-1")
+            print(f"  [SD] Loading UNet from {unet_id} ...")
             self.unet = UNet2DConditionModel.from_pretrained(
-                cfg.sd_model_id, subfolder="unet", low_cpu_mem_usage=False
+                unet_id, subfolder="unet", low_cpu_mem_usage=False
             )
+            print(f"  [SD] Loading VAE from {vae_id} ...")
             self.vae = AutoencoderKL.from_pretrained(
-                cfg.sd_model_id, subfolder="vae", low_cpu_mem_usage=False
+                vae_id, subfolder="vae", low_cpu_mem_usage=False
             )
 
         # ── Pre-fusion: concat(noisy, cond) → small CNN → 4ch → vanilla conv_in ──
@@ -322,10 +404,10 @@ class SRDiffusion(PreTrainedModel):
     
     用法:
         # 新建
-        config = SRDiffusionConfig(...)
+        config = SRDiffusionConfig()
         model = SRDiffusion(config)
         
-        # 保存
+        # 保存（config.json 自包含 DINO + SD 架构配置）
         model.save_pretrained("./checkpoint")
         
         # 加载 (AutoModel 兼容)
@@ -337,7 +419,12 @@ class SRDiffusion(PreTrainedModel):
     """
     config_class = SRDiffusionConfig
 
-    def __init__(self, config: SRDiffusionConfig, device: str = "cuda", skip_pretrained: bool = False):
+    def __init__(
+        self,
+        config: SRDiffusionConfig,
+        device: str = "cuda",
+        skip_pretrained: bool = False,
+    ):
         super().__init__(config)
         self.config = config
         self.noise_schedule = NoiseSchedule(
@@ -456,11 +543,12 @@ def build_model(
     device: str = "cuda",
     skip_pretrained: bool = False,
 ) -> SRDiffusion:
-    """便捷构建函数。兼容旧接口 cfg=... 调用。
-    
-    新用法:
-        model = build_model(config=SRDiffusionConfig(), device="cuda")
-    
+    """便捷构建函数.
+
+    新建:
+        config = SRDiffusionConfig()
+        model = build_model(config, device="cuda")
+
     加载:
         model = SRDiffusion.from_pretrained("./checkpoint")
     """
