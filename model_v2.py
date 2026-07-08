@@ -240,6 +240,7 @@ class DiffusionDecoder(nn.Module):
 
         # ── Pre-fusion: 8ch (noisy+cond) → 4ch → vanilla conv_in ──
         # 不改动 U-Net 预训练 conv_in，前置一个小型融合网络
+        # Conv2d 使用 PyTorch 默认 Kaiming uniform 初始化（与 U-Net 一致）
         self.cond_fusion = nn.Sequential(
             nn.Conv2d(8, 64, kernel_size=3, stride=1, padding=1),
             nn.SiLU(),
@@ -247,9 +248,6 @@ class DiffusionDecoder(nn.Module):
             nn.SiLU(),
             nn.Conv2d(64, 4, kernel_size=3, stride=1, padding=1),
         )
-        # 最后一层零初始化，训练初期 pre-fusion 输出 ≈ 0
-        nn.init.zeros_(self.cond_fusion[-1].weight)
-        nn.init.zeros_(self.cond_fusion[-1].bias)
         self.unet.enable_gradient_checkpointing()
 
         self.scale = self.vae.config.scaling_factor
