@@ -28,10 +28,25 @@ from transformers import PreTrainedModel, PretrainedConfig
 class ConfigDict(dict):
     """dict 子类，支持 x.key 和 x["key"] 两种访问方式。
     JSON 序列化时退化为普通 dict。"""
-    __getattr__ = dict.__getitem__
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-    __repr__ = dict.__repr__
+    __slots__ = ()
+
+    def __getattr__(self, key: str):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' has no key '{key}'") from None
+
+    def __setattr__(self, key: str, value):
+        self[key] = value
+
+    def __delattr__(self, key: str):
+        try:
+            del self[key]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' has no key '{key}'") from None
+
+    def __repr__(self):
+        return dict.__repr__(self)
 
 
 # ═══════════════════════════════════════════════════════════════
