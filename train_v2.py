@@ -5,7 +5,8 @@ Pipeline:
   1. HR image → SVD → DINOv2 Encoder → cross-attention tokens
   2. LR bicubic → VAE Encoder → condition latent
   3. HR → VAE Encoder → +noise → U-Net(cross_attn) → x₀ pred
-  4. Loss: MSE(x₀_pred, hr_z) — pure VAE latent reconstruction
+  4. Loss: ε-MSE + 0.5·x₀-MSE — noise pred + latent KL constraint
+  5. CFG-style conditioning dropout (15%) to prevent mode collapse
 
 全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
 """

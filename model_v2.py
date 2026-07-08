@@ -6,7 +6,7 @@ Pipeline:
   2. eig vectors + LR tokens → DINOv2 Encoder → cross-attn tokens (1024d)
   3. LR bicubic → VAE Encoder → condition latent
   4. HR → VAE Encoder → latent → +noise → U-Net(cross_attn) → x₀ pred
-  5. Loss: MSE(x₀_pred, hr_z) — pure VAE latent reconstruction
+  5. Loss: ε-MSE + 0.5·x₀-MSE — noise pred + latent KL constraint
 
 全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
 """
@@ -54,6 +54,7 @@ class Config:
     batch_size: int = 1
     grad_accum: int = 4
     max_grad_norm: float = 1.0
+    cond_dropout: float = 0.15  # CFG-style cross-attn dropout rate
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -298,6 +299,10 @@ class SRDiffusion(nn.Module):
         svd = self.dino(lr_flat, eig_tokens, n_list)
         cross = self.projector(svd)
 
+        # CFG-style conditioning dropout (15%) — force U-Net to use cross-attn
+        if self.training and torch.rand(1).item() < self.cfg.cond_dropout:
+            cross = torch.zeros_like(cross)
+
         # ── 2. LR condition latent ──
         lr_img = F.interpolate(
             F.interpolate(
@@ -313,13 +318,16 @@ class SRDiffusion(nn.Module):
         t = torch.randint(0, self.cfg.train_timesteps, (B,), device=device)
         noisy = self.noise_schedule.add_noise(hr_z, noise, t)
 
-        # ── 4. U-Net predict noise → x₀ from noise ──
+        # ── 4. U-Net predict noise → ε-MSE + x₀ KL constraint ──
         pred = self.decoder(noisy, cond, t, cross)
+        loss_noise = F.mse_loss(pred, noise)
+
         alpha_bar = self.noise_schedule.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
         x0_pred = (noisy - (1.0 - alpha_bar).sqrt() * pred) / alpha_bar.sqrt().clamp(min=1e-8)
+        loss_recon = F.mse_loss(x0_pred, hr_z)
 
-        # ── 5. Loss: pure VAE latent reconstruction ──
-        loss = F.mse_loss(x0_pred, hr_z)
+        # ── 5. Loss: ε-MSE (prevent collapse) + 0.5·x₀-MSE (latent constraint) ──
+        loss = loss_noise + loss_recon * 0.5
 
         if return_dict:
             return {"loss": loss, "pred": pred, "noise": noise}
