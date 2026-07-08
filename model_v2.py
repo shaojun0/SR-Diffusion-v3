@@ -22,6 +22,19 @@ from transformers import PreTrainedModel, PretrainedConfig
 
 
 # ═══════════════════════════════════════════════════════════════
+# ConfigDict — dict subclass with attribute access
+# ═══════════════════════════════════════════════════════════════
+
+class ConfigDict(dict):
+    """dict 子类，支持 x.key 和 x["key"] 两种访问方式。
+    JSON 序列化时退化为普通 dict。"""
+    __getattr__ = dict.__getitem__
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+    __repr__ = dict.__repr__
+
+
+# ═══════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════
 
@@ -84,7 +97,7 @@ class SRDiffusionConfig(PretrainedConfig):
                 "qkv_bias": True,
                 "use_swiglu_ffn": True,
             }
-        self.dino = dino
+        self.dino = ConfigDict(dino)
 
         # ── SD 2.1 U-Net 默认配置（对齐实际 config.json）──
         if sd_unet is None:
@@ -123,7 +136,7 @@ class SRDiffusionConfig(PretrainedConfig):
                 "use_linear_projection": True,
                 "upcast_attention": True,
             }
-        self.sd_unet = sd_unet
+        self.sd_unet = ConfigDict(sd_unet)
 
         # ── SD 2.1 VAE 默认配置（对齐实际 config.json）──
         if sd_vae is None:
@@ -150,7 +163,7 @@ class SRDiffusionConfig(PretrainedConfig):
                     "UpDecoderBlock2D",
                 ],
             }
-        self.sd_vae = sd_vae
+        self.sd_vae = ConfigDict(sd_vae)
 
         # ── 便捷字段 ──
         self.dino_hidden = dino_hidden
