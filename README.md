@@ -20,7 +20,7 @@ HR Image (1024²)
                                               noise_pred
 ```
 
-Loss: MSE(noise_pred, noise) — standard DDPM diffusion loss
+Loss: ε-MSE + 0.5·x₀-MSE — noise prediction + latent KL constraint
 
 ## 参数量
 
@@ -40,12 +40,41 @@ Loss: MSE(noise_pred, noise) — standard DDPM diffusion loss
 - BS=1, grad_accum=4
 - LR=5e-5, CosineAnnealingWarmRestarts
 - 100 epochs, ~20,000 steps
-- GPU: H800 80GB, 峰值显存 ~70GB
+- GPU: H800 80GB / RTX PRO 6000 96GB
 
 ## 文件
 
-- `model_v2.py` — 模型定义（Config, DINOv2, TokenProjector, DiffusionDecoder, SRDiffusion）
-- `train_v2.py` — 训练脚本（Dataset, 训练循环, 评估）
+| 文件 | 说明 |
+|------|------|
+| `model_v2.py` | v2 模型 (nn.Module, pretrained 直接加载) |
+| `model_v3.py` | v3 模型 (PreTrainedModel, AutoModel 兼容, save/load 一体化) |
+| `train_v2.py` | v2 训练脚本 (HF Trainer) |
+
+## model_v3 新特性
+
+继承 `PreTrainedModel`，支持标准 HuggingFace 工作流：
+
+```python
+# 新建 + 加载预训练权重
+config = SRDiffusionConfig()
+model = SRDiffusion(config)
+model.build_model(dino_dir="dinov2-giant",
+                  sd_model_id="stabilityai/stable-diffusion-2-1")
+
+# 一键保存
+model.save_pretrained("./checkpoint")
+
+# 一键加载 — 无需手动拼 DINO/SD/VAE
+from transformers import AutoModel
+model = AutoModel.from_pretrained("./checkpoint", trust_remote_code=True)
+```
+
+### v3 相比 v2 的改进
+
+- **AutoModel 兼容**: 继承 PreTrainedModel + PretrainedConfig，`from_pretrained` 直接加载
+- **cond_fusion 模块**: `noisy + cond (8ch) → fusion → 4ch`，替代 `conv_in` 直接修改（更易序列化）
+- **NoiseSchedule buffers**: `register_buffer` 确保 save/load 一致
+- **Config 自包含**: `SRDiffusionConfig` 嵌套 DINO + U-Net + VAE 的完整 config，`config.json` 单文件包含全部架构信息
 
 ## 已知问题
 
