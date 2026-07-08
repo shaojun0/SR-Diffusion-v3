@@ -1,15 +1,14 @@
 """
-SR-Diffusion v2: SVD + DINOv2-giant → SD 2.1 U-Net Diffusion 超分辨率
+SR-Diffusion v2: SVD + DINOv2-giant → SD 2.1 U-Net Diffusion 超分辨率.
 
 Pipeline:
   1. HR image → SVD → top-k left singular vectors
-  2. eig vectors + LR tokens → DINOv2 Encoder → SVD tokens (1536d)
-  3. SVD tokens → TokenProjector → cross-attn tokens (1024d)
-  4. LR bicubic upsample → VAE Encoder → latent_cond (128×128×4)
-  5. HR → VAE Encoder → latent → +noise → [noisy; cond] → U-Net(cross_attn) → noise_pred
-  6. Loss: MSE(noise_pred, noise) — standard DDPM
+  2. eig vectors + LR tokens → DINOv2 Encoder → cross-attn tokens (1024d)
+  3. LR bicubic → VAE Encoder → condition latent
+  4. HR → VAE Encoder → latent → +noise → U-Net(cross_attn) → x₀ pred
+  5. Loss: MSE(x₀_pred, hr_z) — pure VAE latent reconstruction
 
-全参数训练, fp16 + 8-bit AdamW + gradient checkpointing.
+全参数训练 (2.09B), fp32 + 8-bit AdamW + gradient checkpointing.
 """
 
 import os
@@ -257,7 +256,7 @@ class DiffusionDecoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Full Model — SRDiffusion
+# SRDiffusion — full DINOv2 + SD 2.1 pipeline
 # ═══════════════════════════════════════════════════════════════
 
 class SRDiffusion(nn.Module):
@@ -288,7 +287,7 @@ class SRDiffusion(nn.Module):
         )
 
     def forward(self, hr: Tensor):
-        """Training forward: hr (B,3,H,W) → mse_loss, noise_pred, noise"""
+        """Training forward: hr (B,3,H,W) → loss, noise_pred, noise"""
         B, device = hr.size(0), hr.device
 
         # ── 1. SVD tokens via DINOv2 ──
@@ -314,18 +313,13 @@ class SRDiffusion(nn.Module):
         t = torch.randint(0, self.cfg.train_timesteps, (B,), device=device)
         noisy = self.noise_schedule.add_noise(hr_z, noise, t)
 
-        # ── 4. U-Net predict noise ──
+        # ── 4. U-Net predict noise → x₀ from noise ──
         pred = self.decoder(noisy, cond, t, cross)
-
-        # ── 5. Loss: ε-MSE + latent KL constraint ──
-        loss_noise = F.mse_loss(pred, noise)
-
-        # x₀ prediction from noise → KL-style latent reconstruction
-        alpha_bar = self.noise_schedule.alphas_cumprod[t].to(device).view(-1, 1, 1, 1)
+        alpha_bar = self.noise_schedule.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
         x0_pred = (noisy - (1.0 - alpha_bar).sqrt() * pred) / alpha_bar.sqrt().clamp(min=1e-8)
-        loss_recon = F.mse_loss(x0_pred, hr_z)  # VAE latent KL constraint
 
-        loss = loss_noise + loss_recon * 0.5
+        # ── 5. Loss: pure VAE latent reconstruction ──
+        loss = F.mse_loss(x0_pred, hr_z)
 
         return loss, pred, noise
 
