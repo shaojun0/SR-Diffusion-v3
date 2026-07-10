@@ -7,6 +7,7 @@
 ## 目录
 
 - [动机：为什么这条路值得走](#动机为什么这条路值得走)
+- [愿景：从超分到多模态大模型](#愿景从超分到多模态大模型)
 - [核心思路：三句话讲清楚](#核心思路三句话讲清楚)
 - [架构详解](#架构详解)
 - [实验与结果](#实验与结果)
@@ -27,6 +28,52 @@
 2. 语义级的纹理生成能力（来自扩散模型先验 + strong conditioner）
 
 本文探索的思路是：**用 DINOv2-giant 作为语义特征提取器，将图像的结构/语义信息压缩为 cross-attention tokens，引导 SD U-Net 的去噪过程。**
+
+---
+
+## 愿景：从超分到多模态大模型
+
+> **超分辨率不是终点，是试金石。**
+
+SR-Diffusion v3 表面上看是一个超分模型，但它的架构核心——**SVD 视觉编码器 + DINOv2 + Cross-Attention 注入**——本质上是一种**通用的图像→语义特征提取管线**。
+
+这就引出了这个项目的终极目标：**把这个编码器接入多模态大模型（MLLM）**，替代传统 CLIP-ViT 编码器。
+
+### 为什么现有 MLLM 的视觉编码器不够好？
+
+当前主流的多模态模型（LLaVA、Qwen-VL、InternVL 等）的图像编码器大多使用 CLIP-ViT 或 SigLIP——这些编码器是在图文匹配任务上训练的，擅长**语义对齐**，但不擅长**像素级理解**。
+
+| 短板 | 具体表现 |
+|------|---------|
+| 空间感知弱 | "左边第三个人在干什么？" → 经常答错位置 |
+| 细节丢失 | 小物体、文字、数字识别错误率高 |
+| 分辨率受限 | 固定 336²/448² 输入，高分辨率信息被粗暴压缩 |
+| 结构不敏感 | 对纹理、边缘等 mid-level 视觉特征缺乏理解 |
+
+### SVD+DINOv2 编码器的优势
+
+SR-Diffusion 的编码器天然弥补了上述短板：
+
+| 优势 | 原理 |
+|------|------|
+| **结构显式编码** | SVD 分解直接提取局部几何结构（边缘方向、主纹理），不依赖语义标签 |
+| **密集视觉特征** | DINOv2 是 self-supervised 训练的，patch 级特征比 CLIP 更细粒度 |
+| **原生高分辨率** | 当前支持 1024² 输入，可扩展，不需要暴力 patch merge |
+| **跨模态桥接** | Cross-Attention 机制天然适合投射到 LLM 的 token space |
+
+### 路线图
+
+```
+Phase 1 ✅ SR-Diffusion v3
+  └─ 验证 SVD+DINOv2 编码器的特征提取能力 (current)
+
+Phase 2 🔲 编码器剥离
+  └─ 从扩散模型中独立出纯 encoder，输出 visual tokens
+
+Phase 3 🔲 多模态接入
+  └─ Visual Tokens → Projector → LLM (Qwen/LLaMA)
+  └─ 在 VQA / OCR / grounding 任务上验证效果
+```
 
 ---
 
@@ -298,6 +345,8 @@ SD 2.1 的 VAE 有个 `scaling_factor = 0.18215`，编码时需要乘以它，�
 
 ## 下一步
 
+- [ ] **Phase 2**: 从扩散模型中剥离纯 SVD+DINOv2 编码器
+- [ ] **Phase 3**: Visual Tokens → Projector → LLM (Qwen/LLaMA)，在 VQA/OCR/grounding 上验证
 - [ ] 用 Flickr2K + DIV2K (DF2K) 扩大训练集，测试泛化
 - [ ] 换 SDXL VAE 测试更高的重建天花板
 - [ ] 加入 LPIPS / Perceptual Loss
