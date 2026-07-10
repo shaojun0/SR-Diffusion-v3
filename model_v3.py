@@ -33,7 +33,6 @@ from torch import Tensor
 from transformers import Dinov2Config, PretrainedConfig, PreTrainedModel
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Encoder
 
-
 # ═══════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════
@@ -194,7 +193,6 @@ class SRDiffusionConfig(PretrainedConfig):
             "AutoModel": "model_v3.SRDiffusion",
         }
 
-
 # ═══════════════════════════════════════════════════════════════
 # SVD Preprocessing
 # ═══════════════════════════════════════════════════════════════
@@ -228,7 +226,6 @@ def svd_eigenvectors(
         out[b, :n] = e
     return out, n_list
 
-
 def build_tokens(
     hr: Tensor,
     lr_size: int = 32,
@@ -249,7 +246,6 @@ def build_tokens(
     )
     return lr_flat, eig_tokens, n_list
 
-
 # ═══════════════════════════════════════════════════════════════
 # Noise Schedule — DDPM, uses registered buffers for serialization
 # ═══════════════════════════════════════════════════════════════
@@ -267,7 +263,6 @@ class NoiseSchedule:
         sa = self.sqrt_alphas[t.cpu()].to(device)
         som = self.sqrt_one_minus[t.cpu()].to(device)
         return sa.view(-1, 1, 1, 1) * x0 + som.view(-1, 1, 1, 1) * noise
-
 
 # ═══════════════════════════════════════════════════════════════
 # DINOv2 Encoder — SVD tokens → cross-attention features
@@ -326,7 +321,6 @@ class DinoEncoder(nn.Module):
         enc = self.vit_encoder(tokens, output_hidden_states=True)
         return self.vit_layernorm(enc.last_hidden_state)
 
-
 # ═══════════════════════════════════════════════════════════════
 # Token Projector — 1536d → 1024d for SD cross-attention
 # ═══════════════════════════════════════════════════════════════
@@ -343,7 +337,6 @@ class TokenProjector(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.proj(x)
-
 
 # ═══════════════════════════════════════════════════════════════
 # Diffusion Decoder — SD 2.1 U-Net + VAE (cond_fusion 代替 conv_in hack)
@@ -374,7 +367,7 @@ class DiffusionDecoder(nn.Module):
             nn.Conv2d(hidden_ch, latent_ch, kernel_size=3, stride=1, padding=1),
         )
 
-        self.scale = cfg.sd_vae.get("scaling_factor", 0.18215)
+        self.scale = self.vae.config.scaling_factor
 
     def encode(self, x: Tensor) -> Tensor:
         """Image → latent (B, 4, H/8, W/8)"""
@@ -394,7 +387,6 @@ class DiffusionDecoder(nn.Module):
         """Predict noise. Input: noisy (B,4,H,W) + cond (B,4,H,W), output: (B,4,H,W)"""
         x = self.cond_fusion(torch.cat([noisy, cond], dim=1))
         return self.unet(x, t, encoder_hidden_states=cross_tokens, return_dict=False)[0]
-
 
 # ═══════════════════════════════════════════════════════════════
 # SRDiffusion — full pipeline, PreTrainedModel compatible
@@ -588,19 +580,10 @@ class SRDiffusion(PreTrainedModel):
         t = torch.randint(0, cfg.train_timesteps, (B,), device=device)
         noisy = self.noise_schedule.add_noise(hr_z, noise, t)
 
-        # ── 4. U-Net predict noise → ε-MSE + x₀ KL constraint ──
+        # ── 4. U-Net predict noise → ε-MSE (standard DDPM) ──
         pred = self.decoder(noisy, cond, t, cross)
-        loss_noise = F.mse_loss(pred, noise)
 
-        alpha_bar = self._alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
-        x0_pred = (
-            (noisy - (1.0 - alpha_bar).sqrt() * pred)
-            / alpha_bar.sqrt().clamp(min=1e-8)
-        )
-        loss_recon = F.mse_loss(x0_pred, hr_z)
-
-        # ── 5. Loss: ε-MSE + 0.5·x₀-MSE ──
-        loss = loss_noise + loss_recon * 0.5
+        loss = F.mse_loss(pred, noise)
 
         if return_dict:
             return {"loss": loss, "pred": pred, "noise": noise}
