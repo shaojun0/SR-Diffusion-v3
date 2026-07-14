@@ -30,6 +30,8 @@
 
 SR-Diffusion v3 的外壳是超分模型，但内核是一套**通用视觉编码管线**：
 
+![SR-Diffusion v3 Architecture](assets/architecture.png)
+
 ```
 原始图像
   │
