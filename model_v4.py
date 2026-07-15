@@ -1,18 +1,18 @@
 """
-SR-Diffusion v4: DINOv2 整图 patch + 动态 special tokens 信息瓶颈.
+SR-Diffusion v4: DINOv2 整图 patch + SVD 特征向量瓶颈.
 PreTrainedModel 兼容.
 
 Pipeline:
   1. Image(1024²) → resize 448² → DINOv2 patch_embed → 1024 patch tokens (1536d)
-  2. SVD on grayscale → energy threshold → n (dynamic, 每张图不同)
-  3. n learnable special tokens + 1024 patches → DINOv2 Encoder (self-attention)
-  4. n special token outputs → Projector → U-Net cross-attn (1024d)
+  2. Image → grayscale → SVD → n eig_vectors (动态, energy threshold)
+  3. [CLS, eig_vectors_n, patches_1024] → DINOv2 Encoder (self-attention)
+  4. n eig vector positions 的输出 → Projector → U-Net cross-attn (1024d)
   5. Diffusion: ε-MSE + x₀-MSE (same as v3)
 
 Changes from v3:
-  - 去掉 SVD eig_tokens 作为输入特征 → 改为只用于定 n
-  - DINOv2 输入改为 [CLS, special_n, patches_1024]
-  - DINOv2 输出只取 special tokens → decoder cross-attn (信息瓶颈)
+  - DINOv2 输入改为 [CLS, eig_tokens, patches_1024] (patches=整图特征, eig=结构瓶颈)
+  - DINOv2 输出只取 eig token 的位置 → decoder cross-attn
+  - 保留 SVD eig_tokens 作为输入特征 (不是 learnable special tokens)
 """
 
 import math
@@ -43,9 +43,9 @@ class SRDiffusionV4Config(PretrainedConfig):
         image_size: int = 1024,
         dino_input_size: int = 448,       # resize target: 32*14=448 for 1024 patches
         num_patches: int = 1024,           # 32×32
-        max_special: int = 64,             # 最大特殊 token 数
+        max_eig: int = 64,                 # 最大特征向量数
         energy_threshold: float = 0.95,    # SVD 能量阈值 → 动态 n
-        min_special: int = 16,             # 最小特殊 token 数
+        min_eig: int = 16,                 # 最小特征向量数
         # ── Latent ──
         latent_size: int = 128,
         in_channels: int = 3,
@@ -152,9 +152,9 @@ class SRDiffusionV4Config(PretrainedConfig):
         self.image_size = image_size
         self.dino_input_size = dino_input_size
         self.num_patches = num_patches
-        self.max_special = max_special
+        self.max_eig = max_eig
         self.energy_threshold = energy_threshold
-        self.min_special = min_special
+        self.min_eig = min_eig
         self.latent_size = latent_size
         self.in_channels = in_channels
         self.latent_channels = latent_channels
@@ -176,71 +176,72 @@ class SRDiffusionV4Config(PretrainedConfig):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SVD — 只用于定 n (与 v3 完全一致)
+# SVD — 算特征向量 + 动态 n (与 v3 完全一致)
 # ═══════════════════════════════════════════════════════════════
 
-def compute_n_from_svd(
+def svd_eigenvectors(
     img: Tensor,
     energy_threshold: float = 0.95,
     max_n: int = 64,
     min_n: int = 16,
-) -> list[int]:
-    """(B, 3, H, W) → n_list: 每张图的特殊 token 数量
+):
+    """(B, 3, H, W) → padded eig_tokens (B, max_n, H), n_list
 
-    算法与 v3 完全一致: grayscale → SVD → 累计能量阈值 → n
+    与 v3 model_v3.svd_eigenvectors 完全一致.
     """
     gray = 0.2989 * img[:, 0] + 0.5870 * img[:, 1] + 0.1140 * img[:, 2]  # (B, H, W)
-    B = gray.size(0)
-    n_list = []
+    B, H, _ = gray.shape
+    eig_padded, n_list = [], []
 
     for b in range(B):
-        _, s, _ = torch.linalg.svd(gray[b].float(), full_matrices=False)
+        u, s, _ = torch.linalg.svd(gray[b].float())
         s2 = s ** 2
-        total = s2.sum()
-        if total > 0:
-            n = torch.searchsorted(s2.cumsum(0), energy_threshold * total).item() + 1
-        else:
-            n = min_n
-        n_list.append(max(min_n, min(n, max_n)))
+        n = torch.searchsorted(s2.cumsum(0), energy_threshold * s2.sum()).item() + 1
+        n = max(min_n, min(n, max_n))
+        eig_padded.append(u[:, :n].T)  # (n, H)
+        n_list.append(n)
 
-    return n_list
+    max_nb = max(n_list)
+    out = torch.zeros(B, max_nb, H, device=img.device, dtype=torch.float32)
+    for b, (e, n) in enumerate(zip(eig_padded, n_list)):
+        out[b, :n] = e
+    return out, n_list
 
 
 # ═══════════════════════════════════════════════════════════════
-# DINOv2 Encoder v4 — patch tokens + dynamic special tokens
+# DINOv2 Encoder v4 — patch tokens + SVD eig_tokens
 # ═══════════════════════════════════════════════════════════════
 
 class DinoEncoderV4(nn.Module):
-    """DINOv2 encoder: image patches + learnable special tokens → encoder → special outputs.
+    """DINOv2 encoder: image patches + SVD eig_tokens → encoder → eig outputs.
 
     Input:
         img (B, 3, 1024, 1024)
     Process:
         1. resize 448² → DINOv2 patch_embed → 1024 tokens (1536d)
-        2. add max_special learnable special tokens
-        3. add position embeddings (interpolated from DINOv2)
+        2. SVD → eig_tokens (B, n, 1024) → eig_proj → (B, n, 1536)
+        3. [CLS, eig_tokens, patches] + position embed
         4. DINOv2 transformer encoder
     Output:
-        special_token_features (B, max_special, 1536) — 每张图用前 n 个
+        eig_features (B, max_eig, 1536) — eig token 位置的 encoder 输出
     """
 
     def __init__(self, cfg: SRDiffusionV4Config):
         super().__init__()
-        self.max_special = cfg.max_special
+        self.max_eig = cfg.max_eig
         self.num_patches = cfg.num_patches
         self.dino_input_size = cfg.dino_input_size
         self.hidden_size = cfg.dino_hidden
+        self.image_size = cfg.image_size
 
         # ── DINOv2 native patch embed (Conv2d 3→1536, k14 s14) ──
         dino_config = Dinov2Config.from_dict(cfg.dino)
         self.patch_embed = Dinov2Embeddings(dino_config)
 
-        # ── Learnable special tokens ──
-        self.special_tokens = nn.Parameter(
-            torch.randn(1, cfg.max_special, cfg.dino_hidden) * 0.02
-        )
+        # ── Eigenvector projection: (H) → (1536)  ──
+        self.eig_proj = nn.Linear(cfg.image_size, cfg.dino_hidden)
 
-        # ── CLS token (reuse DINOv2's or init new) ──
+        # ── CLS token ──
         self.cls_token = nn.Parameter(
             torch.randn(1, 1, cfg.dino_hidden) * 0.02
         )
@@ -251,24 +252,17 @@ class DinoEncoderV4(nn.Module):
             cfg.dino_hidden, eps=dino_config.layer_norm_eps
         )
 
-        # ── Position embedding placeholder (从 DINOv2 weights 插值) ──
-        # DINOv2 native: (1, 1+37×37, 1536)
-        # We need:       (1, 1+max_special+32×32, 1536)
-        # 在 build_model 中从 pretrained 加载并插值
-        num_native_patches = (518 // 14) * (518 // 14)  # 37×37 = 1369
-        total_positions = 1 + cfg.max_special + cfg.num_patches  # 1 + 64 + 1024 = 1089
+        # ── Position embedding: [CLS, eig_max_eig, patches_1024] ──
+        # DINOv2 native: (1, 1+37×37, 1536) = (1, 1370, 1536)
+        # We need:       (1, 1+max_eig+32×32, 1536) = (1, 1089, 1536)
+        total_positions = 1 + cfg.max_eig + cfg.num_patches  # 1 + 64 + 1024 = 1089
         self.pos_embed = nn.Parameter(
             torch.randn(1, total_positions, cfg.dino_hidden) * 0.02
         )
-        self._num_native_patches = num_native_patches
 
     def _interpolate_pos_embed(self, native_pos: Tensor, native_size: int = 37,
                                 target_size: int = 32):
-        """Interpolate DINOv2 native position embeddings to target grid size.
-
-        native_pos: (num_patches, hidden) or (1, num_patches, hidden)
-        Returns: (target_size², hidden)
-        """
+        """Interpolate DINOv2 native position embeddings to target grid size."""
         if native_pos.dim() == 3:
             native_pos = native_pos[0]  # (N, H)
         return F.interpolate(
@@ -283,24 +277,17 @@ class DinoEncoderV4(nn.Module):
         cls_key = "embeddings.cls_token"
 
         if native_key in dino_state_dict:
-            # DINOv2 position: (1, 1370, 1536) = [CLS, patches_1369]
             native_pos = dino_state_dict[native_key]  # (1, 1370, 1536)
-
-            # Extract CLS position + patch positions
             cls_pos = native_pos[:, :1, :]             # (1, 1, 1536)
             patch_pos = native_pos[:, 1:, :]            # (1, 1369, 1536)
-
-            # Interpolate patches: 37×37 → 32×32
             interpolated = self._interpolate_pos_embed(patch_pos, 37, 32)  # (1024, 1536)
 
-            # Build new position embeddings
-            # [CLS, special_64, patches_1024]
+            # [CLS, eig_64, patches_1024]
             new_pos = torch.cat([
-                cls_pos,                                     # (1, 1, 1536)
-                self.pos_embed[:, 1:1 + self.max_special, :],  # (1, 64, 1536) — keep random init
-                interpolated.unsqueeze(0),                   # (1, 1024, 1536)
+                cls_pos,
+                self.pos_embed[:, 1:1 + self.max_eig, :],  # keep random init for eig positions
+                interpolated.unsqueeze(0),
             ], dim=1)
-
             self.pos_embed.data.copy_(new_pos)
             print(f"    Position embeddings: 37×37 → 32×32 (1369 → 1024 patches)")
 
@@ -310,43 +297,56 @@ class DinoEncoderV4(nn.Module):
 
     def _resize_for_patches(self, img: Tensor) -> Tensor:
         """Resize image so DINOv2 native patch_embed yields exactly num_patches tokens."""
-        # Patch embed: kernel=14, stride=14
-        # Target: 32×32 patches → image size = 32×14 = 448
         return F.interpolate(
             img, size=(self.dino_input_size, self.dino_input_size),
             mode="bicubic", align_corners=False,
         )
 
-    def forward(self, img: Tensor) -> Tensor:
+    def forward(self, img: Tensor, eig_tokens: Tensor) -> Tensor:
         """
         Args:
             img: (B, 3, 1024, 1024)
+            eig_tokens: (B, N_eig, 1024) — SVD left singular vectors (padded to batch max N)
         Returns:
-            special_features: (B, max_special, hidden) — special token encoder outputs
+            eig_features: (B, max_eig, 1536) — encoder output at eig token positions
         """
         B = img.size(0)
-        device = img.device
+        N_eig = eig_tokens.size(1)
 
         # ── 1. Resize + patch embed → 1024 tokens ──
         img_resized = self._resize_for_patches(img)
         patch_tokens = self.patch_embed(img_resized)  # (B, 1024, 1536)
 
-        # ── 2. CLS + special tokens ──
-        cls_tok = self.cls_token.expand(B, -1, -1)                           # (B, 1, 1536)
-        special_tok = self.special_tokens.expand(B, -1, -1)                  # (B, max_special, 1536)
+        # ── 2. Project eig_tokens to DINOv2 dim ──
+        eig_projected = self.eig_proj(eig_tokens)  # (B, N_eig, 1536)
 
-        # ── 3. Concatenate: [CLS, special, patches] ──
-        tokens = torch.cat([cls_tok, special_tok, patch_tokens], dim=1)      # (B, 1+N+1024, 1536)
-        tokens = tokens + self.pos_embed
+        # ── 3. CLS + eig + patches ──
+        cls_tok = self.cls_token.expand(B, -1, -1)
+        tokens = torch.cat([cls_tok, eig_projected, patch_tokens], dim=1)  # (B, 1+N_eig+1024, 1536)
+
+        # Position embedding: trim/pad to match actual token count
+        S = tokens.size(1)
+        pos = (
+            self.pos_embed[:, :S, :]
+            if S <= self.pos_embed.size(1)
+            else F.pad(self.pos_embed, (0, 0, 0, S - self.pos_embed.size(1)))
+        )
+        tokens = tokens + pos
 
         # ── 4. DINOv2 Encoder ──
         enc_out = self.encoder(tokens, output_hidden_states=True)
-        hidden = self.layernorm(enc_out.last_hidden_state)                   # (B, 1+N+1024, 1536)
+        hidden = self.layernorm(enc_out.last_hidden_state)  # (B, 1+N_eig+1024, 1536)
 
-        # ── 5. Extract special token outputs ──
-        special_features = hidden[:, 1:1 + self.max_special, :]              # (B, max_special, 1536)
+        # ── 5. Extract eig token outputs (pad to max_eig) ──
+        eig_out = hidden[:, 1:1 + N_eig, :]  # (B, N_eig, 1536)
 
-        return special_features
+        # Pad to max_eig if needed
+        if N_eig < self.max_eig:
+            pad = torch.zeros(B, self.max_eig - N_eig, self.hidden_size,
+                              device=img.device, dtype=eig_out.dtype)
+            eig_out = torch.cat([eig_out, pad], dim=1)
+
+        return eig_out  # (B, max_eig, 1536)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -536,33 +536,27 @@ class SRDiffusionV4(PreTrainedModel):
         print(f"  [Model] Total: {total/1e9:.2f}B | Trainable: {train/1e9:.2f}B | "
               f"DINO: {dino/1e6:.0f}M | U-Net: {unet/1e6:.0f}M | VAE: {vae/1e6:.0f}M")
 
-    def _get_cross_tokens(self, img: Tensor, n_list: list[int] | None = None) -> tuple[Tensor, Tensor]:
-        """Compute cross-attention tokens from image.
+    def _get_cross_tokens(self, img: Tensor, eig_tokens: Tensor, n_list: list[int]) -> Tensor:
+        """Compute cross-attention tokens from image + eig_tokens.
 
         Returns:
-            cross: (B, max_special, 1024) — cross-attention tokens (masked)
-            mask: (B, max_special) — True for active tokens, False for padded
+            cross: (B, max_eig, 1024) — cross-attention tokens (padded positions zeroed)
         """
-        B = img.size(0)
         cfg = self.config
 
-        # DINOv2 encode → special token features
-        special_features = self.dino(img)  # (B, max_special, 1536)
+        # DINOv2 encode → eig token features
+        eig_features = self.dino(img, eig_tokens)  # (B, max_eig, 1536)
 
         # Project to SD cross-attention dim
-        cross = self.projector(special_features)  # (B, max_special, 1024)
+        cross = self.projector(eig_features)  # (B, max_eig, 1024)
 
-        # Build mask based on n_list (dynamic per image)
-        if n_list is not None:
-            mask = torch.zeros(B, cfg.max_special, device=img.device, dtype=torch.bool)
-            for i, n in enumerate(n_list):
-                mask[i, :n] = True
-            # Zero out padded tokens
-            cross = cross * mask.unsqueeze(-1).float()
-        else:
-            mask = torch.ones(B, cfg.max_special, device=img.device, dtype=torch.bool)
+        # Zero out padded positions
+        mask = torch.zeros(cross.size(0), cfg.max_eig, device=img.device)
+        for i, n in enumerate(n_list):
+            mask[i, :n] = 1.0
+        cross = cross * mask.unsqueeze(-1)
 
-        return cross, mask
+        return cross
 
     def forward(self, hr: Tensor, return_dict: bool = True, **kwargs):
         """Training forward."""
@@ -574,11 +568,13 @@ class SRDiffusionV4(PreTrainedModel):
             hr = F.interpolate(hr, size=(cfg.image_size, cfg.image_size),
                                mode="bicubic", align_corners=False)
 
-        # ── 1. SVD → n_list (dynamic) ──
-        n_list = compute_n_from_svd(hr, cfg.energy_threshold, cfg.max_special, cfg.min_special)
+        # ── 1. SVD → eig_tokens + n_list (dynamic) ──
+        eig_tokens, n_list = svd_eigenvectors(
+            hr, cfg.energy_threshold, cfg.max_eig, cfg.min_eig,
+        )
 
-        # ── 2. DINOv2 → special token features → project → cross-attn tokens ──
-        cross, mask = self._get_cross_tokens(hr, n_list)
+        # ── 2. DINOv2 → eig token features → project → cross-attn tokens ──
+        cross = self._get_cross_tokens(hr, eig_tokens, n_list)
 
         # CFG conditioning dropout
         if self.training and torch.rand(1).item() < cfg.cond_dropout:
@@ -626,11 +622,13 @@ class SRDiffusionV4(PreTrainedModel):
             img = F.interpolate(img, size=(cfg.image_size, cfg.image_size),
                                 mode="bicubic", align_corners=False)
 
-        # SVD → n
-        n_list = compute_n_from_svd(img, cfg.energy_threshold, cfg.max_special, cfg.min_special)
+        # SVD → eig_tokens + n
+        eig_tokens, n_list = svd_eigenvectors(
+            img, cfg.energy_threshold, cfg.max_eig, cfg.min_eig,
+        )
 
         # DINOv2 → cross-attn tokens
-        cross, _ = self._get_cross_tokens(img, n_list)
+        cross = self._get_cross_tokens(img, eig_tokens, n_list)
 
         # LR condition latent
         lr_size = 32
