@@ -40,9 +40,9 @@ class SRDiffusionV4Config(PretrainedConfig):
         # ── DINO / SVD ──
         dino_hidden: int = 1536,
         sd_cross_attn: int = 1024,
-        image_size: int = 1024,
-        dino_input_size: int = 448,       # resize target: 32*14=448 for 1024 patches
-        num_patches: int = 1024,           # 32×32
+        patch_grid_multiple: int = 32,     # patch grid 必须是32的整数倍
+        max_patch_grid: int = 32,          # position embed buffer 预留的最大 grid 大小
+        eig_interp_size: int = 1024,       # eig_tokens 插值到固定长度再投影
         max_eig: int = 64,                 # 最大特征向量数
         energy_threshold: float = 0.95,    # SVD 能量阈值 → 动态 n
         min_eig: int = 16,                 # 最小特征向量数
@@ -149,9 +149,9 @@ class SRDiffusionV4Config(PretrainedConfig):
 
         self.dino_hidden = dino_hidden
         self.sd_cross_attn = sd_cross_attn
-        self.image_size = image_size
-        self.dino_input_size = dino_input_size
-        self.num_patches = num_patches
+        self.patch_grid_multiple = patch_grid_multiple
+        self.max_patch_grid = max_patch_grid
+        self.eig_interp_size = eig_interp_size
         self.max_eig = max_eig
         self.energy_threshold = energy_threshold
         self.min_eig = min_eig
@@ -215,12 +215,14 @@ def svd_eigenvectors(
 class DinoEncoderV4(nn.Module):
     """DINOv2 encoder: image patches + SVD eig_tokens → encoder → eig outputs.
 
+    支持任意输入尺寸，只要 patch grid 是 patch_grid_multiple 的整数倍。
+
     Input:
-        img (B, 3, 1024, 1024)
+        img (B, 3, H, W) where H,W produce grid multiple of patch_grid_multiple
     Process:
-        1. resize 448² → DINOv2 patch_embed → 1024 tokens (1536d)
-        2. SVD → eig_tokens (B, n, 1024) → eig_proj → (B, n, 1536)
-        3. [CLS, eig_tokens, patches] + position embed
+        1. resize → DINOv2 patch_embed → H'×W' tokens (1536d)
+        2. SVD → eig_tokens (B, n, H_orig) → interpolate → eig_proj → (B, n, 1536)
+        3. [CLS, eig_tokens, patches] + dynamic position embed
         4. DINOv2 transformer encoder
     Output:
         eig_features (B, max_eig, 1536) — eig token 位置的 encoder 输出
@@ -229,17 +231,18 @@ class DinoEncoderV4(nn.Module):
     def __init__(self, cfg: SRDiffusionV4Config):
         super().__init__()
         self.max_eig = cfg.max_eig
-        self.num_patches = cfg.num_patches
-        self.dino_input_size = cfg.dino_input_size
         self.hidden_size = cfg.dino_hidden
-        self.image_size = cfg.image_size
+        self.grid_multiple = cfg.patch_grid_multiple
+        self.eig_interp_size = cfg.eig_interp_size
+        self.max_grid = cfg.max_patch_grid
+        self._patch_size = cfg.dino.get("patch_size", 14)
 
         # ── DINOv2 native patch embed (Conv2d 3→1536, k14 s14) ──
         dino_config = Dinov2Config.from_dict(cfg.dino)
         self.patch_embed = Dinov2Embeddings(dino_config)
 
-        # ── Eigenvector projection: (H) → (1536)  ──
-        self.eig_proj = nn.Linear(cfg.image_size, cfg.dino_hidden)
+        # ── Eigenvector projection: fixed interp size → 1536 ──
+        self.eig_proj = nn.Linear(cfg.eig_interp_size, cfg.dino_hidden)
 
         # ── CLS token ──
         self.cls_token = nn.Parameter(
@@ -248,102 +251,122 @@ class DinoEncoderV4(nn.Module):
 
         # ── DINOv2 Transformer Encoder ──
         self.encoder = Dinov2Encoder(dino_config)
-        self.layernorm = nn.LayerNorm(
-            cfg.dino_hidden, eps=dino_config.layer_norm_eps
+        self.layernorm = nn.LayerNorm(cfg.dino_hidden, eps=dino_config.layer_norm_eps)
+
+        # ── Position embeddings ──
+        # cls_eig_pos: fixed positions for CLS + eig tokens (1 + max_eig)
+        self.cls_eig_pos = nn.Parameter(
+            torch.randn(1, 1 + cfg.max_eig, cfg.dino_hidden) * 0.02
         )
-
-        # ── Position embedding: [CLS, eig_max_eig, patches_1024] ──
-        # DINOv2 native: (1, 1+37×37, 1536) = (1, 1370, 1536)
-        # We need:       (1, 1+max_eig+32×32, 1536) = (1, 1089, 1536)
-        total_positions = 1 + cfg.max_eig + cfg.num_patches  # 1 + 64 + 1024 = 1089
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, total_positions, cfg.dino_hidden) * 0.02
+        # _native_patch_pos: stored from DINOv2 pretrained, dynamically interpolated
+        max_native = (cfg.max_patch_grid * cfg.max_patch_grid)
+        self.register_buffer(
+            "_native_patch_pos",
+            torch.randn(1, max_native, cfg.dino_hidden) * 0.02
         )
+        self._native_grid = 37  # DINOv2-giant native: 37×37
 
-    def _interpolate_pos_embed(self, native_pos: Tensor, native_size: int = 37,
-                                target_size: int = 32):
-        """Interpolate DINOv2 native position embeddings to target grid size."""
-        if native_pos.dim() == 3:
-            native_pos = native_pos[0]  # (N, H)
-        return F.interpolate(
-            native_pos.reshape(1, native_size, native_size, -1).permute(0, 3, 1, 2),
-            size=(target_size, target_size),
-            mode="bicubic", align_corners=False,
-        ).permute(0, 2, 3, 1).reshape(target_size * target_size, -1)
+    def _compute_grid(self, H: int, W: int) -> tuple[int, int]:
+        """Round H,W to produce a grid that's a multiple of grid_multiple."""
+        g = self.grid_multiple
+        h_grid = max(round(H / self._patch_size / g), 1) * g
+        w_grid = max(round(W / self._patch_size / g), 1) * g
+        return h_grid, w_grid
 
-    def load_interpolated_pos_embed(self, dino_state_dict: dict):
-        """从 DINOv2 pretrained 加载并插值 position embeddings。"""
+    def _interpolate_pos(self, target_h: int, target_w: int) -> Tensor:
+        """Interpolate native patch positions to target grid."""
+        np = self._native_patch_pos[0]  # (max_native, hidden)
+        np = np[:self._native_grid * self._native_grid]  # (1369, hidden)
+        np = np.reshape(self._native_grid, self._native_grid, -1)
+        np = np.permute(2, 0, 1).unsqueeze(0)  # (1, hidden, 37, 37)
+        interp = F.interpolate(np, size=(target_h, target_w),
+                               mode="bicubic", align_corners=False)
+        num = target_h * target_w
+        return interp.permute(0, 2, 3, 1).reshape(1, num, -1)  # (1, num, hidden)
+
+    def load_native_pos_embed(self, dino_state_dict: dict):
+        """从 DINOv2 pretrained 加载 position embeddings。"""
         native_key = "embeddings.position_embeddings"
         cls_key = "embeddings.cls_token"
 
         if native_key in dino_state_dict:
             native_pos = dino_state_dict[native_key]  # (1, 1370, 1536)
             cls_pos = native_pos[:, :1, :]             # (1, 1, 1536)
-            patch_pos = native_pos[:, 1:, :]            # (1, 1369, 1536)
-            interpolated = self._interpolate_pos_embed(patch_pos, 37, 32)  # (1024, 1536)
+            patch_pos = native_pos[0, 1:, :]           # (1369, 1536)
 
-            # [CLS, eig_64, patches_1024]
-            new_pos = torch.cat([
-                cls_pos,
-                self.pos_embed[:, 1:1 + self.max_eig, :],  # keep random init for eig positions
-                interpolated.unsqueeze(0),
-            ], dim=1)
-            self.pos_embed.data.copy_(new_pos)
-            print(f"    Position embeddings: 37×37 → 32×32 (1369 → 1024 patches)")
+            # Store native patch positions in buffer
+            nn = patch_pos.size(0)
+            self._native_patch_pos[0, :nn, :] = patch_pos
+            self._native_grid = int(math.sqrt(nn))  # 37
+
+            # Init CLS pos from pretrained
+            self.cls_eig_pos.data[:, :1, :].copy_(cls_pos)
+            print(f"    Native pos_embed: {self._native_grid}×{self._native_grid}={nn} stored")
 
         if cls_key in dino_state_dict:
             self.cls_token.data.copy_(dino_state_dict[cls_key])
             print(f"    CLS token: loaded from pretrained")
 
-    def _resize_for_patches(self, img: Tensor) -> Tensor:
-        """Resize image so DINOv2 native patch_embed yields exactly num_patches tokens."""
-        return F.interpolate(
-            img, size=(self.dino_input_size, self.dino_input_size),
-            mode="bicubic", align_corners=False,
-        )
-
     def forward(self, img: Tensor, eig_tokens: Tensor) -> Tensor:
         """
         Args:
-            img: (B, 3, 1024, 1024)
-            eig_tokens: (B, N_eig, 1024) — SVD left singular vectors (padded to batch max N)
+            img: (B, 3, H, W) — any size, will be resized to valid grid
+            eig_tokens: (B, N_eig, H_orig) — SVD left singular vectors
         Returns:
-            eig_features: (B, max_eig, 1536) — encoder output at eig token positions
+            eig_features: (B, max_eig, 1536)
         """
-        B = img.size(0)
+        B, C, H, W = img.shape
+        device = img.device
         N_eig = eig_tokens.size(1)
 
-        # ── 1. Resize + patch embed → 1024 tokens ──
-        img_resized = self._resize_for_patches(img)
-        patch_tokens = self.patch_embed(img_resized)  # (B, 1024, 1536)
+        # ── 1. Compute target grid & resize image ──
+        h_grid, w_grid = self._compute_grid(H, W)
+        target_H = h_grid * self._patch_size
+        target_W = w_grid * self._patch_size
+        num_patches = h_grid * w_grid
 
-        # ── 2. Project eig_tokens to DINOv2 dim ──
+        img_resized = F.interpolate(img, size=(target_H, target_W),
+                                    mode="bicubic", align_corners=False)
+        patch_tokens = self.patch_embed(img_resized)  # (B, num_patches, 1536)
+
+        # ── 2. Interpolate eig_tokens to fixed size → project ──
+        if eig_tokens.size(2) != self.eig_interp_size:
+            eig_tokens = F.interpolate(
+                eig_tokens.unsqueeze(1),  # (B, 1, N_eig, L)
+                size=(N_eig, self.eig_interp_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
         eig_projected = self.eig_proj(eig_tokens)  # (B, N_eig, 1536)
 
-        # ── 3. CLS + eig + patches ──
+        # ── 3. Build tokens: [CLS, eig_projected, patches] ──
         cls_tok = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls_tok, eig_projected, patch_tokens], dim=1)  # (B, 1+N_eig+1024, 1536)
+        tokens = torch.cat([cls_tok, eig_projected, patch_tokens], dim=1)
+        S = tokens.size(1)  # 1 + N_eig + num_patches
 
-        # Position embedding: trim/pad to match actual token count
-        S = tokens.size(1)
-        pos = (
-            self.pos_embed[:, :S, :]
-            if S <= self.pos_embed.size(1)
-            else F.pad(self.pos_embed, (0, 0, 0, S - self.pos_embed.size(1)))
-        )
+        # ── 4. Dynamic position embedding ──
+        patch_pos = self._interpolate_pos(h_grid, w_grid).to(device)
+        # Pad patch_pos to max_grid×max_grid if needed (for larger grids)
+        if num_patches > patch_pos.size(1):
+            extra = torch.zeros(1, num_patches - patch_pos.size(1), self.hidden_size, device=device)
+            patch_pos = torch.cat([patch_pos, extra], dim=1)
+        pos = torch.cat([self.cls_eig_pos, patch_pos], dim=1)  # (1, 1+max_eig+num_patches, hidden)
+
+        # Trim/pad to match token count
+        if S <= pos.size(1):
+            pos = pos[:, :S, :]
+        else:
+            pos = F.pad(pos, (0, 0, 0, S - pos.size(1)))
         tokens = tokens + pos
 
-        # ── 4. DINOv2 Encoder ──
+        # ── 5. DINOv2 Encoder ──
         enc_out = self.encoder(tokens, output_hidden_states=True)
-        hidden = self.layernorm(enc_out.last_hidden_state)  # (B, 1+N_eig+1024, 1536)
+        hidden = self.layernorm(enc_out.last_hidden_state)  # (B, S, 1536)
 
-        # ── 5. Extract eig token outputs (pad to max_eig) ──
-        eig_out = hidden[:, 1:1 + N_eig, :]  # (B, N_eig, 1536)
-
-        # Pad to max_eig if needed
+        # ── 6. Extract eig token outputs (pad to max_eig) ──
+        eig_out = hidden[:, 1:1 + N_eig, :]
         if N_eig < self.max_eig:
             pad = torch.zeros(B, self.max_eig - N_eig, self.hidden_size,
-                              device=img.device, dtype=eig_out.dtype)
+                              device=device, dtype=eig_out.dtype)
             eig_out = torch.cat([eig_out, pad], dim=1)
 
         return eig_out  # (B, max_eig, 1536)
@@ -493,8 +516,8 @@ class SRDiffusionV4(PreTrainedModel):
             print(f"    encoder+ln: missing={len(missing)} (special_tokens/cls/pos — expected), "
                   f"unexpected={len(unexpected)}")
 
-            # 插值 position embeddings
-            self.dino.load_interpolated_pos_embed(pt_state)
+            # 加载 native position embeddings (forward 时动态插值)
+            self.dino.load_native_pos_embed(pt_state)
 
             del dino_pt
 
@@ -559,14 +582,10 @@ class SRDiffusionV4(PreTrainedModel):
         return cross
 
     def forward(self, hr: Tensor, return_dict: bool = True, **kwargs):
-        """Training forward."""
+        """Training forward. hr can be any size (grid multiple of 32)."""
         B, device = hr.size(0), hr.device
+        H_img, W_img = hr.shape[2], hr.shape[3]
         cfg = self.config
-
-        # Resize if needed
-        if hr.shape[2] != cfg.image_size or hr.shape[3] != cfg.image_size:
-            hr = F.interpolate(hr, size=(cfg.image_size, cfg.image_size),
-                               mode="bicubic", align_corners=False)
 
         # ── 1. SVD → eig_tokens + n_list (dynamic) ──
         eig_tokens, n_list = svd_eigenvectors(
@@ -580,11 +599,11 @@ class SRDiffusionV4(PreTrainedModel):
         if self.training and torch.rand(1).item() < cfg.cond_dropout:
             cross = torch.zeros_like(cross)
 
-        # ── 3. LR condition latent (down-up bicubic) ──
-        lr_size = 32  # fixed; could be configurable
+        # ── 3. LR condition latent (down-up bicubic, matches input size) ──
+        lr_size = 32
         lr_img = F.interpolate(
             F.interpolate(hr, size=(lr_size, lr_size), mode="bicubic", align_corners=False),
-            size=(cfg.image_size, cfg.image_size), mode="bicubic", align_corners=False,
+            size=(H_img, W_img), mode="bicubic", align_corners=False,
         )
         cond = self.decoder.encode(lr_img)
 
@@ -614,13 +633,10 @@ class SRDiffusionV4(PreTrainedModel):
 
     @torch.no_grad()
     def sample(self, img: Tensor, steps: int = 25) -> tuple[Tensor, list[int]]:
-        """DDIM sampling. img is the input image (training: HR, inference: LR upscaled)."""
+        """DDIM sampling. img can be any size (grid multiple of 32)."""
         B, device = img.size(0), img.device
+        H_img, W_img = img.shape[2], img.shape[3]
         cfg = self.config
-
-        if img.shape[2] != cfg.image_size or img.shape[3] != cfg.image_size:
-            img = F.interpolate(img, size=(cfg.image_size, cfg.image_size),
-                                mode="bicubic", align_corners=False)
 
         # SVD → eig_tokens + n
         eig_tokens, n_list = svd_eigenvectors(
@@ -630,11 +646,11 @@ class SRDiffusionV4(PreTrainedModel):
         # DINOv2 → cross-attn tokens
         cross = self._get_cross_tokens(img, eig_tokens, n_list)
 
-        # LR condition latent
+        # LR condition latent (matches input size)
         lr_size = 32
         lr_img = F.interpolate(
             F.interpolate(img, size=(lr_size, lr_size), mode="bicubic", align_corners=False),
-            size=(cfg.image_size, cfg.image_size), mode="bicubic", align_corners=False,
+            size=(H_img, W_img), mode="bicubic", align_corners=False,
         )
         cond = self.decoder.encode(lr_img)
 
@@ -642,7 +658,9 @@ class SRDiffusionV4(PreTrainedModel):
         step_ratio = cfg.train_timesteps // steps
         timesteps = (torch.arange(steps - 1, -1, -1) * step_ratio).long().to(device)
 
-        z = torch.randn(B, cfg.latent_channels, cfg.latent_size, cfg.latent_size, device=device)
+        # Latent size depends on input image size
+        lH, lW = H_img // 8, W_img // 8
+        z = torch.randn(B, cfg.latent_channels, lH, lW, device=device)
         ac = self._alphas_cumprod
 
         for t in timesteps:
