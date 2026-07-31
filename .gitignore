@@ -1,1 +1,21 @@
+# Checkpoints & outputs
+sr_qwen_vl_v10_output/
+*.pt
+*.bin
+*.safetensors
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# SVD cache (large)
+svd_cache/
