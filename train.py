@@ -4,10 +4,9 @@ SR-Qwen-VL v10: Training with HF Trainer + bitsandbytes 8-bit AdamW
 SVD(1024×1024) → (2n,1024) matrix → DINO Encoder → MLP → Qwen → Text
 
 v4: Dataset 从 Parquet 加载（image_bytes + text），
-    SVD + tokenize 全部在 collate_fn 里完成，batched SVD + LRU 缓存。
+    SVD + tokenize 全部在 collate_fn 里完成，batched SVD。
 """
-import os, sys, io, hashlib
-from functools import lru_cache
+import os, sys, io
 import torch
 import numpy as np
 import pandas as pd
@@ -56,98 +55,77 @@ WARMUP_RATIO        = 0.03
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-FULL_DIM = 2 * SVD_MAX_EIG  # 256
-
 
 # ═══════════════════════════════════════════════════════════════
-# Image Bytes → Patches helper (CPU, pure function)
+# Image helper — handles both PIL Image and raw bytes
 # ═══════════════════════════════════════════════════════════════
 
-def load_image_as_feature(image_bytes,
+def load_image_as_feature(image_input,
                           image_size: int = 1024) -> torch.Tensor:
-    """Load single image → grayscale → patchify → (n_patches, patch_dim)."""
-    img = img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    """Load single image → grayscale → (image_size, image_size) matrix.
+
+    Accepts PIL.Image or raw bytes (JPEG/PNG).
+    HF datasets auto-decodes image columns to PIL.Image.
+    """
+    if isinstance(image_input, Image.Image):
+        img = image_input.convert("L")
+    else:
+        img = Image.open(io.BytesIO(image_input)).convert("L")
     img = img.resize((image_size, image_size), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0
     t = torch.from_numpy(arr)
-    return t-t.mean()  # (n_patches, patch_dim)   → (1024, 1024) for default params
-# ═══════════════════════════════════════════════════════════════
-# SVD LRU Cache — per-image, keyed by content hash (md5)
-# ═══════════════════════════════════════════════════════════════
-
-# Shared dict — populated by batched SVD in collate_fn.
-# Keys: md5_hex of image_bytes  →  Values: (U_cpu, S_cpu, Vh_cpu)
-_svd_cache_dict: dict = {}
-
-
-@lru_cache(maxsize=4096)
-def _svd_single_lru(content_hash: str) -> tuple:
-    """Get SVD result by content hash.  Shared-dict hit → instant.
-
-    Returns (U, S, Vh) as CPU tensors: U(1024,1024), S(1024,), Vh(1024,1024).
-
-    The shared _svd_cache_dict is populated by batched collate_fn;
-    this function is the LRU-cached retrieval path.
-    On a miss (should not happen under normal collate_fn flow) it raises.
-    """
-    if content_hash in _svd_cache_dict:
-        return _svd_cache_dict[content_hash]
-
-    raise KeyError(
-        f"SVD not computed for hash {content_hash}. "
-        f"This should not happen — collate_fn always batches uncached images first."
-    )
+    return t - t.mean()
 
 
 # ═══════════════════════════════════════════════════════════════
-# Dataset — reads Parquet, returns raw image_bytes + text
+# Dataset — reads Parquet, returns raw image + text
 # ═══════════════════════════════════════════════════════════════
 
 class RawParquetDataset(Dataset):
-    """__getitem__ → { "image_bytes": bytes, "text": str }.
+    """__getitem__ → {"image": PIL.Image | bytes, "text": str}.
 
-    Reads from a single .parquet file with columns:
-      image        — bytes (JPEG/PNG)
-      zh_caption   — str (中文描述)
-      violations   — str or None/NaN
-
-    No SVD, no tokenize — all heavy lifting deferred to collate_fn.
+    Reads from a single .parquet file (path or pre-loaded DataFrame).
+    Columns: image (JPEG/PNG bytes), image_caption (str), violations (str or None).
     """
 
     def __init__(self, dataset):
-        self.dataset = dataset
+        if isinstance(dataset, str):
+            self.dataset = pd.read_parquet(dataset, engine="pyarrow")
+        elif isinstance(dataset, pd.DataFrame):
+            self.dataset = dataset
+        else:
+            self.dataset = dataset
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        row = self.dataset[idx]
-
-        image_bytes: bytes = row["image"]
+        row = self.dataset.iloc[idx]
+        image = row["image"]  # bytes or PIL.Image (HF datasets auto-decodes)
         caption: str = row["image_caption"]
         violations = row["violations"]
 
         base = f"描述这张建筑工地图片：{caption}"
         text = base if violations is None else f"{base}\n隐患：{violations}"
 
-        return {"image_bytes": image_bytes, "text": text}
+        return {"image_bytes": image, "text": text}
 
 
 # ═══════════════════════════════════════════════════════════════
-# Collate Function Factory — owns tokenizer, does SVD + tokenize
+# Collate Function — batched SVD + tokenize
 # ═══════════════════════════════════════════════════════════════
 
 class SVDCollector:
-    def __init__(self,tokenizer):
+    def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def __call__(self, *args, **kwargs):
-        return self.collate_fn(*args, **kwargs)
+    def __call__(self, batch):
+        return self.collate_fn(batch)
 
-    def collate_fn(self,batch: list) -> dict:
+    def collate_fn(self, batch: list) -> dict:
         texts = [item["text"] for item in batch]
-        image_bytes_list: list[bytes] = [item["image_bytes"] for item in batch]
-        svd_matrix = self._lazy_build_svd(image_bytes_list)
+        images = [item["image_bytes"] for item in batch]
+        svd_matrix = self._build_svd(images)
         encodings = self.tokenizer(
             texts,
             padding=True,
@@ -166,8 +144,8 @@ class SVDCollector:
             "labels": labels,
         }
 
-    @lru_cache
-    def _lazy_build_svd(self, images):
+    def _build_svd(self, images):
+        """Batched SVD: (B, H, W) → (B, 2n, 1024)."""
         features_batch = torch.stack([
             load_image_as_feature(b, SVD_IMAGE_SIZE)
             for b in images
@@ -189,14 +167,17 @@ class SVDCollector:
         return self._pad(svd_list)
 
     def _pad(self, mats: list[torch.Tensor]) -> torch.Tensor:
-        """Pad or truncate to full_dim."""
-        full_dim = max([len(item) for item in mats])
+        """Pad to max 2n in batch."""
+        full_dim = max(len(m) for m in mats)
         pad_mats = []
         for mat in mats:
             d = mat.size(0)
-            pad = torch.zeros(full_dim - d, mat.size(1))
-            pad_mats.append(torch.cat([mat, pad], dim=0))
-        return torch.stack(pad_mats,dim=0)
+            if d < full_dim:
+                pad = torch.zeros(full_dim - d, mat.size(1))
+                mat = torch.cat([mat, pad], dim=0)
+            pad_mats.append(mat)
+        return torch.stack(pad_mats, dim=0)
+
 
 # ══ Step 1: Model ══
 config = SRQwenVLConfig(
@@ -231,7 +212,7 @@ training_args = TrainingArguments(
     weight_decay=WEIGHT_DECAY,
     logging_dir=os.path.join(OUTPUT_DIR, "logs"),
     logging_steps=10,
-    save_steps=SAVE_EVERY,
+    save_strategy="epoch",
     save_total_limit=3,
     eval_strategy="epoch",
     bf16=True,
@@ -276,4 +257,3 @@ trainer.train()
 final_dir = os.path.join(OUTPUT_DIR, "final")
 model.save_pretrained(final_dir)
 print(f"\nFinal model saved to {final_dir}")
-

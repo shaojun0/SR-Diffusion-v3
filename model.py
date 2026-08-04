@@ -44,8 +44,8 @@ class SRQwenVLConfig(PretrainedConfig):
         dino_dir: str = "",
         qwen_dir: str = "",
         # ── 子模型配置 ──
-        dino: dict | None = None,
-        qwen: dict | None = None,
+        dino: Optional[dict] = None,
+        qwen: Optional[dict] = None,
         # ── 维度 ──
         dino_dim: int = 1536,
         qwen_dim: int = 2560,
@@ -68,6 +68,8 @@ class SRQwenVLConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
 
+        self.hidden_size = qwen_dim  # for DeepSpeed ZeRO auto-config
+
         if dino is None:
             dino = {
                 "hidden_size": 1536,
@@ -86,6 +88,7 @@ class SRQwenVLConfig(PretrainedConfig):
                 "image_size": 518,
                 "patch_size": 14,
                 "num_channels": 3,
+                "_attn_implementation": "sdpa",
             }
         self.dino = dino
 
@@ -233,8 +236,8 @@ class SRQwenVLv10(PreTrainedModel):
 
     def build_model(
         self,
-        dino_dir: str | None = None,
-        qwen_dir: str | None = None,
+        dino_dir: Optional[str] = None,
+        qwen_dir: Optional[str] = None,
         device: str = "cuda",
     ) -> "SRQwenVLv10":
         """加载预训练权重。"""
