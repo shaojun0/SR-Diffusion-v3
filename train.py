@@ -63,28 +63,14 @@ FULL_DIM = 2 * SVD_MAX_EIG  # 256
 # Image Bytes → Patches helper (CPU, pure function)
 # ═══════════════════════════════════════════════════════════════
 
-def bytes_to_patches(
-    image_bytes: bytes,
-    image_size: int = SVD_IMAGE_SIZE,
-    patch_size: int = SVD_PATCH_SIZE,
-) -> torch.Tensor:
-    """Decode JPEG/PNG bytes → grayscale → patchify → (n_patches, patch_dim).
-
-    For default params: (1024, 1024) — 1024 patches, 1024-dimensional.
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+def load_image_as_feature(image_bytes,
+                          image_size: int = 1024) -> torch.Tensor:
+    """Load single image → grayscale → patchify → (n_patches, patch_dim)."""
+    img = img = Image.open(io.BytesIO(image_bytes)).convert("L")
     img = img.resize((image_size, image_size), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0
     t = torch.from_numpy(arr)
-
-    patches = t.unfold(0, patch_size, patch_size).unfold(1, patch_size, patch_size)
-    n_patches = patches.shape[0] * patches.shape[1]
-    patch_dim = patch_size * patch_size
-    patches = patches.reshape(n_patches, patch_dim)
-    patches = patches - patches.mean(dim=1, keepdim=True)
-    return patches  # (1024, 1024)
-
-
+    return t-t.mean()  # (n_patches, patch_dim)   → (1024, 1024) for default params
 # ═══════════════════════════════════════════════════════════════
 # SVD LRU Cache — per-image, keyed by content hash (md5)
 # ═══════════════════════════════════════════════════════════════
@@ -128,30 +114,18 @@ class RawParquetDataset(Dataset):
     No SVD, no tokenize — all heavy lifting deferred to collate_fn.
     """
 
-    def __init__(self, parquet_path: str):
-        self.parquet_path = parquet_path
-        self.df = pd.read_parquet(parquet_path)
-
-        # ── Pre-extract strings from DataFrame for speed ──
-        self._zh_captions = self.df["zh_caption"].tolist()
-
-        raw_violations = self.df["violations"].tolist()
-        self._violations: list = []
-        for v in raw_violations:
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                self._violations.append(None)
-            else:
-                self._violations.append(str(v))
+    def __init__(self, dataset):
+        self.dataset = dataset
 
     def __len__(self) -> int:
-        return len(self.df)
+        return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        row = self.df.iloc[idx]
+        row = self.dataset[idx]
 
         image_bytes: bytes = row["image"]
-        caption: str = self._zh_captions[idx]
-        violations = self._violations[idx]
+        caption: str = row["image_caption"]
+        violations = row["violations"]
 
         base = f"描述这张建筑工地图片：{caption}"
         text = base if violations is None else f"{base}\n隐患：{violations}"
@@ -163,79 +137,18 @@ class RawParquetDataset(Dataset):
 # Collate Function Factory — owns tokenizer, does SVD + tokenize
 # ═══════════════════════════════════════════════════════════════
 
-def make_collator(tokenizer):
-    """Returns a collate_fn that does batched SVD + batch tokenize."""
+class SVDCollector:
+    def __init__(self,tokenizer):
+        self.tokenizer = tokenizer
 
-    def collate_fn(batch: list) -> dict:
+    def __call__(self, *args, **kwargs):
+        return self.collate_fn(*args, **kwargs)
+
+    def collate_fn(self,batch: list) -> dict:
         texts = [item["text"] for item in batch]
         image_bytes_list: list[bytes] = [item["image_bytes"] for item in batch]
-
-        # ── 1. Compute content hashes & identify uncached images ──
-        content_hashes = [hashlib.md5(b).hexdigest() for b in image_bytes_list]
-        uncached_hashes = [h for h in content_hashes if h not in _svd_cache_dict]
-
-        # ── 2. Batched SVD for uncached images on GPU ──
-        if uncached_hashes:
-            # Build mapping: hash → image_bytes for uncached only
-            hash_to_bytes = {
-                content_hashes[i]: image_bytes_list[i]
-                for i, h in enumerate(content_hashes)
-                if h in uncached_hashes
-            }
-
-            # Patchify all uncached images → stack → GPU
-            uncached_bytes = [hash_to_bytes[h] for h in uncached_hashes]
-            patches_batch = torch.stack([
-                bytes_to_patches(b, SVD_IMAGE_SIZE, SVD_PATCH_SIZE)
-                for b in uncached_bytes
-            ]).cuda()  # (U, 1024, 1024)
-
-            with torch.no_grad():
-                U, S, Vh = torch.linalg.svd(patches_batch, full_matrices=False)
-                # U  (U, 1024, 1024)   S  (U, 1024)   Vh (U, 1024, 1024)
-
-            # Energy-based truncation  (per-batch vector — no .item())
-            S_sq = S * S
-            total_e = S_sq.sum(dim=1, keepdim=True)
-            cumsum = torch.cumsum(S_sq, dim=1)
-            n_per_img = (cumsum / total_e < SVD_ENERGY_THRESHOLD).sum(dim=1) + 1
-            n_per_img = n_per_img.clamp(min=32, max=SVD_MAX_EIG).cpu()
-
-            # Store full (U, S, Vh) in shared dict
-            for k, ch in enumerate(uncached_hashes):
-                _svd_cache_dict[ch] = (
-                    U[k].cpu(),   # (1024, 1024)
-                    S[k].cpu(),   # (1024,)
-                    Vh[k].cpu(),  # (1024, 1024)
-                )
-
-        # ── 3. Retrieve SVD results via _svd_single_lru (LRU-cached) ──
-        svd_results = [_svd_single_lru(h) for h in content_hashes]
-
-        # ── 4. Build padded SVD matrices from (U, S, Vh) ──
-        svd_matrices: list[torch.Tensor] = []
-
-        for U_img, S_img, Vh_img in svd_results:  # all on CPU
-            S_sq = S_img * S_img
-            total_e = S_sq.sum()
-            cumsum = torch.cumsum(S_sq, dim=0)
-            n = (cumsum / total_e < SVD_ENERGY_THRESHOLD).sum() + 1
-            n = n.clamp(32, SVD_MAX_EIG)         # 0-dim tensor
-
-            U_top = U_img[:, :n].T               # (n, 1024)  — U^T
-            Vh_top = Vh_img[:n, :]               # (n, 1024)  — Vh rows
-            mat = torch.cat([U_top, Vh_top], dim=0)  # (2n, 1024)
-
-            # Pad to FULL_DIM = 2 * SVD_MAX_EIG
-            d = mat.size(0)
-            if d < FULL_DIM:
-                padding = torch.zeros(FULL_DIM - d, mat.size(1))
-                mat = torch.cat([mat, padding], dim=0)
-
-            svd_matrices.append(mat)
-
-        # ── 5. Tokenize entire batch (batched, not per-sample) ──
-        encodings = tokenizer(
+        svd_matrix = self._lazy_build_svd(image_bytes_list)
+        encodings = self.tokenizer(
             texts,
             padding=True,
             truncation=True,
@@ -246,25 +159,44 @@ def make_collator(tokenizer):
         attention_mask = encodings["attention_mask"]
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
-
         return {
-            "svd_matrix":    torch.stack(svd_matrices),
-            "input_ids":     input_ids,
+            "svd_matrix": svd_matrix,
+            "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels":        labels,
+            "labels": labels,
         }
 
-    return collate_fn
+    @lru_cache
+    def _lazy_build_svd(self, images):
+        features_batch = torch.stack([
+            load_image_as_feature(b, SVD_IMAGE_SIZE)
+            for b in images
+        ])
+        with torch.no_grad():
+            U, S, Vh = torch.linalg.svd(features_batch, full_matrices=False)
+        S_sq = S * S
+        total_e = S_sq.sum(dim=1, keepdim=True)
+        cumsum = torch.cumsum(S_sq, dim=1)
+        n_per_img = (cumsum / total_e < SVD_ENERGY_THRESHOLD).sum(dim=1) + 1
+        n_per_img = n_per_img.clamp(min=32, max=SVD_MAX_EIG)
+        svd_list = []
+        for k in range(len(images)):
+            n = n_per_img[k].item()
+            U_top = U[k, :, :n].T  # (n, 1024)
+            Vh_top = Vh[k, :n, :]  # (n, 1024)
+            mat = torch.cat([U_top, Vh_top], dim=0)  # (2n, 1024)
+            svd_list.append(mat)
+        return self._pad(svd_list)
 
-
-# ═══════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════
-
-print("=" * 60)
-print("SR-Qwen-VL v10: SVD → DINO Encoder → MLP → Qwen")
-print("  v4: Parquet dataset, SVD + tokenize in collate_fn, LRU cache")
-print("=" * 60)
+    def _pad(self, mats: list[torch.Tensor]) -> torch.Tensor:
+        """Pad or truncate to full_dim."""
+        full_dim = max([len(item) for item in mats])
+        pad_mats = []
+        for mat in mats:
+            d = mat.size(0)
+            pad = torch.zeros(full_dim - d, mat.size(1))
+            pad_mats.append(torch.cat([mat, pad], dim=0))
+        return torch.stack(pad_mats,dim=0)
 
 # ══ Step 1: Model ══
 config = SRQwenVLConfig(
@@ -283,7 +215,7 @@ test_dataset  = RawParquetDataset(PARQUET_TEST)
 print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
 # ══ Step 3: Collator (SVD + tokenize happens here) ══
-collator = make_collator(model.tokenizer)
+collator = SVDCollector(model.tokenizer)
 
 # ══ Step 4: Optimizer ══
 optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -344,3 +276,4 @@ trainer.train()
 final_dir = os.path.join(OUTPUT_DIR, "final")
 model.save_pretrained(final_dir)
 print(f"\nFinal model saved to {final_dir}")
+
