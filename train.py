@@ -241,7 +241,11 @@ print(f"{'='*60}\n")
 
 trainer.train()
 
+# 使用 trainer.save_model() 而非 model.save_pretrained()
+# DeepSpeed ZeRO-3 需要先 gather 分片参数再保存，model.save_pretrained 不会自动 gather
 final_dir = os.path.join(OUTPUT_DIR, "final")
-model.save_pretrained(final_dir)
+trainer.save_model(final_dir)
+if model.tokenizer is not None:
+    model.tokenizer.save_pretrained(final_dir)
 print(f"\nFinal model saved to {final_dir}")
 
