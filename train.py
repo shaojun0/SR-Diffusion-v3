@@ -4,14 +4,14 @@ SR-Qwen-VL v10: Training with HF Trainer + bitsandbytes 8-bit AdamW
 SVD(1024×1024) → (2n,1024) matrix → DINO Encoder → MLP → Qwen → Text
 
 v4: Dataset 从 Parquet 加载（image_bytes + text），
-    SVD + tokenize 全部在 collate_fn 里完成，batched SVD。
+    SVD + tokenize 全部在 collate_fn 里完成，batched SVD + LRU 缓存。
 """
 import os, sys, io
+from functools import lru_cache
 import torch
 import numpy as np
-import pandas as pd
-import bitsandbytes as bnb
 from PIL import Image
+from datasets import load_dataset
 from transformers import Trainer, TrainingArguments
 from torch.utils.data import Dataset
 
@@ -23,12 +23,10 @@ from model import SRQwenVLConfig, SRQwenVLv10
 # Paths
 # ═══════════════════════════════════════════════════════════════
 
-PARQUET_TRAIN   = "/root/autodl-tmp/construction_site_zh/train.parquet"
-PARQUET_TEST    = "/root/autodl-tmp/construction_site_zh/test.parquet"
-OUTPUT_DIR      = "/root/autodl-tmp/sr_qwen_vl_v10_output"
-DINOV2_DIR      = "/root/autodl-tmp/sr_dinov2/models/AI-ModelScope--dinov2-giant"
-QWEN_DIR        = "/root/autodl-tmp/qwen3.5-4B"
-
+OUTPUT_DIR      = "output/sr_qwen_vl_v10_output"
+DINOV2_DIR      = "models/dinov2-giant"
+QWEN_DIR        = "models/qwen3.5-4B"
+DATA_PATH       = "translated_dataset_with_new_fields"
 # ═══════════════════════════════════════════════════════════════
 # SVD 参数
 # ═══════════════════════════════════════════════════════════════
@@ -55,18 +53,14 @@ WARMUP_RATIO        = 0.03
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+FULL_DIM = 2 * SVD_MAX_EIG  # 256
+
 
 # ═══════════════════════════════════════════════════════════════
-# Image helper — handles both PIL Image and raw bytes
+# Image Bytes → Patches helper (CPU, pure function)
 # ═══════════════════════════════════════════════════════════════
 
-def load_image_as_feature(image_input,
-                          image_size: int = 1024) -> torch.Tensor:
-    """Load single image → grayscale → (image_size, image_size) matrix.
-
-    Accepts PIL.Image or raw bytes (JPEG/PNG).
-    HF datasets auto-decodes image columns to PIL.Image.
-    """
+def load_image_as_feature(image_input, image_size=1024):
     if isinstance(image_input, Image.Image):
         img = image_input.convert("L")
     else:
@@ -75,57 +69,55 @@ def load_image_as_feature(image_input,
     arr = np.array(img, dtype=np.float32) / 255.0
     t = torch.from_numpy(arr)
     return t - t.mean()
-
-
 # ═══════════════════════════════════════════════════════════════
-# Dataset — reads Parquet, returns raw image + text
+# Dataset — reads Parquet, returns raw image_bytes + text
 # ═══════════════════════════════════════════════════════════════
 
 class RawParquetDataset(Dataset):
-    """__getitem__ → {"image": PIL.Image | bytes, "text": str}.
+    """__getitem__ → { "image_bytes": bytes, "text": str }.
 
-    Reads from a single .parquet file (path or pre-loaded DataFrame).
-    Columns: image (JPEG/PNG bytes), image_caption (str), violations (str or None).
+    Reads from a single .parquet file with columns:
+      image        — bytes (JPEG/PNG)
+      zh_caption   — str (中文描述)
+      violations   — str or None/NaN
+
+    No SVD, no tokenize — all heavy lifting deferred to collate_fn.
     """
 
     def __init__(self, dataset):
-        if isinstance(dataset, str):
-            self.dataset = pd.read_parquet(dataset, engine="pyarrow")
-        elif isinstance(dataset, pd.DataFrame):
-            self.dataset = dataset
-        else:
-            self.dataset = dataset
+        self.dataset = dataset
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict:
-        row = self.dataset.iloc[idx]
-        image = row["image"]  # bytes or PIL.Image (HF datasets auto-decodes)
+        row = self.dataset[idx]
+
+        image_bytes: bytes = row["image"]
         caption: str = row["image_caption"]
         violations = row["violations"]
 
         base = f"描述这张建筑工地图片：{caption}"
         text = base if violations is None else f"{base}\n隐患：{violations}"
 
-        return {"image_bytes": image, "text": text}
+        return {"image_bytes": image_bytes, "text": text}
 
 
 # ═══════════════════════════════════════════════════════════════
-# Collate Function — batched SVD + tokenize
+# Collate Function Factory — owns tokenizer, does SVD + tokenize
 # ═══════════════════════════════════════════════════════════════
 
 class SVDCollector:
-    def __init__(self, tokenizer):
+    def __init__(self,tokenizer):
         self.tokenizer = tokenizer
 
-    def __call__(self, batch):
-        return self.collate_fn(batch)
+    def __call__(self, *args, **kwargs):
+        return self.collate_fn(*args, **kwargs)
 
-    def collate_fn(self, batch: list) -> dict:
+    def collate_fn(self,batch: list) -> dict:
         texts = [item["text"] for item in batch]
-        images = [item["image_bytes"] for item in batch]
-        svd_matrix = self._build_svd(images)
+        image_bytes_list: list[bytes] = [item["image_bytes"] for item in batch]
+        svd_matrix = self._lazy_build_svd(tuple(image_bytes_list))
         encodings = self.tokenizer(
             texts,
             padding=True,
@@ -144,8 +136,7 @@ class SVDCollector:
             "labels": labels,
         }
 
-    def _build_svd(self, images):
-        """Batched SVD: (B, H, W) → (B, 2n, 1024)."""
+    def _lazy_build_svd(self, images):
         features_batch = torch.stack([
             load_image_as_feature(b, SVD_IMAGE_SIZE)
             for b in images
@@ -167,17 +158,14 @@ class SVDCollector:
         return self._pad(svd_list)
 
     def _pad(self, mats: list[torch.Tensor]) -> torch.Tensor:
-        """Pad to max 2n in batch."""
-        full_dim = max(len(m) for m in mats)
+        """Pad or truncate to full_dim."""
+        full_dim = max([len(item) for item in mats])
         pad_mats = []
         for mat in mats:
             d = mat.size(0)
-            if d < full_dim:
-                pad = torch.zeros(full_dim - d, mat.size(1))
-                mat = torch.cat([mat, pad], dim=0)
-            pad_mats.append(mat)
-        return torch.stack(pad_mats, dim=0)
-
+            pad = torch.zeros(full_dim - d, mat.size(1))
+            pad_mats.append(torch.cat([mat, pad], dim=0))
+        return torch.stack(pad_mats,dim=0)
 
 # ══ Step 1: Model ══
 config = SRQwenVLConfig(
@@ -187,19 +175,16 @@ config = SRQwenVLConfig(
     svd_energy_threshold=SVD_ENERGY_THRESHOLD,
 )
 model = SRQwenVLv10(config)
-model.build_model()
+model.build_model(device="npu")
 model._enable_gradient_checkpointing()
-
+dataset = load_dataset(DATA_PATH,cache_dir="./cache")
 # ══ Step 2: Dataset (parquet, raw bytes + text) ══
-train_dataset = RawParquetDataset(PARQUET_TRAIN)
-test_dataset  = RawParquetDataset(PARQUET_TEST)
+train_dataset = RawParquetDataset(dataset["train"])
+test_dataset  = RawParquetDataset(dataset["test"])
 print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
 # ══ Step 3: Collator (SVD + tokenize happens here) ══
 collator = SVDCollector(model.tokenizer)
-
-# ══ Step 4: Optimizer ══
-optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
 # ══ Step 5: Trainer ══
 training_args = TrainingArguments(
@@ -212,9 +197,10 @@ training_args = TrainingArguments(
     weight_decay=WEIGHT_DECAY,
     logging_dir=os.path.join(OUTPUT_DIR, "logs"),
     logging_steps=10,
-    save_strategy="epoch",
+    save_steps=SAVE_EVERY,
     save_total_limit=3,
     eval_strategy="epoch",
+    save_strategy="epoch",
     bf16=True,
     dataloader_num_workers=NUM_WORKERS,
     report_to=[],
@@ -226,6 +212,7 @@ training_args = TrainingArguments(
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
     greater_is_better=False,
+    deepspeed="ds_config_zero3.json",
 )
 
 
@@ -241,7 +228,7 @@ class V10Trainer(Trainer):
 trainer = V10Trainer(
     model=model, args=training_args,
     train_dataset=train_dataset, eval_dataset=test_dataset,
-    data_collator=collator, optimizers=(optimizer, None),
+    data_collator=collator,
 )
 
 print(f"\n{'='*60}")
@@ -257,3 +244,4 @@ trainer.train()
 final_dir = os.path.join(OUTPUT_DIR, "final")
 model.save_pretrained(final_dir)
 print(f"\nFinal model saved to {final_dir}")
+
