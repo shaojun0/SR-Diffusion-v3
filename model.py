@@ -413,10 +413,6 @@ class SRQwenVLv10(PreTrainedModel):
         )
 
     def save_pretrained(self, save_directory, safe_serialization=True, **kwargs):
-        # 物化所有 meta device 上的参数，防止旧版 PyTorch 保存时存成空张量
-        for name, param in self.named_parameters():
-            if param.device.type == 'meta':
-                param.data = torch.empty(param.shape, dtype=param.dtype, device='cpu')
         super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
         if self.tokenizer is not None:
             self.tokenizer.save_pretrained(save_directory)
