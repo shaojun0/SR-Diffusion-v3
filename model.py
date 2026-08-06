@@ -233,6 +233,11 @@ class SRQwenVLv10(PreTrainedModel):
     # ═══════════════════════════════════════════════════════════
 
     @property
+    def all_tied_weights_keys(self) -> dict:
+        """No tied weights. Required by transformers >=4.55."""
+        return {}
+
+    @property
     def _keys_to_ignore_on_save(self):
         """DINO + Qwen loaded from directories — never saved in checkpoint."""
         keys = []
