@@ -170,8 +170,7 @@ class SRQwenVLv2(PreTrainedModel, GenerationMixin):
         B, device = svd_matrix.size(0), svd_matrix.device
 
         # Cast inputs to model dtype (svd collator produces fp32, model is bf16)
-        target_dtype = next(self.encoder.svd_proj.parameters()).dtype
-        svd_matrix = svd_matrix.to(dtype=target_dtype, device=device)
+        svd_matrix = svd_matrix.to(dtype=torch.bfloat16, device=device)
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
         if labels is not None:
@@ -218,8 +217,7 @@ class SRQwenVLv2(PreTrainedModel, GenerationMixin):
         **gen_kwargs,
     ) -> str:
         device = svd_matrix.device
-        target_dtype = next(self.encoder.svd_proj.parameters()).dtype
-        svd_matrix = svd_matrix.to(dtype=target_dtype, device=device)
+        svd_matrix = svd_matrix.to(dtype=torch.bfloat16, device=device)
         visual_prefix = self.projector(self.encoder(svd_matrix)).to(torch.bfloat16)
 
         prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
