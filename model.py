@@ -4,13 +4,14 @@ SR-Qwen-VL v11: SVD(1024×1024) → DINOv2 Encoder → MLP → Qwen3.5-4B → Te
 Architecture:
   1. [离线] 1024×1024 → 32×32 patches → SVD → (2n, 1024) matrix
   2. SVD Proj: Linear(1024→1536) + CLS + pos_embed
-  3. DINOv2-giant Encoder (40 layers, frozen, auto-loaded from dino_dir)
+  3. DINOv2-giant Encoder (40 layers, frozen, lazy-loaded from dino_dir)
   4. MLP Projector: 1536 → 5120 → 2560
-  5. Qwen3.5-4B (auto-loaded from qwen_dir)
+  5. Qwen3.5-4B (lazy-loaded from qwen_dir)
 
 Design (v11 — entropy reduction):
   - Tokenizer: NOT attached to model; caller loads independently
-  - Auto-load: DINO + Qwen loaded in __init__, no build_model()
+  - __init__ creates random-init DINO/Qwen (from_config, meta-safe)
+  - Pretrained weights lazy-loaded on first _encode()/forward()/generate()
   - Standard HF: no save_pretrained / from_pretrained overrides
   - Checkpoint stores only trainable weights (svd_proj, pos_embed, cls_token, projector)
 """
@@ -24,8 +25,9 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
     Dinov2Model,
+    Dinov2Config,
     AutoModelForCausalLM,
-    AutoTokenizer,
+    AutoConfig,
 )
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Encoder
 
@@ -88,7 +90,7 @@ class SRQwenVLConfig(PretrainedConfig):
 class SVDEncoder(nn.Module):
     """
     SVD eigen-tokens → DINOv2-giant transformer encoder → features.
-    Receives a pre-loaded Dinov2Encoder (frozen weights from dino_dir).
+    Receives a pre-created Dinov2Encoder (weights loaded separately).
 
     Input:  (B, 2n, 1024)  SVD matrix (U^T stacked on V^T)
     Output: (B, 2n+1, 1536) encoded tokens with CLS
@@ -141,10 +143,11 @@ class SRQwenVLv10(PreTrainedModel):
     SR-Qwen-VL v11: SVD → DINO Encoder → MLP → Qwen → Text
 
     Entropy-reduced design:
-    - DINO + Qwen auto-loaded in __init__ from config.dino_dir / config.qwen_dir
+    - __init__ creates random-init architecture (from_config, meta-safe)
+    - DINO + Qwen pretrained weights lazy-loaded on first use
     - Tokenizer NOT attached (caller manages independently)
-    - No build_model(), no custom save/load overrides
-    - Only trainable params (svd_proj/pos_embed/cls_token/projector) saved to checkpoint
+    - No custom save/load overrides
+    - Only trainable params saved to checkpoint
     """
     config_class = SRQwenVLConfig
     base_model_prefix = "sr_qwen_vl"
@@ -154,9 +157,10 @@ class SRQwenVLv10(PreTrainedModel):
         super().__init__(config)
         cfg = config
 
-        # ── 1. DINOv2 encoder（自动从 dino_dir 加载）──
-        dino_encoder, dino_layernorm = self._load_dino_encoder(cfg)
-        self.encoder = SVDEncoder(cfg, dino_encoder, dino_layernorm)
+        # ── 1. DINOv2 encoder (from_config — safe inside from_pretrained meta context) ──
+        dino_cfg = Dinov2Config(hidden_size=cfg.dino_dim, num_hidden_layers=40,
+                                num_attention_heads=24, image_size=518, patch_size=14)
+        self.encoder = SVDEncoder(cfg, Dinov2Encoder(dino_cfg), nn.LayerNorm(cfg.dino_dim))
 
         # ── 2. MLP Projector ──
         self.projector = MLPProjector(
@@ -165,54 +169,67 @@ class SRQwenVLv10(PreTrainedModel):
             out_dim=cfg.qwen_dim,
         )
 
-        # ── 3. Qwen（自动从 qwen_dir 加载）──
-        self.lm_model = self._load_qwen_lm(cfg)
+        # ── 3. Qwen (from_config — safe inside meta context) ──
+        try:
+            qwen_cfg = AutoConfig.from_pretrained(cfg.qwen_dir, trust_remote_code=True)
+        except Exception:
+            qwen_cfg = AutoConfig.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
+        self.lm_model = AutoModelForCausalLM.from_config(qwen_cfg, torch_dtype=torch.bfloat16)
+
+        # Lazy-load pretrained weights on first use
+        self._pretrained_loaded = False
 
     # ═══════════════════════════════════════════════════════════
-    # Auto-load helpers
+    # Lazy-load pretrained DINO + Qwen (compatible with meta device)
     # ═══════════════════════════════════════════════════════════
 
-    def _load_dino_encoder(self, cfg: SRQwenVLConfig):
-        """Load DINOv2-giant encoder from dino_dir. Returns (encoder, layernorm)."""
+    def _ensure_pretrained(self):
+        """Load DINO + Qwen pretrained weights on first use.
+        Deferred from __init__ to avoid from_pretrained's init_empty_weights()
+        meta-device conflict when loading sub-models from disk."""
+        if self._pretrained_loaded:
+            return
+        self._pretrained_loaded = True
+
+        cfg = self.config
+
+        # ── DINO encoder ──
         if cfg.dino_dir and os.path.isdir(cfg.dino_dir):
-            print(f"[DINO] Auto-loading from {cfg.dino_dir}")
+            print(f"[DINO] Loading weights from {cfg.dino_dir}")
             dino_model = Dinov2Model.from_pretrained(cfg.dino_dir, local_files_only=True)
-            encoder = dino_model.encoder
-            layernorm = dino_model.layernorm
-            del dino_model  # free the full model, keep encoder + layernorm refs
+            self.encoder.vit_encoder.load_state_dict(dino_model.encoder.state_dict())
+            # Load layernorm
+            ln_state = {k.replace("layernorm.", ""): v
+                        for k, v in dino_model.state_dict().items() if k.startswith("layernorm.")}
+            if ln_state:
+                self.encoder.vit_layernorm.load_state_dict(ln_state)
+            del dino_model
 
             if not cfg.dino_trainable:
-                encoder.eval()
-                for p in encoder.parameters():
+                self.encoder.vit_encoder.eval()
+                for p in self.encoder.vit_encoder.parameters():
                     p.requires_grad_(False)
-                for p in layernorm.parameters():
+                for p in self.encoder.vit_layernorm.parameters():
                     p.requires_grad_(False)
                 print("[DINO] Frozen ✓")
-            return encoder, layernorm
         else:
-            print("[DINO] dino_dir not found, using random init")
-            from transformers import Dinov2Config as DinoCfg
-            dino_cfg = DinoCfg(hidden_size=cfg.dino_dim, num_hidden_layers=40,
-                               num_attention_heads=24, image_size=518, patch_size=14)
-            return Dinov2Encoder(dino_cfg), nn.LayerNorm(cfg.dino_dim)
+            print("[DINO] dino_dir not set, using random init")
 
-    def _load_qwen_lm(self, cfg: SRQwenVLConfig):
-        """Load Qwen3.5-4B from qwen_dir."""
+        # ── Qwen LM ──
         if cfg.qwen_dir and os.path.isdir(cfg.qwen_dir):
-            print(f"[Qwen] Auto-loading from {cfg.qwen_dir}")
-            lm = AutoModelForCausalLM.from_pretrained(
+            print(f"[Qwen] Loading weights from {cfg.qwen_dir}")
+            qwen = AutoModelForCausalLM.from_pretrained(
                 cfg.qwen_dir, torch_dtype=torch.bfloat16, trust_remote_code=True,
             )
-            print(f"[Qwen] Loaded ✓ — {sum(p.numel() for p in lm.parameters())/1e9:.2f}B params")
-            return lm
+            self.lm_model.load_state_dict(qwen.state_dict())
+            del qwen
+            n_params = sum(p.numel() for p in self.lm_model.parameters())
+            print(f"[Qwen] Loaded ✓ — {n_params/1e9:.2f}B params")
         else:
-            print("[Qwen] qwen_dir not found, creating empty model")
-            from transformers import AutoConfig as AC
-            qwen_cfg = AC.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
-            return AutoModelForCausalLM.from_config(qwen_cfg, torch_dtype=torch.bfloat16)
+            print("[Qwen] qwen_dir not set, using random init")
 
     # ═══════════════════════════════════════════════════════════
-    # Keys to ignore on save（仅保存可训练参数）
+    # Keys to ignore on save (only trainable params)
     # ═══════════════════════════════════════════════════════════
 
     @property
@@ -245,8 +262,9 @@ class SRQwenVLv10(PreTrainedModel):
     # ═══════════════════════════════════════════════════════════
 
     def _encode(self, svd_matrix: Tensor) -> Tensor:
-        encoded = self.encoder(svd_matrix)      # (B, 2n+1, 1536)
-        visual_embeds = self.projector(encoded)  # (B, 2n+1, 2560)
+        self._ensure_pretrained()
+        encoded = self.encoder(svd_matrix)       # (B, 2n+1, 1536)
+        visual_embeds = self.projector(encoded)   # (B, 2n+1, 2560)
         return visual_embeds.to(torch.bfloat16)
 
     # ═══════════════════════════════════════════════════════════
@@ -262,6 +280,7 @@ class SRQwenVLv10(PreTrainedModel):
         return_dict: bool = True,
         **kwargs,
     ):
+        self._ensure_pretrained()
         B, device = svd_matrix.size(0), svd_matrix.device
         visual_prefix = self._encode(svd_matrix)
         N_vis = visual_prefix.size(1)
@@ -303,6 +322,7 @@ class SRQwenVLv10(PreTrainedModel):
         top_p: float = 0.9,
     ) -> str:
         """tokenizer 由调用方传入（不再绑定在 model 上）"""
+        self._ensure_pretrained()
         device = svd_matrix.device
         visual_prefix = self._encode(svd_matrix)
 
@@ -332,6 +352,7 @@ class SRQwenVLv10(PreTrainedModel):
 
 if __name__ == "__main__":
     import tempfile
+    from safetensors.torch import load_file
 
     dino_dir = "/root/autodl-tmp/sr_dinov2/models/AI-ModelScope--dinov2-giant"
     qwen_dir = "/root/autodl-tmp/qwen3_5_4B"
@@ -340,14 +361,14 @@ if __name__ == "__main__":
     print("SR-Qwen-VL v11: Self-test")
     print("=" * 60)
 
-    # ── Test 1: Create model (auto-load) ──
-    print("\n[1] Creating model (auto-load DINO + Qwen)...")
+    # ── Test 1: Create model ──
+    print("\n[1] Creating model (random init, meta-safe)...")
     config = SRQwenVLConfig(dino_dir=dino_dir, qwen_dir=qwen_dir)
     model = SRQwenVLv10(config)
-    model._log_params()
+    print("  ✅ Created (no from_pretrained needed during init)")
 
-    # ── Test 2: Forward pass ──
-    print("\n[2] Forward pass...")
+    # ── Test 2: Move to GPU + load pretrained on first use ──
+    print("\n[2] Moving to GPU, lazy-loading pretrained weights on first forward...")
     model = model.cuda().bfloat16()
     B = 2
     svd_matrix = torch.randn(B, 2 * config.svd_max_eig, config.svd_patch_dim).cuda().bfloat16()
@@ -358,7 +379,8 @@ if __name__ == "__main__":
     outputs = model(svd_matrix=svd_matrix, input_ids=input_ids,
                     attention_mask=attention_mask, labels=labels)
     print(f"  Logits: {outputs['logits'].shape}, Loss: {outputs['loss'].item():.4f}")
-    print("  ✅ Forward OK")
+    model._log_params()
+    print("  ✅ Forward + lazy-load OK")
 
     # ── Test 3: Save → Load cycle ──
     print("\n[3] save_pretrained → from_pretrained cycle...")
@@ -366,8 +388,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         model.save_pretrained(d, safe_serialization=True)
 
-        # Inspect saved weights
-        from safetensors.torch import load_file
+        # Inspect saved weights — pos_embed must NOT be empty
         for f in sorted(os.listdir(d)):
             if f.endswith('.safetensors'):
                 sd = load_file(os.path.join(d, f))
@@ -375,6 +396,10 @@ if __name__ == "__main__":
                     if 'pos_embed' in k.lower():
                         assert sd[k].numel() > 0, f"❌ pos_embed is EMPTY!"
                         print(f"  Saved: {k} shape={sd[k].shape} ✅")
+                # Verify no lm_model/dino weights leaked
+                leaked = [k for k in sd if k.startswith('lm_model.') or k.startswith('encoder.vit_encoder.')]
+                assert len(leaked) == 0, f"❌ Leaked keys: {leaked}"
+                print(f"  No leaked DINO/Qwen keys ✅")
 
         # Load back
         loaded = SRQwenVLv10.from_pretrained(d)
@@ -382,15 +407,12 @@ if __name__ == "__main__":
         assert pe.numel() > 0, "❌ pos_embed is EMPTY after load!"
         print(f"  Loaded: pos_embed shape={pe.shape} ✅")
 
-    # ── Test 4: Has no tokenizer bound ──
+    # ── Test 4: No tokenizer, no build_model ──
     print(f"\n[4] Tokenizer bound: {hasattr(model, 'tokenizer')}")
-    assert not hasattr(model, 'tokenizer'), "❌ tokenizer should NOT be bound to model"
-    print("  ✅ Tokenizer decoupled")
-
-    # ── Test 5: Has no build_model ──
-    print(f"\n[5] build_model exists: {hasattr(model, 'build_model')}")
+    assert not hasattr(model, 'tokenizer'), "❌ tokenizer should NOT be bound"
+    print(f"    build_model exists: {hasattr(model, 'build_model')}")
     assert not hasattr(model, 'build_model'), "❌ build_model should NOT exist"
-    print("  ✅ No build_model")
+    print("  ✅")
 
     print("\n" + "=" * 60)
     print("All tests passed ✅")
