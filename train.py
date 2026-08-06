@@ -174,8 +174,13 @@ config = SRQwenVLConfig(
     svd_max_eig=SVD_MAX_EIG,
     svd_energy_threshold=SVD_ENERGY_THRESHOLD,
 )
+# Tokenizer loaded independently (not bound to model)
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained(QWEN_DIR, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 model = SRQwenVLv10(config)
-model.build_model(device="npu")
 model._enable_gradient_checkpointing()
 dataset = load_dataset(DATA_PATH,cache_dir="./cache")
 # ══ Step 2: Dataset (parquet, raw bytes + text) ══
@@ -184,7 +189,7 @@ test_dataset  = RawParquetDataset(dataset["test"])
 print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
 # ══ Step 3: Collator (SVD + tokenize happens here) ══
-collator = SVDCollector(model.tokenizer)
+collator = SVDCollector(tokenizer)
 
 # ══ Step 5: Trainer ══
 training_args = TrainingArguments(
@@ -245,7 +250,6 @@ trainer.train()
 # DeepSpeed ZeRO-3 需要先 gather 分片参数再保存，model.save_pretrained 不会自动 gather
 final_dir = os.path.join(OUTPUT_DIR, "final")
 trainer.save_model(final_dir)
-if model.tokenizer is not None:
-    model.tokenizer.save_pretrained(final_dir)
+tokenizer.save_pretrained(final_dir)
 print(f"\nFinal model saved to {final_dir}")
 
