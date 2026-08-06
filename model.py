@@ -231,6 +231,17 @@ class SRQwenVLv10(PreTrainedModel):
         self._is_built = False
 
     # ═══════════════════════════════════════════════════════════
+    # Tied-weights compatibility (newer transformers >=4.55)
+    # ═══════════════════════════════════════════════════════════
+
+    @property
+    def all_tied_weights_keys(self) -> dict:
+        """No tied weights in this model.
+        Explicit override required for transformers >=4.55 that calls
+        self.all_tied_weights_keys.keys() during from_pretrained."""
+        return {}
+
+    # ═══════════════════════════════════════════════════════════
     # build_model
     # ═══════════════════════════════════════════════════════════
 
@@ -413,9 +424,50 @@ class SRQwenVLv10(PreTrainedModel):
         )
 
     def save_pretrained(self, save_directory, safe_serialization=True, **kwargs):
-        super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(save_directory)
+        # ═══ Don't save lm_model — we load it separately via build_model() ═══
+        # If lm_model is attached, temporarily detach to prevent saving ~8GB of
+        # Qwen weights into the checkpoint (they'd show as UNEXPECTED on load).
+        lm_model = self.lm_model
+        tokenizer = self.tokenizer
+        self.lm_model = None
+        self.tokenizer = None
+        try:
+            super().save_pretrained(save_directory, safe_serialization=safe_serialization, **kwargs)
+
+            # ═══ Workaround: fix false tied-weight detection on Ascend NPU ═══
+            # On some NPU builds, data_ptr() may return colliding addresses for
+            # independent tensors, causing HF to save them as torch.empty(0).
+            # Post-save: scan safetensors and recover any falsely-emptied params.
+            if safe_serialization:
+                self._fix_empty_saved_params(save_directory)
+        finally:
+            self.lm_model = lm_model
+            self.tokenizer = tokenizer
+
+        if tokenizer is not None:
+            tokenizer.save_pretrained(save_directory)
+
+    def _fix_empty_saved_params(self, save_directory):
+        """Recover parameters falsely saved as empty tensors (Ascend NPU bug)."""
+        from safetensors.torch import load_file, save_file
+
+        real_params = {name: param.data for name, param in self.named_parameters()}
+
+        for fname in sorted(os.listdir(save_directory)):
+            fpath = os.path.join(save_directory, fname)
+            if not fname.endswith('.safetensors'):
+                continue
+
+            sd = load_file(fpath)
+            fixed = False
+            for key in list(sd.keys()):
+                if sd[key].numel() == 0 and key in real_params:
+                    val = real_params[key]
+                    sd[key] = val.cpu().contiguous()
+                    fixed = True
+
+            if fixed:
+                save_file(sd, fpath)
 
 
 # ═══════════════════════════════════════════════════════════════
