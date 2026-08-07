@@ -24,7 +24,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
     Dinov2Model,
-    Qwen3ForCausalLM,Qwen3Config
+    Qwen3_5ForConditionalGeneration,Qwen3_5Config
 )
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Encoder
 from transformers import Dinov2Config as DinoCfg
@@ -86,7 +86,7 @@ class SVDEncoder(nn.Module):
 
     def forward(self, svd_matrix: Tensor) -> Tensor:
         B, S, _ = svd_matrix.shape
-        tokens = self.svd_proj(svd_matrix)
+        tokens = self.svd_proj(svd_matrix.to(self.svd_proj.weight.dtype))
         cls_tok = self.cls_token.expand(B, -1, -1)
         tokens = torch.cat([cls_tok, tokens], dim=1)
         tokens = tokens + self.pos_embed[:, :S + 1, :]
@@ -135,19 +135,21 @@ class SRQwenVLv10(PreTrainedModel):
         self.encoder = SVDEncoder(config)
 
         # ── 2. MLP Projector ──
+        # in = DINO hidden (1536), out = Qwen text hidden (2560)
+        qwen_text_hidden = config.qwen_config["text_config"]["hidden_size"]
         self.projector = MLPProjector(
             in_dim=config.dino_config["hidden_size"],
             hidden_dim=config.projector_hidden,
-            out_dim=config.dino_config["hidden_size"],
+            out_dim=qwen_text_hidden,
         )
 
-        # ── 3. Qwen（自动从 qwen_dir 加载）──
-        self.lm_model = Qwen3ForCausalLM(Qwen3Config(**config.qwen_config))
+        # ── 3. Qwen3.5（自动从 qwen_dir 加载）──
+        self.lm_model = Qwen3_5ForConditionalGeneration(Qwen3_5Config(**config.qwen_config))
 
     @classmethod
     def build_model(cls, dino_path,qwen_path):
         dino_model = Dinov2Model.from_pretrained(dino_path, local_files_only=True)
-        lm = Qwen3ForCausalLM.from_pretrained(
+        lm = Qwen3_5ForConditionalGeneration.from_pretrained(
             qwen_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
         )
         config = SRQwenVLConfig(dino_config=dino_model.config.to_dict(),qwen_config=lm.config.to_dict())
@@ -185,8 +187,12 @@ class SRQwenVLv10(PreTrainedModel):
         inputs_embeds = torch.cat([visual_prefix, text_embeds], dim=1)
         attn_mask = torch.cat([vis_mask, attention_mask], dim=1)
 
-        outputs = self.lm_model(inputs_embeds=inputs_embeds, attention_mask=attn_mask)
-        logits = outputs.logits[:, N_vis:, :]
+        # Qwen3.5: 文本子模型 + lm_head
+        text_out = self.lm_model.model.language_model(
+            inputs_embeds=inputs_embeds, attention_mask=attn_mask
+        )
+        logits = self.lm_model.lm_head(text_out.last_hidden_state)
+        logits = logits[:, N_vis:, :]
 
         loss = None
         if labels is not None:
