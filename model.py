@@ -138,7 +138,7 @@ class SRQwenVLv10(PreTrainedModel):
         self.projector = MLPProjector(
             in_dim=config.dino_config["hidden_size"],
             hidden_dim=config.projector_hidden,
-            out_dim=config.dino_config["hidden_size"],
+            out_dim=config.qwen_config["hidden_size"],
         )
 
         # ── 3. Qwen（自动从 qwen_dir 加载）──
@@ -166,6 +166,10 @@ class SRQwenVLv10(PreTrainedModel):
     # ═══════════════════════════════════════════════════════════
     # forward
     # ═══════════════════════════════════════════════════════════
+    @property
+    def all_tied_weights_keys(self) -> dict:
+        """No tied weights in this model."""
+        return {}
 
     def forward(
         self,
