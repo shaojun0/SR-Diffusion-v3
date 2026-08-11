@@ -1,10 +1,9 @@
 """
-SR-Diffusion v12 Training Script
+SR-Diffusion v12 Training Script (Diffusion Decoder version)
 
-GAN training with:
-  - L1 reconstruction loss
-  - LPIPS perceptual loss (weight 0.1)
-  - Adversarial loss (hinge GAN)
+Training:
+  - Diffusion noise prediction loss (L1, primary)
+  - Optional adversarial loss (hinge GAN) on quick DDIM reconstruction
   - Optional SVD compression loss
 
 Dataset: aswin00000/ConstructionSite (200 images for quick test)
@@ -36,7 +35,9 @@ from datasets import load_dataset
 
 # Add script dir to path for model import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model_v12 import build_model_v12, SRDiffusionV12, NLayerDiscriminator, GANLoss
+from model_v12 import (
+    build_model_v12, SRDiffusionV12, NLayerDiscriminator, GANLoss
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -45,7 +46,6 @@ from model_v12 import build_model_v12, SRDiffusionV12, NLayerDiscriminator, GANL
 
 DEFAULT_OUTPUT_DIR = "/root/autodl-tmp/sr_diffusion_v12_output"
 DEFAULT_DINO_PATH = "facebook/dinov2-giant"
-DEFAULT_VAE_PATH = "stabilityai/sd-vae-ft-ema"
 
 # Image
 IMAGE_SIZE = 224
@@ -54,6 +54,11 @@ IMAGE_SIZE = 224
 SVD_ENERGY_THRESHOLD = 0.99
 SVD_MAX_K = 64
 
+# Diffusion
+DIFFUSION_TIMESTEPS = 1000
+DDIM_SAMPLE_STEPS = 50      # steps for visualization sampling
+DDIM_QUICK_STEPS = 5        # steps for quick GAN reconstruction
+
 # Training
 BATCH_SIZE = 2
 EPOCHS = 10
@@ -61,9 +66,8 @@ LR_ENCODER = 1e-4
 LR_DECODER = 1e-4
 LR_DISCRIMINATOR = 4e-4
 WEIGHT_DECAY = 1e-4
-LPIPS_WEIGHT = 0.1
-GAN_WEIGHT = 0.05
-SVD_COMPRESS_WEIGHT = 0.01
+GAN_WEIGHT = 0.05            # weight for adversarial loss (0 = disable)
+SVD_COMPRESS_WEIGHT = 0.01   # weight for SVD compression loss (0 = disable)
 
 # GAN
 GAN_MODE = "hinge"  # 'hinge' | 'lsgan' | 'vanilla'
@@ -73,26 +77,6 @@ LOG_EVERY = 10
 SAVE_EVERY = 100
 SAMPLE_EVERY = 50
 NUM_SAMPLES = 200  # quick test
-
-
-# ═══════════════════════════════════════════════════════════════
-# LPIPS helper (lazy import)
-# ═══════════════════════════════════════════════════════════════
-
-_lpips_fn = None
-
-
-def get_lpips(device: torch.device):
-    global _lpips_fn
-    if _lpips_fn is None:
-        try:
-            import lpips
-            _lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device)
-            print("[LPIPS] Loaded AlexNet backbone")
-        except ImportError:
-            print("[LPIPS] lpips not installed; perceptual loss disabled. Install with: pip install lpips")
-            _lpips_fn = None
-    return _lpips_fn
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -125,8 +109,10 @@ def denormalize(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Dataset — HF ConstructionSite → (image, label)
+# Dataset — HF ConstructionSite → (image,)
 # ═══════════════════════════════════════════════════════════════
+import io as io_module
+
 
 class ConstructionSiteDataset(torch.utils.data.Dataset):
     """
@@ -151,15 +137,14 @@ class ConstructionSiteDataset(torch.utils.data.Dataset):
 
         # Handle various image formats from HF datasets
         if isinstance(img, dict):
-            # {'bytes': ..., 'path': ...}
             if 'bytes' in img:
-                img = Image.open(io.BytesIO(img['bytes']))
+                img = Image.open(io_module.BytesIO(img['bytes']))
             elif 'path' in img:
                 img = Image.open(img['path'])
             else:
                 raise ValueError(f"Unknown image dict format: {img.keys()}")
         elif isinstance(img, bytes):
-            img = Image.open(io.BytesIO(img))
+            img = Image.open(io_module.BytesIO(img))
         elif isinstance(img, str):
             img = Image.open(img)
         elif not isinstance(img, Image.Image):
@@ -180,7 +165,6 @@ class ConstructionSiteDataset(torch.utils.data.Dataset):
 def svd_compression_loss(S: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """
     Encourage energy concentration in top-k singular values.
-    Loss = sum(log(S[:k])) / sum(log(S)) — higher when energy is spread out.
 
     Args:
         S: (B, r) singular values
@@ -196,28 +180,27 @@ def svd_compression_loss(S: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         ki = int(k[i].item())
         kept_log[i] = log_S[i, :ki].sum()
 
-    # Negative because we want HIGH concentration (penalize when kept/total is far from 1)
     ratio = kept_log / (total_log + 1e-8)
     loss = (1.0 - ratio).mean()
     return loss
 
 
 # ═══════════════════════════════════════════════════════════════
-# Sample saving
+# Sample saving (uses DDIM sampling)
 # ═══════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def save_samples(generator, images, step, output_dir):
-    """Save comparison: original vs reconstruction."""
+def save_samples(generator, images, step, output_dir, ddim_steps=50):
+    """Save comparison: original vs DDIM reconstruction."""
     import torchvision.utils as vutils
 
     generator.eval()
-    recon, _, k = generator(images)
+    recon, k = generator.sample(images, steps=ddim_steps)
     generator.train()
 
     # Denormalize for visualization
     orig_vis = denormalize(images[:4])
-    recon_vis = denormalize(recon[:4].detach())
+    recon_vis = denormalize(recon[:4])
 
     # Concatenate: [orig1, recon1, orig2, recon2, ...]
     comparison = []
@@ -250,10 +233,12 @@ def train(args):
     # ── Build model ──
     generator, discriminator = build_model_v12(
         dino_path=args.dino_path,
-        vae_path=args.vae_path,
         bridge_dim=args.bridge_dim,
         svd_energy_threshold=args.svd_energy_threshold,
         svd_max_k=args.svd_max_k,
+        diffusion_timesteps=args.diffusion_timesteps,
+        unet_base_dim=args.unet_base_dim,
+        unet_dim_mults=tuple(args.unet_dim_mults),
         device=device,
     )
 
@@ -274,11 +259,9 @@ def train(args):
     )
 
     # ── Optimizers ──
-    # Generator: encoder (DINO + SVD) + decoder (bridge + VAE)
     param_groups = generator.get_trainable_params(lr_enc=args.lr_encoder, lr_dec=args.lr_decoder)
     optimizer_G = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    # Discriminator: separate optimizer
     optimizer_D = torch.optim.AdamW(
         discriminator.parameters(),
         lr=args.lr_discriminator,
@@ -287,20 +270,21 @@ def train(args):
     )
 
     # ── Losses ──
-    l1_loss = nn.L1Loss()
     gan_loss_fn = GANLoss(gan_mode=args.gan_mode)
-    lpips_fn = get_lpips(device)
 
     # ── Training state ──
     global_step = 0
     metrics_history = defaultdict(list)
 
+    use_gan = args.gan_weight > 0
+
     print(f"\n{'='*70}")
-    print(f"SR-Diffusion v12 Training")
+    print(f"SR-Diffusion v12 Training (Diffusion Decoder)")
     print(f"  Epochs: {args.epochs}  Batch: {args.batch_size}  Samples: {len(dataset)}")
     print(f"  LR: enc={args.lr_encoder} dec={args.lr_decoder} disc={args.lr_discriminator}")
-    print(f"  GAN: {args.gan_mode}  LPIPS weight: {args.lpips_weight}")
+    print(f"  GAN: {'enabled' if use_gan else 'disabled'} ({args.gan_mode}, weight={args.gan_weight})")
     print(f"  SVD: energy_threshold={args.svd_energy_threshold} max_k={args.svd_max_k}")
+    print(f"  Diffusion: T={args.diffusion_timesteps}, cosine schedule, DDIM={args.ddim_steps} steps")
     print(f"{'='*70}\n")
 
     for epoch in range(1, args.epochs + 1):
@@ -319,82 +303,82 @@ def train(args):
             # ═══════════════════════════════════════════════
             optimizer_G.zero_grad()
 
-            recon, features, k = generator(images)
-            # features shape: (B, 257, 1536) — used only for potential SVD compression loss
+            # Forward: diffusion noise prediction loss
+            # return_recon=True for GAN training
+            noise_loss, recon, k, features = generator(
+                images,
+                return_recon=use_gan,
+                ddim_steps=args.ddim_quick_steps,
+            )
 
-            # L1 loss
-            loss_l1 = l1_loss(recon, images)
+            loss_G = noise_loss
 
-            # LPIPS perceptual loss
-            if lpips_fn is not None:
-                loss_lpips_val = lpips_fn(recon, images).mean()
-                loss_lpips = loss_lpips_val * args.lpips_weight
+            # Optional: adversarial loss
+            if use_gan and recon is not None:
+                pred_fake = discriminator(recon)
+                loss_G_gan = gan_loss_fn(pred_fake, target_is_real=True) * args.gan_weight
+                loss_G = loss_G + loss_G_gan
             else:
-                loss_lpips = torch.tensor(0.0, device=device)
-                loss_lpips_val = torch.tensor(0.0, device=device)
+                loss_G_gan = torch.tensor(0.0, device=device)
 
-            # Adversarial loss (generator wants discriminator to predict "real")
-            pred_fake = discriminator(recon)
-            loss_G_gan = gan_loss_fn(pred_fake, target_is_real=True) * args.gan_weight
-
-            # Optional SVD compression loss
+            # Optional: SVD compression loss
             if args.svd_compress_weight > 0:
-                # Recompute S to get singular values (we only have k from forward)
-                # We use a no-grad SVD to compute the compression loss on features
                 with torch.no_grad():
                     _, S_vals, _ = torch.linalg.svd(features.float(), full_matrices=False)
                 loss_svd = svd_compression_loss(S_vals, k) * args.svd_compress_weight
+                loss_G = loss_G + loss_svd
             else:
                 loss_svd = torch.tensor(0.0, device=device)
 
-            loss_G = loss_l1 + loss_lpips + loss_G_gan + loss_svd
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             optimizer_G.step()
 
             # ═══════════════════════════════════════════════
-            # Discriminator step
+            # Discriminator step (only if GAN is enabled)
             # ═══════════════════════════════════════════════
-            optimizer_D.zero_grad()
+            if use_gan and recon is not None:
+                optimizer_D.zero_grad()
 
-            # Real images
-            pred_real = discriminator(images)
-            loss_D_real = gan_loss_fn(pred_real, target_is_real=True)
+                pred_real = discriminator(images)
+                loss_D_real = gan_loss_fn(pred_real, target_is_real=True)
 
-            # Fake images (detached from generator)
-            pred_fake_d = discriminator(recon.detach())
-            loss_D_fake = gan_loss_fn(pred_fake_d, target_is_real=False)
+                pred_fake_d = discriminator(recon.detach())
+                loss_D_fake = gan_loss_fn(pred_fake_d, target_is_real=False)
 
-            loss_D = (loss_D_real + loss_D_fake) * 0.5
-            loss_D.backward()
-            optimizer_D.step()
+                loss_D = (loss_D_real + loss_D_fake) * 0.5
+                loss_D.backward()
+                optimizer_D.step()
+            else:
+                loss_D = torch.tensor(0.0, device=device)
 
             # ── Metrics ──
             k_avg = k.float().mean().item()
             epoch_metrics['loss_G'] += loss_G.item()
-            epoch_metrics['loss_l1'] += loss_l1.item()
-            epoch_metrics['loss_lpips'] += loss_lpips_val.item() if lpips_fn else 0
-            epoch_metrics['loss_G_gan'] += loss_G_gan.item()
-            epoch_metrics['loss_D'] += loss_D.item()
+            epoch_metrics['diff_loss'] += noise_loss.item()
+            epoch_metrics['loss_G_gan'] += loss_G_gan.item() if use_gan else 0
+            epoch_metrics['loss_D'] += loss_D.item() if use_gan else 0
             epoch_metrics['loss_svd'] += loss_svd.item()
             epoch_metrics['k_avg'] += k_avg
             epoch_metrics['k_min'] += k.min().item()
             epoch_metrics['k_max'] += k.max().item()
 
             # Update progress bar
-            pbar.set_postfix({
-                'G': f"{loss_G.item():.3f}",
-                'L1': f"{loss_l1.item():.3f}",
-                'D': f"{loss_D.item():.3f}",
+            postfix = {
+                'diff': f"{noise_loss.item():.3f}",
                 'k': f"{k_avg:.1f}",
-            })
+            }
+            if use_gan:
+                postfix['D'] = f"{loss_D.item():.3f}"
+                postfix['G_gan'] = f"{loss_G_gan.item():.3f}"
+            pbar.set_postfix(postfix)
 
             # ── Logging ──
             if global_step % args.log_every == 0:
                 log_str = (
                     f"[Step {global_step:06d}] "
-                    f"G={loss_G.item():.4f} L1={loss_l1.item():.4f} "
-                    f"LPIPS={loss_lpips_val.item():.4f} G_gan={loss_G_gan.item():.4f} "
+                    f"G={loss_G.item():.4f} diff={noise_loss.item():.4f} "
+                    f"G_gan={loss_G_gan.item():.4f} "
                     f"D={loss_D.item():.4f} SVD={loss_svd.item():.4f} "
                     f"k_avg={k_avg:.1f} k_min={k.min().item()} k_max={k.max().item()}"
                 )
@@ -405,7 +389,8 @@ def train(args):
             if global_step % args.sample_every == 0:
                 k_avg_s, k_min_s, k_max_s = save_samples(
                     generator, images, global_step,
-                    os.path.join(args.output_dir, "samples")
+                    os.path.join(args.output_dir, "samples"),
+                    ddim_steps=args.ddim_steps,
                 )
 
             # ── Save checkpoint ──
@@ -430,8 +415,8 @@ def train(args):
 
         summary = (
             f"\n[Epoch {epoch}/{args.epochs}] "
-            f"G={epoch_metrics['loss_G']:.4f} L1={epoch_metrics['loss_l1']:.4f} "
-            f"LPIPS={epoch_metrics['loss_lpips']:.4f} G_gan={epoch_metrics['loss_G_gan']:.4f} "
+            f"G={epoch_metrics['loss_G']:.4f} diff={epoch_metrics['diff_loss']:.4f} "
+            f"G_gan={epoch_metrics['loss_G_gan']:.4f} "
             f"D={epoch_metrics['loss_D']:.4f} k_avg={epoch_metrics['k_avg']:.1f} "
             f"Time={epoch_time:.1f}s"
         )
@@ -457,7 +442,8 @@ def train(args):
         try:
             sample_batch = next(iter(dataloader)).to(device)
             save_samples(generator, sample_batch, f"epoch_{epoch:03d}",
-                        os.path.join(args.output_dir, "samples"))
+                        os.path.join(args.output_dir, "samples"),
+                        ddim_steps=args.ddim_steps)
         except Exception as e:
             print(f"[Warn] Could not save epoch sample: {e}")
 
@@ -476,22 +462,32 @@ def train(args):
 # ═══════════════════════════════════════════════════════════════
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="SR-Diffusion v12 Training")
+    parser = argparse.ArgumentParser(description="SR-Diffusion v12 Training (Diffusion Decoder)")
     parser.add_argument('--output_dir', type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument('--dino_path', type=str, default=DEFAULT_DINO_PATH)
-    parser.add_argument('--vae_path', type=str, default=DEFAULT_VAE_PATH)
-    parser.add_argument('--bridge_dim', type=int, default=256)
+    parser.add_argument('--bridge_dim', type=int, default=64,
+                        help='Conditioning projector output channels')
     parser.add_argument('--svd_energy_threshold', type=float, default=SVD_ENERGY_THRESHOLD)
     parser.add_argument('--svd_max_k', type=int, default=SVD_MAX_K)
+    parser.add_argument('--diffusion_timesteps', type=int, default=DIFFUSION_TIMESTEPS)
+    parser.add_argument('--ddim_steps', type=int, default=DDIM_SAMPLE_STEPS,
+                        help='DDIM steps for visualization sampling')
+    parser.add_argument('--ddim_quick_steps', type=int, default=DDIM_QUICK_STEPS,
+                        help='DDIM steps for quick GAN reconstruction')
+    parser.add_argument('--unet_base_dim', type=int, default=128,
+                        help='UNet base filter dimension')
+    parser.add_argument('--unet_dim_mults', type=int, nargs='+', default=[1, 2, 4, 4],
+                        help='UNet channel multipliers per level')
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--epochs', type=int, default=EPOCHS)
     parser.add_argument('--lr_encoder', type=float, default=LR_ENCODER)
     parser.add_argument('--lr_decoder', type=float, default=LR_DECODER)
     parser.add_argument('--lr_discriminator', type=float, default=LR_DISCRIMINATOR)
     parser.add_argument('--weight_decay', type=float, default=WEIGHT_DECAY)
-    parser.add_argument('--lpips_weight', type=float, default=LPIPS_WEIGHT)
-    parser.add_argument('--gan_weight', type=float, default=GAN_WEIGHT)
-    parser.add_argument('--svd_compress_weight', type=float, default=SVD_COMPRESS_WEIGHT)
+    parser.add_argument('--gan_weight', type=float, default=GAN_WEIGHT,
+                        help='GAN adversarial loss weight (0 = disable)')
+    parser.add_argument('--svd_compress_weight', type=float, default=SVD_COMPRESS_WEIGHT,
+                        help='SVD compression loss weight (0 = disable)')
     parser.add_argument('--gan_mode', type=str, default=GAN_MODE, choices=['hinge', 'lsgan', 'vanilla'])
     parser.add_argument('--num_samples', type=int, default=NUM_SAMPLES)
     parser.add_argument('--num_workers', type=int, default=4)

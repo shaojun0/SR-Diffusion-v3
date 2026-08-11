@@ -7,3 +7,4 @@ sentencepiece>=0.1.99
 Pillow>=9.0.0
 tqdm>=4.64.0
 bitsandbytes>=0.41.0
+datasets>=2.14.0
