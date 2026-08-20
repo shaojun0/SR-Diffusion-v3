@@ -113,12 +113,16 @@ class GumbelTopK(nn.Module):
         soft = torch.sigmoid((logits + g) / self.tau)          # (B,N) in (0,1)
 
         # hard top-k mask (detached, straight-through)
+        # STE direction: forward = hard; backward = soft path.
+        #   mask = soft + (hard - soft).detach()
+        #   forward: soft + hard - soft = hard   ✓  (true one-hot selection)
+        #   backward: grad flows through soft    ✓  (score_head learnable)
         k = k.long().clamp(1, N)
         idx = torch.topk(logits, N, dim=1).indices          # full ranking (B,N)
         hard = torch.zeros_like(logits)
         for i in range(B):
             hard[i, idx[i, :k[i]]] = 1.0
-        mask = hard + (soft - hard).detach()
+        mask = soft + (hard - soft).detach()
         return mask, soft
 
 
@@ -158,22 +162,28 @@ class ReEncoder(nn.Module):
             hard_mode: if True, physically prune to top-k tokens (inference)
             hard_mask: (B,N) 0/1 hard selection used in hard_mode
         Returns:
-            z: (B, N+1, D)  (or (B, k+1, D) in hard_mode)
+            z: (B, N+1, D)  (or (B, max_k+1, D) in hard_mode)
         """
         B, N, D = gated_tokens.shape
+        pad_mask = None
         if hard_mode and hard_mask is not None:
-            idx = hard_mask.topk(hard_mask.sum(1).max().item(), dim=1).indices
-            sel = []
-            for i in range(B):
-                ki = int(hard_mask[i].sum().item())
-                sel.append(gated_tokens[i, idx[i, :ki]])
-            gated_tokens = torch.stack(sel, dim=0)          # (B, k_i, D)
-            N = gated_tokens.shape[1]
+            lengths = hard_mask.sum(1).long()                    # (B,) per-image k
+            max_k = int(lengths.max().item())
+            idx = hard_mask.topk(max_k, dim=1).indices           # (B,max_k)
+            gated_tokens = gated_tokens.gather(
+                1, idx.unsqueeze(-1).expand(-1, -1, D))          # (B,max_k,D)
+            N = max_k
+            # True where padded (beyond this image's k)
+            pad_mask = (torch.arange(max_k, device=hard_mask.device)
+                        .unsqueeze(0) >= lengths.unsqueeze(1))   # (B,max_k)
+            pad_mask = torch.cat([torch.zeros(B, 1, dtype=torch.bool,
+                                              device=hard_mask.device),
+                                  pad_mask], dim=1)              # (B,max_k+1) cls never pad
         cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, gated_tokens], dim=1)           # (B, N+1, D)
+        x = torch.cat([cls, gated_tokens], dim=1)                # (B, N+1, D)
         x = x + self.pos_embed[:, :N + 1, :]
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, src_key_padding_mask=pad_mask)
         return self.norm(x)
 
 
