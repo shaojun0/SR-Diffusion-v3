@@ -287,7 +287,7 @@ class SRPhase1(nn.Module):
     def set_stage(self, stage: int):
         """stage=1: fix τ (all tokens kept), no rate penalty.
         stage=2: learn τ (content-adaptive budget)."""
-        self.fixed_tau = -4.0 if stage == 1 else None
+        self.fixed_tau = -2.0 if stage == 1 else None
 
     def set_lambda_rate(self, value: float):
         self.lambda_rate = value
@@ -321,9 +321,11 @@ class SRPhase1(nn.Module):
         if self.fixed_tau is not None:
             tau = torch.full((B, 1), self.fixed_tau, device=x.device)
         else:
-            # bounded threshold: 4·tanh keeps τ in [-4, 4] so the gate never
-            # saturates beyond the logits scale (prevents budget collapse)
-            tau = 4.0 * torch.tanh(self.rate_head(cls))   # (B,1) ∈ [-4, 4]
+            # bounded threshold: 2·tanh keeps τ in [-2, 2], always INSIDE the
+            # normalized logits distribution (N(0,1)).  If τ left the support,
+            # sigmoid would saturate → soft(1-soft)→0 → both recon and rate
+            # gradients vanish → τ stuck (deadlock we hit with 4·tanh).
+            tau = 2.0 * torch.tanh(self.rate_head(cls))   # (B,1) ∈ [-2, 2]
         mask, soft = self.gate(logits, tau)    # (B,256) each
 
         # ── gate features (train: soft; eval: hard) ──
