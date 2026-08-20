@@ -283,6 +283,21 @@ class SRPhase1(nn.Module):
         nn.init.zeros_(self.rate_head.mlp[3].weight)
         nn.init.zeros_(self.rate_head.mlp[3].bias)
 
+        # PPO-style budget stabilization (optional, enabled by train script)
+        self.use_trust_region = False
+        self.rate_head_target = None   # EMA reference policy, built on demand
+        self.trust_region = None       # BudgetTrustRegion instance
+
+    # ── enable PPO-style trust region for stage-2 budget learning ──
+    def enable_trust_region(self, btr: "BudgetTrustRegion"):
+        import copy
+        self.use_trust_region = True
+        self.trust_region = btr
+        self.rate_head_target = copy.deepcopy(self.rate_head)
+        for p in self.rate_head_target.parameters():
+            p.requires_grad_(False)
+        self.rate_head_target.eval()
+
     # ── two-stage control ──
     def set_stage(self, stage: int):
         """stage=1: fix τ (all tokens kept), no rate penalty.
@@ -370,13 +385,32 @@ class SRPhase1(nn.Module):
         # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──
         if self.fixed_tau is not None:
             tau = torch.full((B, 1), self.fixed_tau, device=x.device)
+            mask, soft = self.gate(logits, tau)    # (B,256) each
+            budget_loss = torch.zeros((), device=x.device)
+            kl_loss = torch.zeros((), device=x.device)
+            ent_loss = torch.zeros((), device=x.device)
+            tr_extras = {}
+        elif self.use_trust_region and self.trust_region is not None:
+            # PPO-style budget stabilization (stage-2)
+            tr = self.trust_region.gate_forward(self, logits, cls)
+            mask, soft = tr["mask"], tr["soft"]
+            tau = mask.new_zeros(B, 1)  # not used directly; extras carry stats
+            budget_loss, kl_loss, ent_loss = (tr["budget_loss"], tr["kl_loss"],
+                                              tr["ent_loss"])
+            tr_extras = tr["extras"]
+            # stash KL for the callback's adaptive-β update
+            self.trust_region._last_kl = float(kl_loss.detach().cpu())
         else:
             # bounded threshold: 2·tanh keeps τ in [-2, 2], always INSIDE the
             # normalized logits distribution (N(0,1)).  If τ left the support,
             # sigmoid would saturate → soft(1-soft)→0 → both recon and rate
             # gradients vanish → τ stuck (deadlock we hit with 4·tanh).
             tau = 2.0 * torch.tanh(self.rate_head(cls))   # (B,1) ∈ [-2, 2]
-        mask, soft = self.gate(logits, tau)    # (B,256) each
+            mask, soft = self.gate(logits, tau)    # (B,256) each
+            budget_loss = torch.zeros((), device=x.device)
+            kl_loss = torch.zeros((), device=x.device)
+            ent_loss = torch.zeros((), device=x.device)
+            tr_extras = {}
 
         # ── gate features (train: soft; eval: hard) ──
         if hard_mode:
@@ -396,14 +430,22 @@ class SRPhase1(nn.Module):
         # ── losses ──
         recon = F.l1_loss(F_hat, patch, reduction="mean")
 
-        # rate penalty = expected token fraction (differentiable via soft mask)
-        rate = soft.mean()
-        # entropy anti-collapse: averaged selection should not degenerate
-        avg_sel = soft.mean(dim=0)             # (256,)
-        ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
-                (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()
-
-        loss = recon + self.lambda_rate * rate + self.lambda_ent * ent
+        if self.use_trust_region and self.trust_region is not None:
+            # PPO-KL variant: budget interval (slow EMA) + trust region KL
+            beta = self.trust_region.beta
+            loss = recon + budget_loss + beta * kl_loss + self.lambda_ent * ent_loss
+            rate = soft.mean()
+            avg_sel = soft.mean(dim=0)
+            ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
+                    (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()
+        else:
+            # rate penalty = expected token fraction (differentiable via soft mask)
+            rate = soft.mean()
+            # entropy anti-collapse: averaged selection should not degenerate
+            avg_sel = soft.mean(dim=0)             # (256,)
+            ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
+                    (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()
+            loss = recon + self.lambda_rate * rate + self.lambda_ent * ent
 
         with torch.no_grad():
             k_used = (mask > 0.5).sum(dim=1)   # (B,) hard token count
@@ -411,7 +453,7 @@ class SRPhase1(nn.Module):
                 return torch.as_tensor(v, device=x.device)  # DataParallel-gatherable
             stats = {
                 "recon_l1": _t(recon),
-                "tau_mean": _t(tau.mean()),
+                "tau_mean": _t(tau.mean() if tau.numel() else rate.new_tensor(0.0)),
                 "rate": _t(rate),
                 "usage": _t((mask > 0.5).float().mean()),
                 "k_used_mean": _t(k_used.float().mean()),
@@ -419,6 +461,174 @@ class SRPhase1(nn.Module):
                 "k_used_max": _t(k_used.float().max()),
                 "entropy": _t(ent),
             }
+            stats.update({k: _t(v) for k, v in tr_extras.items()})
 
         return {"loss": loss, "F_hat": F_hat, "mask": mask,
                 "tau": tau, "stats": stats}
+
+
+# ═══════════════════════════════════════════════════════════════
+# BudgetTrustRegion — PPO-style stabilization of the budget policy
+# ═══════════════════════════════════════════════════════════════
+# Root cause (measured): τ moves are amplified ~100× into k (dk/dτ≈-φ·256),
+# the recon/rate gradients cancel near equilibrium, and gumbel noise turns
+# τ into a random walk that slams into the tanh bound → k collapses (λ=0.3)
+# or never compresses (λ=0.04).  Fixes (mirror PPO's trust-region idea):
+#   ① τ output cap:  |τ - τ_ref| ≤ δ_τ per step  (Δk ≤ ~5 tokens/step)
+#   ② k hard guard:  τ clamped to keep k ∈ [k_min, k_max] always
+#   ③ KL trust region: β·KL(Bern(p_ref)‖Bern(p)) with dual-gradient β
+#      → one-step damped system, cannot diverge (PPO-KL variant)
+#   ④ gumbel → 0 + T anneal: removes the noise driving the random walk
+#   ⑤ EMA budget interval: penalty only outside [r_min, r_max], slow α_r
+#      feedback (cascade control: fast recon inner loop, slow budget outer)
+#   ⑥ separate small lr for RateHead (TTUR) + grad clip (in train script)
+
+class BudgetTrustRegion:
+    """Holds controller state + forward-time computations for stage-2.
+
+    Not an nn.Module (stateless w.r.t. params) — the train script drives
+    update_ref / update_beta / anneal each step.
+    """
+
+    def __init__(
+        self,
+        n: int = 256,
+        delta_tau: float = 0.05,
+        kl_target: float = 0.005,
+        beta: float = 1.0,
+        beta_min: float = 1e-3,
+        beta_max: float = 50.0,
+        beta_eta: float = 0.3,
+        kl_ema_alpha: float = 0.05,
+        k_min: int = 2,
+        k_max: int = 250,
+        T: float = 1.0,
+        T_min: float = 0.3,
+        anneal_steps: int = 1000,
+        gumbel_steps: int = 800,
+        rate_ema_alpha: float = 0.01,
+        rate_min: float = 0.03,
+        rate_max: float = 0.25,
+        lambda_rate: float = 0.3,
+        lambda_ent: float = 0.01,
+        ref_momentum: float = 0.99,
+    ):
+        assert k_max < n, "k_max must be < n (topk index needs k_max <= n-1)"
+        self.n = n
+        self.delta_tau = delta_tau
+        self.kl_target = kl_target
+        self.beta = beta
+        self.beta_min = beta_min
+        self.beta_max = beta_max
+        self.beta_eta = beta_eta
+        self.kl_ema_alpha = kl_ema_alpha
+        self.k_min = k_min
+        self.k_max = k_max
+        self.T = T
+        self.T_min = T_min
+        self.anneal_steps = anneal_steps
+        self.gumbel_steps = gumbel_steps
+        self.rate_ema_alpha = rate_ema_alpha
+        self.rate_min = rate_min
+        self.rate_max = rate_max
+        self.lambda_rate = lambda_rate
+        self.lambda_ent = lambda_ent
+        self.ref_momentum = ref_momentum
+        self.kl_ema = 0.0
+        self.rate_ema = None      # init to 1.0 at stage-2 start (was full-keep)
+        self._last_kl = 0.0
+        self.step = 0
+
+    # ── schedule helpers ──
+    def anneal(self):
+        f = min(1.0, self.step / max(1, self.anneal_steps))
+        return self.T + (self.T_min - self.T) * f
+
+    def gumbel_coef(self):
+        return max(0.0, 1.0 - self.step / max(1, self.gumbel_steps))
+
+    def update_ref(self, model: "SRPhase1"):
+        """EMA of RateHead weights = reference policy (old π)."""
+        with torch.no_grad():
+            for p, pt in zip(model.rate_head.parameters(),
+                             model.rate_head_target.parameters()):
+                pt.data.mul_(self.ref_momentum).add_(p.data, alpha=1 - self.ref_momentum)
+
+    def update_beta(self, kl_step: float):
+        """Dual-gradient update for β (PPO's adaptive KL penalty)."""
+        self.kl_ema = (1 - self.kl_ema_alpha) * self.kl_ema + self.kl_ema_alpha * kl_step
+        self.beta = min(max(self.beta * math.exp(self.beta_eta * (self.kl_ema - self.kl_target)),
+                            self.beta_min), self.beta_max)
+
+    # ── forward-time gate + budget (called from SRPhase1.forward) ──
+    def gate_forward(self, model: "SRPhase1", logits: Tensor, cls: Tensor) -> dict:
+        """
+        logits: (B,N) per-sample normalized, requires_grad (ScoreHead path)
+        cls:    (B,D)
+        Returns dict: mask(STE, for recon), soft(clean, τ-grad only),
+                      budget_loss, kl_loss, ent_loss, extras(stats)
+        """
+        B, N = logits.shape
+        self.step += 1
+
+        # ① τ with cap around reference policy
+        tau_net = 2.0 * torch.tanh(model.rate_head(cls))            # (B,1) ∈ [-2,2]
+        with torch.no_grad():
+            tau_ref = 2.0 * torch.tanh(model.rate_head_target(cls))
+        tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
+                          tau_ref + self.delta_tau)
+
+        # ② k hard guard: keep k ∈ [k_min, k_max]
+        #   topk(k_max+1) so index k_max = (k_max+1)-th largest logit exists.
+        top_vals, _ = torch.topk(logits, self.k_max + 1, dim=1)     # descending
+        tau = torch.clamp(tau,
+                          top_vals[:, self.k_max].detach().unsqueeze(1),
+                          top_vals[:, self.k_min - 1].detach().unsqueeze(1))
+
+        # ③ gate
+        T = self.anneal()
+        g = self.gumbel_coef()
+        noise = g * (-torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8))
+        soft_noisy = torch.sigmoid((logits + noise - tau) / T)      # exploration (mask path)
+        hard = (logits > tau).float()
+        mask = hard + (soft_noisy - hard).detach()                  # STE path (unchanged)
+
+        # ④ clean soft: logits detached → budget terms only push τ
+        soft = torch.sigmoid((logits.detach() - tau) / T)
+        with torch.no_grad():
+            soft_ref = torch.sigmoid((logits - tau_ref) / T)
+
+        # ⑤ trust region: KL(Bern(p_ref) ‖ Bern(p))
+        eps = 1e-5
+        pr = soft_ref.clamp(eps, 1 - eps)
+        pc = soft.clamp(eps, 1 - eps)
+        kl = (pr * (pr.log() - pc.log()) +
+              (1 - pr) * ((1 - pr).log() - (1 - pc).log())).mean()
+        # entropy (on clean soft)
+        ent = -(pc * pc.log() + (1 - pc) * (1 - pc).log()).mean()
+
+        # ⑥ budget interval penalty (hinge, rate-dependent)
+        #    Out-of-range decided by detach(rate) (stable); gradient flows
+        #    through rate → τ.  Inside [r_min, r_max] → zero penalty, so no
+        #    equilibrium gradient cancellation (the λ cliff we measured).
+        rate = soft.mean()
+        rate_d = rate.detach()
+        budget = self.lambda_rate * (F.relu(rate_d - self.rate_max) ** 2
+                                     + F.relu(self.rate_min - rate_d) ** 2)
+        # gradient path: the squared hinge is w.r.t. rate_d (const), so attach
+        # a linear pass-through so τ still receives push when out of range
+        if float(budget.detach().cpu()) > 0:
+            budget = budget + self.lambda_rate * 0.1 * rate
+
+        extras = {
+            "tau_mean": tau.mean().item(),
+            "tau_ref": tau_ref.mean().item(),
+            "k_used_mean": hard.sum(1).float().mean().item(),
+            "rate": rate.item(),
+            "kl": kl.item(),
+            "beta": self.beta,
+            "T": T,
+            "gumbel_coef": g,
+        }
+        return {"mask": mask, "soft": soft, "budget_loss": budget,
+                "kl_loss": kl, "ent_loss": ent, "extras": extras}

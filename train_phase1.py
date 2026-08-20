@@ -27,7 +27,7 @@ from transformers import (
     Dinov2Model, Trainer, TrainingArguments, TrainerCallback,
 )
 
-from model_phase1 import SRPhase1
+from model_phase1 import SRPhase1, BudgetTrustRegion
 
 # ═══════════════════════════════════════════════════════════════
 # Dataset — flat JPEG dir or ImageFolder; returns raw path (like
@@ -85,17 +85,20 @@ class ImageCollector:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Callback — two-stage schedule (stage1 warmup → stage2 anneal)
+# Callback — two-stage schedule + PPO-style trust-region updates
 # ═══════════════════════════════════════════════════════════════
 
 class StageScheduleCallback(TrainerCallback):
     def __init__(self, stage1_steps: int, anneal_steps: int,
-                 lambda_rate_target: float, T: float, T_min: float):
+                 lambda_rate_target: float, T: float, T_min: float,
+                 trust_region: bool = False, lr_pol: float = 1e-4):
         self.stage1_steps = stage1_steps
         self.anneal_steps = anneal_steps
         self.lambda_rate_target = lambda_rate_target
         self.T = T
         self.T_min = T_min
+        self.trust_region = trust_region
+        self.lr_pol = lr_pol
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if model is None:
@@ -106,9 +109,24 @@ class StageScheduleCallback(TrainerCallback):
             model.set_lambda_rate(0.0)
         else:
             model.set_stage(2)
-            prog = min(1.0, (step - self.stage1_steps) / max(1, self.anneal_steps))
-            model.set_lambda_rate(self.lambda_rate_target * prog)
-            model.gate.T = max(self.T_min, self.T * (1 - 0.7 * prog))
+            if self.trust_region and model.trust_region is not None:
+                # trust-region controller handles its own scheduling
+                pass
+            else:
+                prog = min(1.0, (step - self.stage1_steps) / max(1, self.anneal_steps))
+                model.set_lambda_rate(self.lambda_rate_target * prog)
+                model.gate.T = max(self.T_min, self.T * (1 - 0.7 * prog))
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if model is None or not self.trust_region:
+            return
+        btr = model.trust_region
+        if btr is None or model.fixed_tau is not None:
+            return
+        # EMA reference policy + adaptive β (PPO-KL dual gradient)
+        btr.update_ref(model)
+        kl_step = getattr(btr, "_last_kl", 0.0)
+        btr.update_beta(kl_step)
 
     def on_log(self, args, state, control, model=None, **kwargs):
         if model is not None:
@@ -135,6 +153,21 @@ def main():
     ap.add_argument("--lambda_rate_target", type=float, default=0.04)
     ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--T_min", type=float, default=0.7)
+
+    # PPO-style trust region (budget stabilization)
+    ap.add_argument("--trust_region", type=int, default=0,
+                    help="enable PPO-KL budget stabilization (stage-2)")
+    ap.add_argument("--lr_pol", type=float, default=1e-4,
+                    help="RateHead lr (TTUR: slow policy head)")
+    ap.add_argument("--delta_tau", type=float, default=0.05)
+    ap.add_argument("--kl_target", type=float, default=0.005)
+    ap.add_argument("--beta0", type=float, default=1.0)
+    ap.add_argument("--k_min", type=int, default=2)
+    ap.add_argument("--k_max", type=int, default=250)
+    ap.add_argument("--rate_min", type=float, default=0.03)
+    ap.add_argument("--rate_max", type=float, default=0.25)
+    ap.add_argument("--tr_T_min", type=float, default=0.3)
+    ap.add_argument("--tr_gumbel_steps", type=int, default=800)
 
     # HF Trainer args (mirror train.py style)
     ap.add_argument("--num_train_epochs", type=int, default=4)
@@ -211,7 +244,40 @@ def main():
     schedule = StageScheduleCallback(
         args.stage1_steps, args.anneal_steps,
         args.lambda_rate_target, args.T, args.T_min,
+        trust_region=bool(args.trust_region), lr_pol=args.lr_pol,
     )
+
+    # ── PPO-style trust region: controller + RateHead slow lr (TTUR) ──
+    optimizers = None
+    if args.trust_region:
+        btr = BudgetTrustRegion(
+            n=num_patches,
+            delta_tau=args.delta_tau,
+            kl_target=args.kl_target,
+            beta=args.beta0,
+            k_min=args.k_min,
+            k_max=args.k_max,
+            T=args.T,
+            T_min=args.tr_T_min,
+            gumbel_steps=args.tr_gumbel_steps,
+            rate_min=args.rate_min,
+            rate_max=args.rate_max,
+            lambda_rate=args.lambda_rate_target,
+        )
+        model.enable_trust_region(btr)
+        # two timescales: main params 3e-4, RateHead 1e-4 (TTUR)
+        main_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and "rate_head" not in n]
+        pol_params = [p for n, p in model.named_parameters()
+                      if p.requires_grad and "rate_head" in n]
+        opt = torch.optim.AdamW([
+            {"params": main_params, "lr": args.learning_rate},
+            {"params": pol_params, "lr": args.lr_pol},
+        ], weight_decay=args.weight_decay)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
+        optimizers = (opt, sched)
+        print(f"[trust-region] RateHead lr={args.lr_pol} (TTUR), "
+              f"k∈[{args.k_min},{args.k_max}], rate∈[{args.rate_min},{args.rate_max}]")
 
     trainer = Trainer(
         model=model,
@@ -219,6 +285,7 @@ def main():
         train_dataset=dataset,
         data_collator=collator,
         callbacks=[schedule],
+        optimizers=optimizers,
     )
 
     print(f"\n{'='*60}")
