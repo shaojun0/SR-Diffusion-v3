@@ -309,9 +309,13 @@ class SRPhase1(nn.Module):
         cls = feats[:, 0]                      # (B, D)
         patch = feats[:, 1:]                   # (B, 256, D)
 
-        # ── per-token importance ──
-        logits = self.score_head(patch) * 2.0   # (B,256) fixed scale: widen
-                                                # distribution so τ stays in range
+        # ── per-token importance (relative ranking only) ──
+        logits = self.score_head(patch)        # (B,256) raw scores
+        # per-sample normalize: ScoreHead learns WHICH tokens matter (ranking),
+        # RateHead learns HOW MANY (absolute τ).  This prevents an arms race
+        # where ScoreHead inflates all logits past a bounded τ → gate always on.
+        logits = (logits - logits.mean(dim=1, keepdim=True)) / \
+                 (logits.std(dim=1, keepdim=True) + 1e-5)
 
         # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──
         if self.fixed_tau is not None:
