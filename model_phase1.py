@@ -114,7 +114,7 @@ class GumbelTopK(nn.Module):
 
         # hard top-k mask (detached, straight-through)
         k = k.long().clamp(1, N)
-        idx = torch.topk(logits, k.max().item(), dim=1).indices
+        idx = torch.topk(logits, N, dim=1).indices          # full ranking (B,N)
         hard = torch.zeros_like(logits)
         for i in range(B):
             hard[i, idx[i, :k[i]]] = 1.0
