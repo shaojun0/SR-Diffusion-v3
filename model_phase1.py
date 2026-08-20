@@ -381,6 +381,10 @@ class SRPhase1(nn.Module):
         # where ScoreHead inflates all logits past a bounded τ → gate always on.
         logits = (logits - logits.mean(dim=1, keepdim=True)) / \
                  (logits.std(dim=1, keepdim=True) + 1e-5)
+        # NaN 防御（实测：真实 ImageNet 图 ~970 步 grad_norm=NaN，随机噪声 1000 步稳定；
+        # 真实图 logits 长尾在 bf16 下产生梯度尖峰 → 单参数 inf → HF Trainer 的
+        # clip_grad_norm_(inf) 做 inf×0 → 全参 NaN）。限幅不改变排序，k 守卫/gate 不受影响。
+        logits = logits.clamp(-8.0, 8.0)
 
         # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──
         if self.fixed_tau is not None:
@@ -394,18 +398,18 @@ class SRPhase1(nn.Module):
             # PPO-style budget stabilization (stage-2)
             tr = self.trust_region.gate_forward(self, logits, cls)
             mask, soft = tr["mask"], tr["soft"]
-            tau = mask.new_zeros(B, 1)  # not used directly; extras carry stats
+            tau = tr["tau"]                       # 真实 τ（供 recon 力放大）
             budget_loss, kl_loss, ent_loss = (tr["budget_loss"], tr["kl_loss"],
                                               tr["ent_loss"])
+            tau_reg = tr["tau_reg"]
             tr_extras = tr["extras"]
             # stash KL for the callback's adaptive-β update
             self.trust_region._last_kl = float(kl_loss.detach().cpu())
         else:
-            # bounded threshold: 2·tanh keeps τ in [-2, 2], always INSIDE the
-            # normalized logits distribution (N(0,1)).  If τ left the support,
-            # sigmoid would saturate → soft(1-soft)→0 → both recon and rate
-            # gradients vanish → τ stuck (deadlock we hit with 4·tanh).
-            tau = 2.0 * torch.tanh(self.rate_head(cls))   # (B,1) ∈ [-2, 2]
+            # bounded threshold: 2·tanh keeps τ in [-1.8, 1.8] (raw 先 clamp 防
+            # tanh 饱和死锁，dτ/draw ≥ 0.38 永不消失)。与 trust-region 路径一致。
+            raw = torch.clamp(self.rate_head(cls), -1.472, 1.472)   # insurance
+            tau = 2.0 * torch.tanh(raw)                             # ∈ [-1.8, 1.8]
             mask, soft = self.gate(logits, tau)    # (B,256) each
             budget_loss = torch.zeros((), device=x.device)
             kl_loss = torch.zeros((), device=x.device)
@@ -430,10 +434,29 @@ class SRPhase1(nn.Module):
         # ── losses ──
         recon = F.l1_loss(F_hat, patch, reduction="mean")
 
-        if self.use_trust_region and self.trust_region is not None:
-            # PPO-KL variant: budget interval (slow EMA) + trust region KL
-            beta = self.trust_region.beta
-            loss = recon + budget_loss + beta * kl_loss + self.lambda_ent * ent_loss
+        if (self.use_trust_region and self.trust_region is not None
+                and self.fixed_tau is None):
+            # v3: dead-zone hinge + recon 的 τ 路径梯度放大 ×s + 排斥正则
+            btr = self.trust_region
+            beta = btr.beta
+            # ── 力放大：把 ∂recon/∂τ 放大 s 倍，且只影响 RateHead ──
+            #    L_boost = (s-1)·Σ_j (∂recon/∂τ_j)·τ_j
+            #    ∂L_boost/∂τ_j = (s-1)·∂recon/∂τ_j（g_tau detach 后视为常数）
+            #    L_boost 不含 logits/decoder 变量 → ScoreHead/ReEncoder/Decoder
+            #    的梯度不变（实测 recon 力仅 ~0.001-0.003，不放大则 τ 动力学冻结）。
+            if tau.requires_grad and recon.requires_grad:
+                g_tau = torch.autograd.grad(recon, tau, retain_graph=True,
+                                            allow_unused=True)[0]
+                if g_tau is None:
+                    g_tau = torch.zeros_like(tau)
+                g_tau = torch.nan_to_num(g_tau, nan=0.0, posinf=0.0, neginf=0.0)
+                recon_boost = (btr.recon_tau_scale - 1.0) * (g_tau.detach() * tau).sum()
+            else:
+                recon_boost = recon.new_zeros(())
+            loss = (recon + recon_boost
+                    + budget_loss + beta * kl_loss
+                    + self.lambda_ent * ent_loss
+                    + btr.lambda_tau * tau_reg)
             rate = soft.mean()
             avg_sel = soft.mean(dim=0)
             ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
@@ -500,7 +523,7 @@ class BudgetTrustRegion:
         beta_max: float = 50.0,
         beta_eta: float = 0.3,
         kl_ema_alpha: float = 0.05,
-        k_min: int = 2,
+        k_min: int = 8,
         k_max: int = 250,
         T: float = 1.0,
         T_min: float = 0.3,
@@ -509,9 +532,13 @@ class BudgetTrustRegion:
         rate_ema_alpha: float = 0.01,
         rate_min: float = 0.03,
         rate_max: float = 0.25,
-        lambda_rate: float = 0.3,
+        lambda_rate: float = 5.0,          # dead-zone hinge 刚度（原 0.3 线性惩罚语义废弃）
         lambda_ent: float = 0.01,
         ref_momentum: float = 0.99,
+        recon_tau_scale: float = 50.0,     # NEW: recon 的 τ 路径梯度放大倍数（力平衡标定）
+        raw_max: float = 1.472,            # NEW: atanh(1.8/2) — raw clamp，dτ/draw ≥ 0.38
+        tau_soft: float = 1.5,             # NEW: raw 空间排斥正则起点（τ=1.5）
+        lambda_tau: float = 1.0,           # NEW: 排斥强度
     ):
         assert k_max < n, "k_max must be < n (topk index needs k_max <= n-1)"
         self.n = n
@@ -538,6 +565,10 @@ class BudgetTrustRegion:
         self.rate_ema = None      # init to 1.0 at stage-2 start (was full-keep)
         self._last_kl = 0.0
         self.step = 0
+        self.recon_tau_scale = recon_tau_scale
+        self.raw_max = raw_max
+        self.raw_soft = math.atanh(min(0.999, tau_soft / 2.0))   # ≈ 1.099 (τ=1.5)
+        self.lambda_tau = lambda_tau
 
     # ── schedule helpers ──
     def anneal(self):
@@ -555,10 +586,17 @@ class BudgetTrustRegion:
                 pt.data.mul_(self.ref_momentum).add_(p.data, alpha=1 - self.ref_momentum)
 
     def update_beta(self, kl_step: float):
-        """Dual-gradient update for β (PPO's adaptive KL penalty)."""
+        """Dual-gradient update for β (PPO's adaptive KL penalty).
+
+        NaN 防御：KL 为 NaN/Inf（真实图 logits 长尾 + bf16 梯度尖峰）时保持 β
+        不动，否则 NaN 会经 exp/min/max 传染进 loss（grad_norm=NaN 的源头之一）。
+        """
+        if not math.isfinite(kl_step) or not math.isfinite(self.kl_ema):
+            return
         self.kl_ema = (1 - self.kl_ema_alpha) * self.kl_ema + self.kl_ema_alpha * kl_step
-        self.beta = min(max(self.beta * math.exp(self.beta_eta * (self.kl_ema - self.kl_target)),
-                            self.beta_min), self.beta_max)
+        new_beta = self.beta * math.exp(self.beta_eta * (self.kl_ema - self.kl_target))
+        if math.isfinite(new_beta):
+            self.beta = min(max(new_beta, self.beta_min), self.beta_max)
 
     # ── forward-time gate + budget (called from SRPhase1.forward) ──
     def gate_forward(self, model: "SRPhase1", logits: Tensor, cls: Tensor) -> dict:
@@ -571,10 +609,20 @@ class BudgetTrustRegion:
         B, N = logits.shape
         self.step += 1
 
-        # ① τ with cap around reference policy
-        tau_net = 2.0 * torch.tanh(model.rate_head(cls))            # (B,1) ∈ [-2,2]
+        # 平滑压缩：rate_max 从 1.0 退火到目标值（消除 stage-2 起点 k 突变的冲击；
+        # 也是 NaN 防御——re-encoder/decoder 先适应全保留输入再逐步压缩）
+        f = min(1.0, self.step / max(1, self.anneal_steps))
+        rate_max = self.rate_max + (1.0 - self.rate_max) * (1.0 - f)
+
+        # ① raw clamp（网络 + target 都要）: dτ/draw = 2(1-tanh²(raw)) ≥ 0.38 永不消失
+        #    （在 forward 处 clamp 而非 RateHead 输出层：target 共享同一条代码路径；
+        #     梯度经 clamp 在界内为恒等，模块本身保持纯函数）
+        raw = torch.clamp(model.rate_head(cls), -self.raw_max, self.raw_max)
+        tau_net = 2.0 * torch.tanh(raw)                              # ∈ [-1.8, 1.8]
         with torch.no_grad():
-            tau_ref = 2.0 * torch.tanh(model.rate_head_target(cls))
+            raw_ref = torch.clamp(model.rate_head_target(cls),
+                                  -self.raw_max, self.raw_max)       # target 也必须 clamp！
+            tau_ref = 2.0 * torch.tanh(raw_ref)
         tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
                           tau_ref + self.delta_tau)
 
@@ -591,7 +639,11 @@ class BudgetTrustRegion:
         noise = g * (-torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8))
         soft_noisy = torch.sigmoid((logits + noise - tau) / T)      # exploration (mask path)
         hard = (logits > tau).float()
-        mask = hard + (soft_noisy - hard).detach()                  # STE path (unchanged)
+        # STE: forward=hard，梯度走 soft_noisy。
+        # ⚠ 必须 soft 在前：写成 hard + (soft-hard).detach() 时，hard 是比较运算
+        #   输出（无 grad_fn），加一个 detach 项后整张 mask requires_grad=False，
+        #   recon 梯度到不了 τ 和 ScoreHead —— 路径静默死掉（smoke test 实测确认）。
+        mask = soft_noisy + (hard - soft_noisy).detach()
 
         # ④ clean soft: logits detached → budget terms only push τ
         soft = torch.sigmoid((logits.detach() - tau) / T)
@@ -599,29 +651,49 @@ class BudgetTrustRegion:
             soft_ref = torch.sigmoid((logits - tau_ref) / T)
 
         # ⑤ trust region: KL(Bern(p_ref) ‖ Bern(p))
-        eps = 1e-5
-        pr = soft_ref.clamp(eps, 1 - eps)
-        pc = soft.clamp(eps, 1 - eps)
+        #    fp32 computation: under bf16 autocast, clamp(1e-5) can't be
+        #    represented (bf16 precision ~1e-3) → pc.log() → -inf → NaN
+        #    (observed at step ~980 under bf16; NaN only in rate_head).
+        eps = 1e-3   # safe lower bound even in bf16
+        pr = soft_ref.float().clamp(eps, 1 - eps)
+        pc = soft.float().clamp(eps, 1 - eps)
         kl = (pr * (pr.log() - pc.log()) +
               (1 - pr) * ((1 - pr).log() - (1 - pc).log())).mean()
         # entropy (on clean soft)
         ent = -(pc * pc.log() + (1 - pc) * (1 - pc).log()).mean()
 
-        # ⑥ budget interval penalty (hinge, rate-dependent)
-        #    Out-of-range decided by detach(rate) (stable); gradient flows
-        #    through rate → τ.  Inside [r_min, r_max] → zero penalty, so no
-        #    equilibrium gradient cancellation (the λ cliff we measured).
+        # ⑥ dead-zone hinge（per-sample、瞬时值、平方）—— 死区内预算力≡0，
+        #    消除实测 30× 力失衡；梯度 ≈ 2·λh·err·φ。
+        #    精确形式（v3）:
+        #      err_j   = ReLU(rate_j - r_max) + ReLU(r_min - rate_j)
+        #      budget  = λh · mean_j(err_j²)
+        #    vs 上一个临时版本（rate.detach() + 线性直通）:
+        #      ① 它只有"上方"正确，rate < r_min 时线性直通方向错误（把 rate 继续往下推），
+        #         塌缩恢复（k=4 → r_min）会失效；② float(...cpu()) 每步 GPU→CPU 同步。
         rate = soft.mean()
-        rate_d = rate.detach()
-        budget = self.lambda_rate * (F.relu(rate_d - self.rate_max) ** 2
-                                     + F.relu(self.rate_min - rate_d) ** 2)
-        # gradient path: the squared hinge is w.r.t. rate_d (const), so attach
-        # a linear pass-through so τ still receives push when out of range
-        if float(budget.detach().cpu()) > 0:
-            budget = budget + self.lambda_rate * 0.1 * rate
+        rate_j = soft.mean(dim=1)                        # (B,) per-sample usage
+        err = (F.relu(rate_j - rate_max)                 # 用退火后的 rate_max
+               + F.relu(self.rate_min - rate_j))         # 死区 [r_min, r_max] 内力=0
+        budget = self.lambda_rate * err.square().mean()
+        # rate_ema 仅作日志统计（不再进入 loss）
+        if self.rate_ema is None:
+            self.rate_ema = torch.ones_like(rate)
+        self.rate_ema = ((1 - self.rate_ema_alpha) * self.rate_ema.detach()
+                         + self.rate_ema_alpha * rate)
+
+        # ⑦ raw 空间排斥正则：饱和区唯一存活的梯度信号（clamp 防复发、排斥管恢复）
+        #    L_tau_reg = λ_tau · mean_j(ReLU(|raw_j| - raw_soft)²)
+        #    ∂L/∂raw_j = 2·λ_tau·ReLU(|raw_j|-raw_soft)·sign(raw_j) —— 无 sigmoid/tanh 衰减
+        tau_reg = F.relu(raw.abs() - self.raw_soft).square().mean()
 
         extras = {
             "tau_mean": tau.mean().item(),
+            "tau_std": tau.std().item(),              # 内容自适应指标（崩前 ≈0.03）
+            "raw_mean": raw.mean().item(),            # raw 是否接近 clamp 边界
+            "rate_j_std": rate_j.std().item(),        # per-sample 使用率分化
+            "rate_max": rate_max,
+            "tau_reg": tau_reg.item(),
+            "logits_std": logits.std(dim=1).mean().item(),   # NaN 诊断
             "tau_ref": tau_ref.mean().item(),
             "k_used_mean": hard.sum(1).float().mean().item(),
             "rate": rate.item(),
@@ -631,4 +703,5 @@ class BudgetTrustRegion:
             "gumbel_coef": g,
         }
         return {"mask": mask, "soft": soft, "budget_loss": budget,
-                "kl_loss": kl, "ent_loss": ent, "extras": extras}
+                "kl_loss": kl, "ent_loss": ent, "tau_reg": tau_reg,
+                "tau": tau, "extras": extras}

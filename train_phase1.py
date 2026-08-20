@@ -108,6 +108,17 @@ class StageScheduleCallback(TrainerCallback):
             model.set_stage(1)
             model.set_lambda_rate(0.0)
         else:
+            if step == self.stage1_steps and self.trust_region and model.trust_region is not None:
+                # 进入 stage-2：参考策略与 RateHead 硬同步（消除 EMA 残留偏差，
+                # 防 τ_ref 与 τ_net 起点不一致；stage-1 期间 rate_head 未训练，
+                # target 是 enable_trust_region 时的旧拷贝，此处强制对齐）
+                btr = model.trust_region
+                with torch.no_grad():
+                    for p, pt in zip(model.rate_head.parameters(),
+                                     model.rate_head_target.parameters()):
+                        pt.data.copy_(p.data)
+                btr.step = 0                 # 退火窗口从 stage-2 起算
+                btr.rate_ema = None          # 日志 EMA 重置
             model.set_stage(2)
             if self.trust_region and model.trust_region is not None:
                 # trust-region controller handles its own scheduling
@@ -150,24 +161,35 @@ def main():
     # stage schedule
     ap.add_argument("--stage1_steps", type=int, default=800)
     ap.add_argument("--anneal_steps", type=int, default=3000)
-    ap.add_argument("--lambda_rate_target", type=float, default=0.04)
+    ap.add_argument("--lambda_rate_target", type=float, default=0.04,
+                    help="plain-path 线性 λr（anneal 目标）；v3 推荐 trust_region=1")
     ap.add_argument("--T", type=float, default=1.0)
     ap.add_argument("--T_min", type=float, default=0.7)
 
-    # PPO-style trust region (budget stabilization)
-    ap.add_argument("--trust_region", type=int, default=0,
-                    help="enable PPO-KL budget stabilization (stage-2)")
-    ap.add_argument("--lr_pol", type=float, default=1e-4,
-                    help="RateHead lr (TTUR: slow policy head)")
+    # PPO-style trust region (budget stabilization) —— v3 默认开启
+    ap.add_argument("--trust_region", type=int, default=1,
+                    help="enable PPO-KL budget stabilization (stage-2) [v3: 必须开]")
+    ap.add_argument("--lr_pol", type=float, default=1e-3,
+                    help="RateHead lr (TTUR: slow policy head; v3: 1e-3，配 trust region)")
     ap.add_argument("--delta_tau", type=float, default=0.05)
     ap.add_argument("--kl_target", type=float, default=0.005)
     ap.add_argument("--beta0", type=float, default=1.0)
-    ap.add_argument("--k_min", type=int, default=2)
+    ap.add_argument("--k_min", type=int, default=8,
+                    help="k 守卫下限（原 2 允许 k=4 塌缩）")
     ap.add_argument("--k_max", type=int, default=250)
     ap.add_argument("--rate_min", type=float, default=0.03)
     ap.add_argument("--rate_max", type=float, default=0.25)
     ap.add_argument("--tr_T_min", type=float, default=0.3)
     ap.add_argument("--tr_gumbel_steps", type=int, default=800)
+    # v3 新增：力平衡 + 触界保护
+    ap.add_argument("--lambda_rate_hinge", type=float, default=5.0,
+                    help="dead-zone hinge 刚度（独立于 lambda_rate_target；勿混用）")
+    ap.add_argument("--recon_tau_scale", type=float, default=50.0,
+                    help="recon 的 τ 路径梯度放大倍数（力平衡标定，主旋钮）")
+    ap.add_argument("--raw_max", type=float, default=1.472,
+                    help="atanh(1.8/2)：raw clamp，τ≤1.8 且 dτ/draw≥0.38")
+    ap.add_argument("--tau_soft", type=float, default=1.5)
+    ap.add_argument("--lambda_tau", type=float, default=1.0)
 
     # HF Trainer args (mirror train.py style)
     ap.add_argument("--num_train_epochs", type=int, default=4)
@@ -262,7 +284,11 @@ def main():
             gumbel_steps=args.tr_gumbel_steps,
             rate_min=args.rate_min,
             rate_max=args.rate_max,
-            lambda_rate=args.lambda_rate_target,
+            lambda_rate=args.lambda_rate_hinge,   # ← 独立 hinge 刚度（勿用 lambda_rate_target）
+            recon_tau_scale=args.recon_tau_scale,
+            raw_max=args.raw_max,
+            tau_soft=args.tau_soft,
+            lambda_tau=args.lambda_tau,
         )
         model.enable_trust_region(btr)
         # two timescales: main params 3e-4, RateHead 1e-4 (TTUR)
