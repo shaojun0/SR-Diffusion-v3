@@ -292,14 +292,64 @@ class SRPhase1(nn.Module):
     def set_lambda_rate(self, value: float):
         self.lambda_rate = value
 
+    # ── init from pretrained DINO (mirrors SRQwenVLv10.build_model) ──
+    @classmethod
+    def build_model(cls, dinov2: nn.Module, num_patches: int = 256, dim: int = 768,
+                    T: float = 1.0, lambda_rate: float = 0.1,
+                    lambda_ent: float = 0.01, fixed_tau: Optional[float] = None,
+                    init_reencoder: bool = True) -> "SRPhase1":
+        """Build Phase-1 model and optionally warm-start ReEncoder from the
+        pretrained DINO encoder layers (so the re-encoder doesn't learn from
+        scratch — same spirit as SRQwenVLv10.build_model swapping in DINO)."""
+        model = cls(dinov2, num_patches=num_patches, dim=dim, T=T,
+                    lambda_rate=lambda_rate, lambda_ent=lambda_ent,
+                    fixed_tau=fixed_tau)
+        if init_reencoder:
+            model.init_reencoder_from_dino()
+        return model
+
+    def init_reencoder_from_dino(self, num_layers: int = 4):
+        """Copy weights from pretrained DINO encoder layers into the ReEncoder.
+
+        DINO layer layout (transformers 5.x):
+            norm1 → attention(query/key/value) → output.dense → layer_scale1
+                 → norm2 → mlp(fc1/fc2) → layer_scale2
+        TransformerEncoderLayer layout:
+            norm1 → self_attn(in_proj / out_proj) → linear1 → linear2 → norm2
+        Shapes match 1:1, so we copy parameter by parameter.
+        """
+        dino_layers = self.dinov2.encoder.layer
+        depth = min(num_layers, len(self.re_encoder.layers), len(dino_layers))
+        for i in range(depth):
+            src, dst = dino_layers[i], self.re_encoder.layers[i]
+            with torch.no_grad():
+                dst.norm1.load_state_dict(src.norm1.state_dict())
+                dst.norm2.load_state_dict(src.norm2.state_dict())
+                # q/k/v → fused in_proj (row order: query, key, value)
+                dst.self_attn.in_proj_weight.data.copy_(torch.cat([
+                    src.attention.attention.query.weight.data,
+                    src.attention.attention.key.weight.data,
+                    src.attention.attention.value.weight.data,
+                ], dim=0))
+                dst.self_attn.in_proj_bias.data.copy_(torch.cat([
+                    src.attention.attention.query.bias.data,
+                    src.attention.attention.key.bias.data,
+                    src.attention.attention.value.bias.data,
+                ], dim=0))
+                dst.self_attn.out_proj.load_state_dict(src.attention.output.dense.state_dict())
+                dst.linear1.load_state_dict(src.mlp.fc1.state_dict())
+                dst.linear2.load_state_dict(src.mlp.fc2.state_dict())
+        print(f"[init] ReEncoder layers 0..{depth-1} warm-started from DINO encoder")
+
     # ── forward ──
-    def forward(self, x: Tensor, hard_mode: bool = False) -> dict:
+    def forward(self, pixel_values: Tensor, hard_mode: bool = False) -> dict:
         """
         Args:
-            x: (B,3,224,224) normalized images
+            pixel_values: (B,3,224,224) normalized images
             hard_mode: inference — physically prune to selected tokens
         Returns dict with loss components + stats.
         """
+        x = pixel_values
         B = x.shape[0]
 
         # ── pass 1: frozen DINOv2 ──
@@ -357,15 +407,17 @@ class SRPhase1(nn.Module):
 
         with torch.no_grad():
             k_used = (mask > 0.5).sum(dim=1)   # (B,) hard token count
+            def _t(v):
+                return torch.as_tensor(v, device=x.device)  # DataParallel-gatherable
             stats = {
-                "recon_l1": recon.item(),
-                "tau_mean": tau.mean().item(),
-                "rate": rate.item(),
-                "usage": (mask > 0.5).float().mean().item(),
-                "k_used_mean": k_used.float().mean().item(),
-                "k_used_min": k_used.float().min().item(),
-                "k_used_max": k_used.float().max().item(),
-                "entropy": ent.item(),
+                "recon_l1": _t(recon),
+                "tau_mean": _t(tau.mean()),
+                "rate": _t(rate),
+                "usage": _t((mask > 0.5).float().mean()),
+                "k_used_mean": _t(k_used.float().mean()),
+                "k_used_min": _t(k_used.float().min()),
+                "k_used_max": _t(k_used.float().max()),
+                "entropy": _t(ent),
             }
 
         return {"loss": loss, "F_hat": F_hat, "mask": mask,
