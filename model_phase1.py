@@ -278,6 +278,11 @@ class SRPhase1(nn.Module):
         self.re_encoder = ReEncoder(dim=dim)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches)
 
+        # zero-init the RateHead output so stage-2 starts at τ≈0 (soft≈0.5):
+        # both recon and rate gradients are then non-zero → no gate saturation
+        nn.init.zeros_(self.rate_head.mlp[3].weight)
+        nn.init.zeros_(self.rate_head.mlp[3].bias)
+
     # ── two-stage control ──
     def set_stage(self, stage: int):
         """stage=1: fix τ (all tokens kept), no rate penalty.
@@ -305,7 +310,7 @@ class SRPhase1(nn.Module):
         patch = feats[:, 1:]                   # (B, 256, D)
 
         # ── per-token importance ──
-        logits = self.score_head(patch) * 3.0   # (B,256) fixed scale: widen
+        logits = self.score_head(patch) * 2.0   # (B,256) fixed scale: widen
                                                 # distribution so τ stays in range
 
         # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──

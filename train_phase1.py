@@ -90,7 +90,7 @@ def main():
                     help="steps over which λ_rate ramps 0 → target")
     ap.add_argument("--lambda_rate_target", type=float, default=0.1)
     ap.add_argument("--T", type=float, default=1.0, help="gate temperature")
-    ap.add_argument("--T_min", type=float, default=0.5)
+    ap.add_argument("--T_min", type=float, default=0.7)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--save_every", type=int, default=500)
     ap.add_argument("--limit", type=int, default=0, help="cap dataset size (0=all)")
