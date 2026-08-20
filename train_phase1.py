@@ -37,7 +37,8 @@ DINO_STD = (0.229, 0.224, 0.225)
 
 class ImageDirDataset(Dataset):
     def __init__(self, root: str, size: int = 224, limit: int = 0):
-        exts = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp")
+        exts = ("*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.png", "*.PNG",
+                "*.webp", "*.WEBP", "*.bmp", "*.BMP")
         files = []
         for ext in exts:
             files += glob.glob(os.path.join(root, "**", ext), recursive=True)
@@ -76,6 +77,8 @@ def main():
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--dino", default="facebook/dinov2-base",
                     help="HF id of frozen DINOv2 (base/small/large/giant)")
+    ap.add_argument("--cache_dir", default=None,
+                    help="HF cache dir with pre-downloaded DINO weights")
     ap.add_argument("--out", default="output/phase1")
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch_size", type=int, default=32)
@@ -86,11 +89,12 @@ def main():
     ap.add_argument("--anneal_steps", type=int, default=2000,
                     help="steps over which λ_rate ramps 0 → target")
     ap.add_argument("--lambda_rate_target", type=float, default=0.1)
-    ap.add_argument("--tau", type=float, default=1.0, help="gumbel temp (annealed)")
-    ap.add_argument("--tau_min", type=float, default=0.3)
+    ap.add_argument("--T", type=float, default=1.0, help="gate temperature")
+    ap.add_argument("--T_min", type=float, default=0.3)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--save_every", type=int, default=500)
     ap.add_argument("--limit", type=int, default=0, help="cap dataset size (0=all)")
+    ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -104,14 +108,14 @@ def main():
 
     # ── frozen DINOv2 ──
     print(f"[model] loading frozen {args.dino} ...")
-    dino = Dinov2Model.from_pretrained(args.dino).to(device).eval()
+    dino = Dinov2Model.from_pretrained(args.dino, cache_dir=args.cache_dir).to(device).eval()
     dim = dino.config.hidden_size
     num_patches = (224 // dino.config.patch_size) ** 2   # 256 for patch14
     print(f"[model] hidden={dim}, patches={num_patches}")
 
     model = SRPhase1(dino, num_patches=num_patches, dim=dim,
-                     tau=args.tau, lambda_rate=0.0).to(device)
-    model.set_stage(1)  # fixed k=1.0
+                     T=args.T, lambda_rate=0.0).to(device)
+    model.set_stage(1)  # fixed tau (all tokens kept)
 
     # trainable = everything except frozen dino
     trainable = [p for n, p in model.named_parameters() if p.requires_grad]
@@ -126,8 +130,8 @@ def main():
 
     # ── loop ──
     step = 0
-    log_keys = ["recon_l1", "rate_soft", "usage", "k_used_mean", "k_used_min",
-                "k_used_max", "entropy"]
+    log_keys = ["recon_l1", "tau_mean", "rate", "usage", "k_used_mean",
+                "k_used_min", "k_used_max", "entropy"]
     for epoch in range(args.epochs):
         model.train()
         for x in loader:
@@ -143,10 +147,8 @@ def main():
                 prog = min(1.0, (step - args.stage1_steps) / max(1, args.anneal_steps))
                 lr_ = args.lambda_rate_target * prog
                 model.set_lambda_rate(lr_)
-                # anneal gumbel temp
-                model.topk.tau = max(args.tau_min,
-                                     args.tau * (1 - 0.7 * prog))
-                model.rate_head.requires_grad_(True)
+                # anneal gate temperature
+                model.gate.T = max(args.T_min, args.T * (1 - 0.7 * prog))
 
             out = model(x)
             loss = out["loss"]
@@ -159,7 +161,7 @@ def main():
                 s = out["stats"]
                 log = " | ".join(f"{k}={s[k]:.4f}" for k in log_keys)
                 print(f"[step {step:6d} ep{epoch}] λr={model.lambda_rate:.3f} "
-                      f"τ={model.topk.tau:.2f} loss={loss.item():.4f} | {log}")
+                      f"T={model.gate.T:.2f} loss={loss.item():.4f} | {log}")
                 with open(os.path.join(args.out, "log.txt"), "a") as f:
                     f.write(f"{step} {loss.item():.6f} " +
                             " ".join(f"{s[k]:.6f}" for k in log_keys) + "\n")

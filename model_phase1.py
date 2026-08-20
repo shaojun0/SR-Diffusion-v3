@@ -47,11 +47,17 @@ from typing import Tuple, Optional
 
 
 # ═══════════════════════════════════════════════════════════════
-# RateHead — predicts the token budget k from [cls]
+# RateHead — predicts the token-budget threshold τ from [cls]
 # ═══════════════════════════════════════════════════════════════
 
 class RateHead(nn.Module):
-    """cls (B,768) → k_soft (B,1) ∈ (0,1).  k = k_soft * N tokens."""
+    """cls (B,768) → τ (B,1) unbounded logit threshold.
+
+    τ participates DIRECTLY in the mask:  mask_i = sigmoid((logits_i - τ)/T).
+    So gradients from BOTH the reconstruction loss (pushes τ ↓, keep more
+    tokens) and the budget penalty λ·mask.mean() (pushes τ ↑, drop more
+    tokens) reach this head.  Their balance = content-adaptive compression.
+    """
 
     def __init__(self, in_dim: int = 768, hidden: int = 256):
         super().__init__()
@@ -63,7 +69,7 @@ class RateHead(nn.Module):
         )
 
     def forward(self, cls: Tensor) -> Tensor:
-        return torch.sigmoid(self.mlp(cls))  # (B,1)
+        return self.mlp(cls)  # (B,1) unbounded threshold
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -87,42 +93,34 @@ class ScoreHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Differentiable Top-k — Gumbel-Sigmoid relaxation + STE
+# Threshold Gate — differentiable top-k via learned threshold τ
 # ═══════════════════════════════════════════════════════════════
 
-class GumbelTopK(nn.Module):
+class ThresholdGate(nn.Module):
     """
-    Soft (train) top-k over N candidates.
+    mask_i = sigmoid((logits_i + g_i - τ) / T)          (soft, gumbel noise g)
+    hard   = (logits_i > τ)                             (hard 0/1 selection)
+    mask   = soft + (hard - soft).detach()              (STE: forward hard)
 
-    forward: logits (B,N), k (B,) or scalar ∈ [1,N]  → (mask, soft)
-      - mask: STE hard 0/1 (one-hot style selection), detached hard path
-      - soft: gumbel-sigmoid relaxation ∈ (0,1), carries gradients to logits
+    τ is a per-image threshold predicted by RateHead.  It appears INSIDE the
+    soft mask, so d(recon)/dτ ≠ 0 — the reconstruction loss can push τ down
+    (keep more tokens) while the rate penalty λ·mask.mean() pushes τ up
+    (drop tokens).  No explicit "predict k as a count" needed: the count
+    emerges from where τ lands relative to the logits distribution.
 
-    During training use soft (or mask which = hard + (soft-hard).detach()).
-    During inference use mask (true hard selection).
+    forward: logits (B,N), tau (B,1) → (mask, soft)
     """
 
-    def __init__(self, tau: float = 1.0):
+    def __init__(self, T: float = 1.0):
         super().__init__()
-        self.tau = tau
+        self.T = T
 
-    def forward(self, logits: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, logits: Tensor, tau: Tensor) -> Tuple[Tensor, Tensor]:
         B, N = logits.shape
-        # gumbel noise (unit gumbel)
         g = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
-        soft = torch.sigmoid((logits + g) / self.tau)          # (B,N) in (0,1)
-
-        # hard top-k mask (detached, straight-through)
-        # STE direction: forward = hard; backward = soft path.
-        #   mask = soft + (hard - soft).detach()
-        #   forward: soft + hard - soft = hard   ✓  (true one-hot selection)
-        #   backward: grad flows through soft    ✓  (score_head learnable)
-        k = k.long().clamp(1, N)
-        idx = torch.topk(logits, N, dim=1).indices          # full ranking (B,N)
-        hard = torch.zeros_like(logits)
-        for i in range(B):
-            hard[i, idx[i, :k[i]]] = 1.0
-        mask = soft + (hard - soft).detach()
+        soft = torch.sigmoid((logits + g - tau) / self.T)   # (B,N) in (0,1)
+        hard = (logits > tau).float()                       # (B,N) 0/1, detached
+        mask = soft + (hard - soft).detach()                # STE
         return mask, soft
 
 
@@ -244,11 +242,11 @@ class SRPhase1(nn.Module):
                 → 256 patch tokens + cls.
         num_patches: candidate token count (256 for 224²/patch14)
         dim: DINO hidden size (768 for base, 1536 for giant)
-        tau: gumbel temperature
+        T: gate temperature (annealed in stage 2)
         lambda_rate: budget penalty weight (annealed in stage 2)
-        lambda_consist: consistency between soft budget and hard mask usage
         lambda_ent: entropy penalty on the averaged selection (anti-collapse)
-        fixed_k: stage-1 mode — if not None, k is pinned to this fraction
+        fixed_tau: stage-1 mode — if not None, τ pinned to this value
+                   (e.g. -8 ⇒ all tokens kept)
     """
 
     def __init__(
@@ -256,11 +254,10 @@ class SRPhase1(nn.Module):
         dinov2: nn.Module,
         num_patches: int = 256,
         dim: int = 768,
-        tau: float = 1.0,
+        T: float = 1.0,
         lambda_rate: float = 0.1,
-        lambda_consist: float = 1.0,
         lambda_ent: float = 0.01,
-        fixed_k: Optional[float] = None,
+        fixed_tau: Optional[float] = None,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -270,22 +267,22 @@ class SRPhase1(nn.Module):
 
         self.num_patches = num_patches
         self.dim = dim
-        self.tau = tau
+        self.T = T
         self.lambda_rate = lambda_rate
-        self.lambda_consist = lambda_consist
         self.lambda_ent = lambda_ent
-        self.fixed_k = fixed_k
+        self.fixed_tau = fixed_tau
 
         self.rate_head = RateHead(in_dim=dim)
         self.score_head = ScoreHead(in_dim=dim)
-        self.topk = GumbelTopK(tau=tau)
+        self.gate = ThresholdGate(T=T)
         self.re_encoder = ReEncoder(dim=dim)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches)
 
     # ── two-stage control ──
     def set_stage(self, stage: int):
-        """stage=1: fix k=1.0, no rate penalty.  stage=2: learn budget."""
-        self.fixed_k = 1.0 if stage == 1 else None
+        """stage=1: fix τ (all tokens kept), no rate penalty.
+        stage=2: learn τ (content-adaptive budget)."""
+        self.fixed_tau = -8.0 if stage == 1 else None
 
     def set_lambda_rate(self, value: float):
         self.lambda_rate = value
@@ -295,7 +292,7 @@ class SRPhase1(nn.Module):
         """
         Args:
             x: (B,3,224,224) normalized images
-            hard_mode: inference — physically prune to top-k tokens
+            hard_mode: inference — physically prune to selected tokens
         Returns dict with loss components + stats.
         """
         B = x.shape[0]
@@ -307,18 +304,15 @@ class SRPhase1(nn.Module):
         cls = feats[:, 0]                      # (B, D)
         patch = feats[:, 1:]                   # (B, 256, D)
 
-        # ── budget ──
-        if self.fixed_k is not None:
-            k_soft = torch.full((B, 1), self.fixed_k, device=x.device)
-        else:
-            k_soft = self.rate_head(cls)       # (B,1) in (0,1)
-
         # ── per-token importance ──
         logits = self.score_head(patch)        # (B,256)
 
-        # ── differentiable top-k ──
-        k_tokens = (k_soft * self.num_patches).squeeze(1)   # (B,) in (0,N)
-        mask, soft = self.topk(logits, k_tokens)            # (B,256) each
+        # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──
+        if self.fixed_tau is not None:
+            tau = torch.full((B, 1), self.fixed_tau, device=x.device)
+        else:
+            tau = self.rate_head(cls)          # (B,1) unbounded
+        mask, soft = self.gate(logits, tau)    # (B,256) each
 
         # ── gate features (train: soft; eval: hard) ──
         if hard_mode:
@@ -338,23 +332,22 @@ class SRPhase1(nn.Module):
         # ── losses ──
         recon = F.l1_loss(F_hat, patch, reduction="mean")
 
-        usage = mask.mean(dim=1, keepdim=True)              # (B,1) actual fraction
-        rate = k_soft.mean()                                 # soft budget
-        consist = F.mse_loss(usage, k_soft)                  # hard↔soft agreement
+        # rate penalty = expected token fraction (differentiable via soft mask)
+        rate = soft.mean()
         # entropy anti-collapse: averaged selection should not degenerate
-        avg_sel = mask.mean(dim=0)                           # (256,)
+        avg_sel = soft.mean(dim=0)             # (256,)
         ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
                 (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()
 
-        loss = recon + self.lambda_rate * rate \
-             + self.lambda_consist * consist + self.lambda_ent * ent
+        loss = recon + self.lambda_rate * rate + self.lambda_ent * ent
 
         with torch.no_grad():
-            k_used = mask.sum(dim=1)                         # (B,)
+            k_used = (mask > 0.5).sum(dim=1)   # (B,) hard token count
             stats = {
                 "recon_l1": recon.item(),
-                "rate_soft": rate.item(),
-                "usage": usage.mean().item(),
+                "tau_mean": tau.mean().item(),
+                "rate": rate.item(),
+                "usage": (mask > 0.5).float().mean().item(),
                 "k_used_mean": k_used.float().mean().item(),
                 "k_used_min": k_used.float().min().item(),
                 "k_used_max": k_used.float().max().item(),
@@ -362,4 +355,4 @@ class SRPhase1(nn.Module):
             }
 
         return {"loss": loss, "F_hat": F_hat, "mask": mask,
-                "k_soft": k_soft, "stats": stats}
+                "tau": tau, "stats": stats}
