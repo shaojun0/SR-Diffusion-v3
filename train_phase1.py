@@ -157,6 +157,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--init_reencoder", type=int, default=1,
                     help="warm-start ReEncoder from DINO encoder layers")
+    ap.add_argument("--resume_from", default=None,
+                    help="dir with model.safetensors/pytorch_model.bin to load "
+                         "weights from before training (e.g. a collapsed ckpt)")
 
     # stage schedule
     ap.add_argument("--stage1_steps", type=int, default=800)
@@ -230,6 +233,21 @@ def main():
     model.set_stage(1)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable params: {n_params/1e6:.2f}M")
+
+    # ── optional: load weights from an existing checkpoint (recovery / fine-tune) ──
+    if args.resume_from:
+        import os as _os
+        p_bin = _os.path.join(args.resume_from, "pytorch_model.bin")
+        if _os.path.exists(p_bin):
+            sd = torch.load(p_bin, map_location=device)
+        else:
+            from safetensors.torch import load_file
+            sd = load_file(_os.path.join(args.resume_from, "model.safetensors"))
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"[resume] loaded {args.resume_from}: "
+              f"missing={len(missing)} unexpected={len(unexpected)}")
+        if len(missing):
+            print(f"  missing keys (sample): {missing[:5]}")
 
     # ── dataset + collator (Trainer-managed) ──
     dataset = ImageDirDataset(args.data_dir, limit=args.limit)
