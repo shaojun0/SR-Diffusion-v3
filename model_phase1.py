@@ -6,27 +6,36 @@ Core idea (visual BPE): learn the data distribution to decide HOW MANY tokens
 each image needs.  A blank image should compress to ~1 token; a dense image
 keeps many.  No fixed-dimension bottleneck, no per-pixel reconstruction.
 
-Architecture (two-pass):
+Architecture (two-pass, v2 — special-token selection):
 
     x (B,3,224,224)
       │  pass 1: frozen DINOv2
       ▼
     F_patch (B,256,768) + cls (B,768)
       │
-      ├─ RateHead(cls) ──────────────► k_soft (B,1) ∈ [0,1]   ← learned budget
-      ├─ ScoreHead(F_patch) ─────────► logits (B,256)          ← per-token importance
+      ├─ RateHead(cls) ──────────────────► τ (B,1)          ← learned budget
+      ├─ SpecialTokenBank ───────────────► specials (B,256,768)
+      │     输入完全相同（共享向量），仅位置编码不同
+      │
+      ▼  [cls; specials; patches] 组合 → pass 2: ReEncoder（全量自注意力）
+    z (B,513,768)                         [cls + N specials + N patches]
+      │
+      ├─ z_s = z[:, 1:257]                ← 特殊 token 的输出（top-k 唯一候选）
+      ├─ ScoreHead(z_s) ─────────────────► logits (B,256)
       │
       ▼  differentiable top-k (Gumbel-Sigmoid + STE)
-    mask (B,256)  ≈ one-hot over the 256 candidate tokens
+    mask (B,256)
       │
-      ▼  pass 2: re-encoder consumes gated semantic tokens
-    z (B,257,D)  [cls + k selected semantic tokens]
-      │
-      ▼  feature-space decoder (cross-attention over 256 positions)
+      ▼  decoder 输入 = [cls; 选中的 z_s]（训练 soft 门控 / 推理硬剪枝）
     F_hat (B,256,768)
       │
       ▼
     L = L1(F_hat, F_patch) + λ_rate·k_soft + λ_consist·consistency + λ_ent·H
+
+选择只在编码器输出的"特殊 token 表示"里进行；图像的原始 patch 编码只作为
+编码器输入参与信息聚合，永远不进入 top-k 候选、也不进入 decoder（避免与
+图像 patch 编码混在一起）。代价：编码器始终全量计算 2N+1 token，自适应预算
+的算力收益只体现在 decoder 的 cross-attention（k vs N memory）。
 
 Training is two-stage:
   Stage 1: fix k=1.0 (all tokens), λ_rate=0  → teach re-encoder + decoder to
@@ -125,25 +134,54 @@ class ThresholdGate(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Re-Encoder — pass 2, consumes only the selected semantic tokens
+# SpecialTokenBank — 特殊 token 池（输入相同，仅位置编码不同）
+# ═══════════════════════════════════════════════════════════════
+
+class SpecialTokenBank(nn.Module):
+    """每个 patch 位置一个特殊 token：共享可学习向量 + 逐位置可学习位置编码。
+
+    token (1,1,D) 对所有位置/所有图像完全相同；pos (1,N,D) 提供位置区分。
+    它们与 patch 组合后输入 ReEncoder，编码器输出中特殊 token 的表示 z_s
+    是 top-k 的唯一候选（见 SRPhase1.forward）——图像的原始 patch 编码
+    不参与选择、也不进入 decoder。
+    """
+
+    def __init__(self, num_patches: int, dim: int):
+        super().__init__()
+        self.num_patches = num_patches
+        self.token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)          # 共享向量
+        self.pos = nn.Parameter(torch.randn(1, num_patches, dim) * 0.02)  # 位置编码
+
+    def forward(self, B: int, device: torch.device) -> Tensor:
+        return self.token.expand(B, self.num_patches, -1) + self.pos      # (B,N,D)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Re-Encoder — pass 2, 组合编码器 [cls; specials; patches]
 # ═══════════════════════════════════════════════════════════════
 
 class ReEncoder(nn.Module):
     """
-    Lightweight transformer that re-encodes the gated tokens.
+    对 [cls; 特殊 token; patch] 组合序列做全量自注意力（特殊 token 与 patch
+    在此"组合"：每个位置的输出既带位置身份又聚合图像内容）。
 
-    During training: all N tokens enter (gated by mask), stable gradients.
-    During inference: only the top-k tokens enter (hard pruning), O(k²) cost.
+    输出中特殊 token 位置的表示 z_s 是 top-k 的唯一候选；patch 位置的输出
+    直接丢弃。因此图像 patch 编码只作为编码器输入参与聚合，永不进入 decoder。
 
-    Input:  gated tokens (B, N, D) + cls prepended → (B, N+1, D)
-    Output: z (B, N+1, D)
+    与旧版（门控 N token、推理硬剪枝 O(k²)）不同：输入是完整的 2N+1 序列，
+    编码器在训练/推理都全量计算（O((2N)²)）——自适应预算的算力收益只体现
+    在 decoder 的 cross-attention（k vs N memory）。剪枝移到 decoder 输入侧。
+
+    Input:  x (B, 2N+1, D) = [cls; special_1..N; patch_1..N]
+    Output: z (B, 2N+1, D)
     """
 
-    def __init__(self, dim: int = 768, depth: int = 4, heads: int = 8,
-                 mlp_ratio: float = 4.0):
+    def __init__(self, dim: int = 768, num_patches: int = 256, depth: int = 4,
+                 heads: int = 8, mlp_ratio: float = 4.0):
         super().__init__()
-        self.pos_embed = nn.Parameter(torch.randn(1, 1025, dim) * 0.02)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.num_patches = num_patches
+        L = 2 * num_patches + 1              # cls + N specials + N patches
+        self.pos_embed = nn.Parameter(torch.randn(1, L, dim) * 0.02)
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=dim, nhead=heads, dim_feedforward=int(dim * mlp_ratio),
@@ -152,52 +190,10 @@ class ReEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, gated_tokens: Tensor, hard_mode: bool = False,
-                hard_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        Args:
-            gated_tokens: (B,N,D) already masked (selected→value, others→~0)
-            hard_mode: if True, physically prune to top-k tokens (inference)
-            hard_mask: (B,N) 0/1 hard selection used in hard_mode
-        Returns:
-            z: (B, N+1, D)  (or (B, max_k+1, D) in hard_mode)
-        """
-        B, N, D = gated_tokens.shape
-        pad_mask = None
-        if hard_mode and hard_mask is not None:
-            lengths = hard_mask.sum(1).long()                    # (B,) per-image k
-            max_k = int(lengths.max().item())
-            # Select in ORIGINAL (spatial) order, NOT topk order.  topk on a 0/1
-            # mask breaks ties arbitrarily → would shuffle the selected tokens.
-            # Training keeps tokens in original order with original positions,
-            # so hard mode must too, or the decoder sees position semantics at
-            # inference that never existed in training (train/infer mismatch).
-            idx = torch.argsort(hard_mask, dim=1, descending=True,
-                                stable=True)[:, :max_k]          # (B,max_k)
-            gated_tokens = gated_tokens.gather(
-                1, idx.unsqueeze(-1).expand(-1, -1, D))          # (B,max_k,D)
-            N = max_k
-            # True where padded (beyond this image's k)
-            pad_mask = (torch.arange(max_k, device=hard_mask.device)
-                        .unsqueeze(0) >= lengths.unsqueeze(1))   # (B,max_k)
-            pad_mask = torch.cat([torch.zeros(B, 1, dtype=torch.bool,
-                                              device=hard_mask.device),
-                                  pad_mask], dim=1)              # (B,max_k+1) cls never pad
-            # position embeddings at ORIGINAL grid positions (cls=0, patch i→i+1),
-            # identical to the training-mode layout — NOT compact ids 0..k.
-            pos_idx = torch.cat([
-                torch.zeros(B, 1, dtype=torch.long,
-                            device=hard_mask.device),
-                idx + 1], dim=1)                                 # (B,max_k+1)
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, gated_tokens], dim=1)                # (B, N+1, D)
-        if hard_mode and hard_mask is not None:
-            x = x + self.pos_embed.expand(B, -1, -1).gather(
-                1, pos_idx.unsqueeze(-1).expand(-1, -1, D))
-        else:
-            x = x + self.pos_embed[:, :N + 1, :]
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.pos_embed[:, :x.shape[1], :]
         for layer in self.layers:
-            x = layer(x, src_key_padding_mask=pad_mask)
+            x = layer(x)
         return self.norm(x)
 
 
@@ -253,6 +249,11 @@ class SRPhase1(nn.Module):
     """
     Adaptive-budget visual tokenizer with feature-space reconstruction.
 
+    v2 (special-token selection): 新增 SpecialTokenBank —— N 个特殊 token
+    （输入相同、仅位置编码不同）与 DINO patch 组合后一起输入 ReEncoder；
+    top-k 只从编码器输出的特殊 token 表示 z_s 中选，图像的原始 patch 编码
+    不参与选择、也不进入 decoder（避免与图像 patch 编码混在一起）。
+
     Args:
         dinov2: frozen Dinov2Model (transformers).  Input 224×224, patch 14
                 → 256 patch tokens + cls.
@@ -293,7 +294,8 @@ class SRPhase1(nn.Module):
         self.rate_head = RateHead(in_dim=dim)
         self.score_head = ScoreHead(in_dim=dim)
         self.gate = ThresholdGate(T=T)
-        self.re_encoder = ReEncoder(dim=dim)
+        self.special_bank = SpecialTokenBank(num_patches=num_patches, dim=dim)
+        self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches)
 
         # zero-init the RateHead output so stage-2 starts at τ≈0 (soft≈0.5):
@@ -306,7 +308,7 @@ class SRPhase1(nn.Module):
         self.rate_head_target = None   # EMA reference policy, built on demand
         self.trust_region = None       # BudgetTrustRegion instance
         # train/inference alignment: prob (stage-2 training only) of feeding the
-        # re-encoder the hard-pruned sequence instead of zero-padded full length.
+        # DECODER the hard-pruned selected z_s instead of zero-padded full length.
         # 0.0 = off (training always sees zero-slots); >0 mixes in pruned inputs.
         self.hard_input_prob = 0.0
 
@@ -383,21 +385,32 @@ class SRPhase1(nn.Module):
         """
         Args:
             pixel_values: (B,3,224,224) normalized images
-            hard_mode: inference — physically prune to selected tokens
+            hard_mode: inference — physically prune selected z_s for the decoder
         Returns dict with loss components + stats.
         """
         x = pixel_values
         B = x.shape[0]
+        N = self.num_patches
 
         # ── pass 1: frozen DINOv2 ──
         with torch.no_grad():
             out = self.dinov2(x)
             feats = out.last_hidden_state      # (B, 257, D)
         cls = feats[:, 0]                      # (B, D)
-        patch = feats[:, 1:]                   # (B, 256, D)
+        patch = feats[:, 1:]                   # (B, N, D)
 
-        # ── per-token importance (relative ranking only) ──
-        logits = self.score_head(patch)        # (B,256) raw scores
+        # ── 特殊 token：输入相同（共享向量），仅位置编码不同 ──
+        specials = self.special_bank(B, x.device)          # (B, N, D)
+
+        # ── pass 2: [cls; specials; patches] 组合进编码器（全量自注意力）──
+        enc_in = torch.cat([cls.unsqueeze(1), specials, patch], dim=1)  # (B,2N+1,D)
+        z = self.re_encoder(enc_in)                        # (B,2N+1,D)
+        z_cls = z[:, 0:1]                                  # (B,1,D) cls 输出
+        z_s = z[:, 1:1 + N]                                # (B,N,D) 特殊 token 输出 ← top-k 唯一候选
+        # z[:, 1+N:] 是 patch 位置的输出，直接丢弃——原始 patch 编码不进 decoder
+
+        # ── per-token importance（排序只依赖编码器输出的特殊 token 表示）──
+        logits = self.score_head(z_s)        # (B,N) raw scores
         # per-sample normalize: ScoreHead learns WHICH tokens matter (ranking),
         # RateHead learns HOW MANY (absolute τ).  This prevents an arms race
         # where ScoreHead inflates all logits past a bounded τ → gate always on.
@@ -438,36 +451,33 @@ class SRPhase1(nn.Module):
             ent_loss = torch.zeros((), device=x.device)
             tr_extras = {}
 
-        # ── gate features (train: soft; eval: hard) ──
+        # ── gate decoder input (train: soft; eval: hard) ──
+        # 门控位置从"编码器输入"移到"编码器输出的特殊 token 表示"：
+        # 选中的 z_s（携带内容）进入 decoder，原始 patch 编码从不进入 decoder。
         hard_mask = (mask > 0.5).float()
         if hard_mode:
-            gated = patch * hard_mask.unsqueeze(-1)
-            hard_input = True
+            sel, _ = self._gather_selected(z_s, hard_mask)
+            dec_in = torch.cat([z_cls, sel], dim=1)          # (B, k+1, D)
         elif (self.training and self.fixed_tau is None
                 and self.hard_input_prob > 0.0
                 and torch.rand(1, device=x.device).item() < self.hard_input_prob):
             # Optional train/inference alignment (default OFF — see
-            # --hard_mix_prob): occasionally feed the re-encoder the hard-pruned
-            # sequence.  In training the decoder otherwise only ever sees N slots
-            # with zeros where tokens were dropped; at inference those slots are
-            # physically gone → the "zero-slot" signal disappears → decoder
-            # memory distribution shift.  Mixing hard inputs removes it.
-            # Budget/τ gradients still flow through `soft`; recon just trains the
-            # re-encoder+decoder on pruned memory.  Stage-1 (k≈256, no pruning)
-            # is skipped via the fixed_tau check.
-            gated = patch * hard_mask.unsqueeze(-1)
-            hard_input = True
+            # --hard_mix_prob): occasionally feed the decoder the hard-pruned
+            # selected z_s.  In training the decoder otherwise only ever sees N
+            # slots with zeros where tokens were dropped; at inference those
+            # slots are physically gone → the "zero-slot" signal disappears →
+            # decoder memory distribution shift.  Mixing hard inputs removes it.
+            # Budget/τ gradients still flow through `soft`; recon just trains
+            # on pruned memory.  Stage-1 (k≈256, no pruning) is skipped via the
+            # fixed_tau check.
+            sel, _ = self._gather_selected(z_s, hard_mask)
+            dec_in = torch.cat([z_cls, sel], dim=1)          # (B, k+1, D)
         else:
-            gated = patch * mask.unsqueeze(-1)  # gradients flow via STE mask
-            hard_input = False
-
-        # ── pass 2: re-encode selected semantic tokens ──
-        z = self.re_encoder(gated, hard_mode=hard_input,
-                            hard_mask=hard_mask if hard_input else None)
-        # (B, N+1, D) or (B, k+1, D)
+            dec_in = torch.cat([z_cls, z_s * mask.unsqueeze(-1)], dim=1)
+            # (B, N+1, D) 梯度经 STE mask 流动
 
         # ── feature-space reconstruction ──
-        F_hat = self.decoder(z)                # (B, 256, D)
+        F_hat = self.decoder(dec_in)           # (B, 256, D)
 
         # ── losses ──
         recon = F.l1_loss(F_hat, patch, reduction="mean")
@@ -526,6 +536,17 @@ class SRPhase1(nn.Module):
 
         return {"loss": loss, "F_hat": F_hat, "mask": mask,
                 "tau": tau, "stats": stats}
+
+    @staticmethod
+    def _gather_selected(tokens: Tensor, hard_mask: Tensor) -> Tuple[Tensor, Tensor]:
+        """按原始空间顺序物理剪枝选中的 token（decoder memory 无位置 PE，
+        顺序无关紧要，但保持原始顺序与训练布局一致）。返回 (selected, lengths)。"""
+        lengths = hard_mask.sum(1).long()                    # (B,) per-image k
+        max_k = int(lengths.max().item())
+        idx = torch.argsort(hard_mask, dim=1, descending=True,
+                            stable=True)[:, :max_k]          # (B,max_k)
+        sel = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+        return sel, lengths
 
 
 # ═══════════════════════════════════════════════════════════════
