@@ -392,7 +392,6 @@ class SRPhase1(nn.Module):
         B = x.shape[0]
         N = self.num_patches
 
-        # ── pass 1: frozen DINOv2 ──
         out = self.dinov2(x)
         feats = out.last_hidden_state      # (B, 257, D)
         cls = feats[:, 0]                      # (B, D)
