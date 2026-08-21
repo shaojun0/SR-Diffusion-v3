@@ -393,9 +393,8 @@ class SRPhase1(nn.Module):
         N = self.num_patches
 
         # ── pass 1: frozen DINOv2 ──
-        with torch.no_grad():
-            out = self.dinov2(x)
-            feats = out.last_hidden_state      # (B, 257, D)
+        out = self.dinov2(x)
+        feats = out.last_hidden_state      # (B, 257, D)
         cls = feats[:, 0]                      # (B, D)
         patch = feats[:, 1:]                   # (B, N, D)
 
