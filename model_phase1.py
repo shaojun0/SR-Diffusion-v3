@@ -167,7 +167,13 @@ class ReEncoder(nn.Module):
         if hard_mode and hard_mask is not None:
             lengths = hard_mask.sum(1).long()                    # (B,) per-image k
             max_k = int(lengths.max().item())
-            idx = hard_mask.topk(max_k, dim=1).indices           # (B,max_k)
+            # Select in ORIGINAL (spatial) order, NOT topk order.  topk on a 0/1
+            # mask breaks ties arbitrarily → would shuffle the selected tokens.
+            # Training keeps tokens in original order with original positions,
+            # so hard mode must too, or the decoder sees position semantics at
+            # inference that never existed in training (train/infer mismatch).
+            idx = torch.argsort(hard_mask, dim=1, descending=True,
+                                stable=True)[:, :max_k]          # (B,max_k)
             gated_tokens = gated_tokens.gather(
                 1, idx.unsqueeze(-1).expand(-1, -1, D))          # (B,max_k,D)
             N = max_k
@@ -177,9 +183,19 @@ class ReEncoder(nn.Module):
             pad_mask = torch.cat([torch.zeros(B, 1, dtype=torch.bool,
                                               device=hard_mask.device),
                                   pad_mask], dim=1)              # (B,max_k+1) cls never pad
+            # position embeddings at ORIGINAL grid positions (cls=0, patch i→i+1),
+            # identical to the training-mode layout — NOT compact ids 0..k.
+            pos_idx = torch.cat([
+                torch.zeros(B, 1, dtype=torch.long,
+                            device=hard_mask.device),
+                idx + 1], dim=1)                                 # (B,max_k+1)
         cls = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls, gated_tokens], dim=1)                # (B, N+1, D)
-        x = x + self.pos_embed[:, :N + 1, :]
+        if hard_mode and hard_mask is not None:
+            x = x + self.pos_embed.expand(B, -1, -1).gather(
+                1, pos_idx.unsqueeze(-1).expand(-1, -1, D))
+        else:
+            x = x + self.pos_embed[:, :N + 1, :]
         for layer in self.layers:
             x = layer(x, src_key_padding_mask=pad_mask)
         return self.norm(x)
@@ -245,8 +261,10 @@ class SRPhase1(nn.Module):
         T: gate temperature (annealed in stage 2)
         lambda_rate: budget penalty weight (annealed in stage 2)
         lambda_ent: entropy penalty on the averaged selection (anti-collapse)
-        fixed_tau: stage-1 mode — if not None, τ pinned to this value
-                   (e.g. -8 ⇒ all tokens kept)
+        fixed_tau: stage-1 mode — if not None, τ pinned to this value.
+                   logits are per-sample z-scored (~N(0,1)), so -2.0 keeps
+                   ≈97.7% of tokens; use a very negative value (e.g. -8) for
+                   ≈100%.
     """
 
     def __init__(
@@ -287,6 +305,10 @@ class SRPhase1(nn.Module):
         self.use_trust_region = False
         self.rate_head_target = None   # EMA reference policy, built on demand
         self.trust_region = None       # BudgetTrustRegion instance
+        # train/inference alignment: prob (stage-2 training only) of feeding the
+        # re-encoder the hard-pruned sequence instead of zero-padded full length.
+        # 0.0 = off (training always sees zero-slots); >0 mixes in pruned inputs.
+        self.hard_input_prob = 0.0
 
     # ── enable PPO-style trust region for stage-2 budget learning ──
     def enable_trust_region(self, btr: "BudgetTrustRegion"):
@@ -417,15 +439,31 @@ class SRPhase1(nn.Module):
             tr_extras = {}
 
         # ── gate features (train: soft; eval: hard) ──
+        hard_mask = (mask > 0.5).float()
         if hard_mode:
-            hard_mask = (mask > 0.5).float()
             gated = patch * hard_mask.unsqueeze(-1)
+            hard_input = True
+        elif (self.training and self.fixed_tau is None
+                and self.hard_input_prob > 0.0
+                and torch.rand(1, device=x.device).item() < self.hard_input_prob):
+            # Optional train/inference alignment (default OFF — see
+            # --hard_mix_prob): occasionally feed the re-encoder the hard-pruned
+            # sequence.  In training the decoder otherwise only ever sees N slots
+            # with zeros where tokens were dropped; at inference those slots are
+            # physically gone → the "zero-slot" signal disappears → decoder
+            # memory distribution shift.  Mixing hard inputs removes it.
+            # Budget/τ gradients still flow through `soft`; recon just trains the
+            # re-encoder+decoder on pruned memory.  Stage-1 (k≈256, no pruning)
+            # is skipped via the fixed_tau check.
+            gated = patch * hard_mask.unsqueeze(-1)
+            hard_input = True
         else:
             gated = patch * mask.unsqueeze(-1)  # gradients flow via STE mask
+            hard_input = False
 
         # ── pass 2: re-encode selected semantic tokens ──
-        z = self.re_encoder(gated, hard_mode=hard_mode,
-                            hard_mask=(mask > 0.5).float() if hard_mode else None)
+        z = self.re_encoder(gated, hard_mode=hard_input,
+                            hard_mask=hard_mask if hard_input else None)
         # (B, N+1, D) or (B, k+1, D)
 
         # ── feature-space reconstruction ──
@@ -567,7 +605,7 @@ class BudgetTrustRegion:
         self.step = 0
         self.recon_tau_scale = recon_tau_scale
         self.raw_max = raw_max
-        self.raw_soft = math.atanh(min(0.999, tau_soft / 2.0))   # ≈ 1.099 (τ=1.5)
+        self.raw_soft = math.atanh(min(0.999, tau_soft / 2.0))   # ≈ 0.973 (τ=1.5)
         self.lambda_tau = lambda_tau
 
     # ── schedule helpers ──

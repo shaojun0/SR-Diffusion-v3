@@ -157,6 +157,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--init_reencoder", type=int, default=1,
                     help="warm-start ReEncoder from DINO encoder layers")
+    ap.add_argument("--hard_mix_prob", type=float, default=0.0,
+                    help="stage-2 training: prob of feeding the re-encoder the "
+                         "hard-pruned sequence instead of zero-padded full length "
+                         "(aligns train/inference decoder memory; 0.0=off, "
+                         "recommended 0.2-0.3 for runs where eval recon >> train)")
     ap.add_argument("--resume_from", default=None,
                     help="dir with model.safetensors/pytorch_model.bin to load "
                          "weights from before training (e.g. a collapsed ckpt)")
@@ -231,6 +236,7 @@ def main():
         init_reencoder=bool(args.init_reencoder),
     ).to(device)
     model.set_stage(1)
+    model.hard_input_prob = args.hard_mix_prob
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable params: {n_params/1e6:.2f}M")
 
