@@ -137,10 +137,10 @@ class ThresholdGate(nn.Module):
 
     def forward(self, logits: Tensor, tau: Tensor) -> Tuple[Tensor, Tensor]:
         B, N = logits.shape
-        g = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+        g = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)  # (B,N) Gumbel 噪声
         soft = torch.sigmoid((logits + g - tau) / self.T)   # (B,N) in (0,1)
         hard = (logits > tau).float()                       # (B,N) 0/1, detached
-        mask = soft + (hard - soft).detach()                # STE
+        mask = soft + (hard - soft).detach()                # (B,N) STE
         return mask, soft
 
 
@@ -202,7 +202,7 @@ class ReEncoder(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.pos_embed[:, :x.shape[1], :]
+        x = x + self.pos_embed[:, :x.shape[1], :]   # (B, 2N+1, D) + (1, 2N+1, D) → (B, 2N+1, D)
         for layer in self.layers:
             x = layer(x)
         return self.norm(x)
@@ -399,7 +399,7 @@ class SRPhase1(nn.Module):
             hard_mode: inference — physically prune selected z_s for the decoder
         Returns dict with loss components + stats.
         """
-        x = pixel_values
+        x = pixel_values                          # (B,3,224,224)
         B = x.shape[0]
         N = self.num_patches
 
@@ -428,11 +428,11 @@ class SRPhase1(nn.Module):
         # NaN 防御（实测：真实 ImageNet 图 ~970 步 grad_norm=NaN，随机噪声 1000 步稳定；
         # 真实图 logits 长尾在 bf16 下产生梯度尖峰 → 单参数 inf → HF Trainer 的
         # clip_grad_norm_(inf) 做 inf×0 → 全参 NaN）。限幅不改变排序，k 守卫/gate 不受影响。
-        logits = logits.clamp(-8.0, 8.0)
+        logits = logits.clamp(-8.0, 8.0)        # (B,N)
 
         # ── threshold gate (τ inside mask ⇒ gradients reach RateHead) ──
         if self.fixed_tau is not None:
-            tau = torch.full((B, 1), self.fixed_tau, device=x.device)
+            tau = torch.full((B, 1), self.fixed_tau, device=x.device)  # (B,1) 固定阈值
             mask, soft = self.gate(logits, tau)    # (B,256) each
             budget_loss = torch.zeros((), device=x.device)
             kl_loss = torch.zeros((), device=x.device)
@@ -442,7 +442,7 @@ class SRPhase1(nn.Module):
             # PPO-style budget stabilization (stage-2)
             tr = self.trust_region.gate_forward(self, logits, cls)
             mask, soft = tr["mask"], tr["soft"]
-            tau = tr["tau"]                       # 真实 τ（供 recon 力放大）
+            tau = tr["tau"]                       # (B,1) 真实 τ（供 recon 力放大）
             budget_loss, kl_loss, ent_loss = (tr["budget_loss"], tr["kl_loss"],
                                               tr["ent_loss"])
             tau_reg = tr["tau_reg"]
@@ -452,8 +452,8 @@ class SRPhase1(nn.Module):
         else:
             # bounded threshold: 与 trust-region 路径相同的两行数学（见模块头
             # RAW_MAX）。raw 先 clamp 防 tanh 饱和死锁，dτ/draw ≥ 0.38 永不消失。
-            raw = torch.clamp(self.rate_head(cls), -RAW_MAX, RAW_MAX)   # insurance
-            tau = 2.0 * torch.tanh(raw)                                 # ∈ [-1.8, 1.8]
+            raw = torch.clamp(self.rate_head(cls), -RAW_MAX, RAW_MAX)   # (B,1) insurance
+            tau = 2.0 * torch.tanh(raw)                                 # (B,1) ∈ [-1.8, 1.8]
             mask, soft = self.gate(logits, tau)    # (B,256) each
             budget_loss = torch.zeros((), device=x.device)
             kl_loss = torch.zeros((), device=x.device)
@@ -463,7 +463,7 @@ class SRPhase1(nn.Module):
         # ── gate decoder input (train: soft; eval: hard) ──
         # 门控位置从"编码器输入"移到"编码器输出的特殊 token 表示"：
         # 选中的 z_s（携带内容）进入 decoder，原始 patch 编码从不进入 decoder。
-        hard_mask = (mask > 0.5).float()
+        hard_mask = (mask > 0.5).float()           # (B,N) 0/1
         if hard_mode:
             sel, _ = self._gather_selected(z_s, hard_mask)
             dec_in = torch.cat([z_cls, sel], dim=1)          # (B, k+1, D)
@@ -489,7 +489,7 @@ class SRPhase1(nn.Module):
         F_hat = self.decoder(dec_in)           # (B, 256, D)
 
         # ── losses ──
-        recon = F.l1_loss(F_hat, patch, reduction="mean")
+        recon = F.l1_loss(F_hat, patch, reduction="mean")    # scalar
 
         if (self.use_trust_region and self.trust_region is not None
                 and self.fixed_tau is None):
@@ -503,7 +503,7 @@ class SRPhase1(nn.Module):
             #    的梯度不变（实测 recon 力仅 ~0.001-0.003，不放大则 τ 动力学冻结）。
             if tau.requires_grad and recon.requires_grad:
                 g_tau = torch.autograd.grad(recon, tau, retain_graph=True,
-                                            allow_unused=True)[0]
+                                            allow_unused=True)[0]  # (B,1) ∂recon/∂τ
                 if g_tau is None:
                     g_tau = torch.zeros_like(tau)
                 g_tau = torch.nan_to_num(g_tau, nan=0.0, posinf=0.0, neginf=0.0)
@@ -554,7 +554,7 @@ class SRPhase1(nn.Module):
         max_k = int(lengths.max().item())
         idx = torch.argsort(hard_mask, dim=1, descending=True,
                             stable=True)[:, :max_k]          # (B,max_k)
-        sel = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))
+        sel = tokens.gather(1, idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))  # (B, max_k, D)
         return sel, lengths
 
 
@@ -685,17 +685,17 @@ class BudgetTrustRegion:
         """
         # ① 结构界（网络 + target 都要 clamp：target 共享同一条代码路径；
         #    梯度经 clamp 在界内为恒等，模块本身保持纯函数）
-        raw = torch.clamp(model.rate_head(cls), -self.raw_max, self.raw_max)
-        tau_net = 2.0 * torch.tanh(raw)                              # ∈ [-1.8, 1.8]
+        raw = torch.clamp(model.rate_head(cls), -self.raw_max, self.raw_max)   # (B,1)
+        tau_net = 2.0 * torch.tanh(raw)                              # (B,1) ∈ [-1.8, 1.8]
         with torch.no_grad():
             raw_ref = torch.clamp(model.rate_head_target(cls),
-                                  -self.raw_max, self.raw_max)
-            tau_ref = 2.0 * torch.tanh(raw_ref)
+                                  -self.raw_max, self.raw_max)       # (B,1)
+            tau_ref = 2.0 * torch.tanh(raw_ref)                      # (B,1)
         # ② 信任域
         tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
                           tau_ref + self.delta_tau)
         # ③ k 守卫
-        top_vals, _ = torch.topk(logits, self.k_max + 1, dim=1)     # descending
+        top_vals, _ = torch.topk(logits, self.k_max + 1, dim=1)     # (B, k_max+1) descending
         tau = torch.clamp(tau,
                           top_vals[:, self.k_max].detach().unsqueeze(1),
                           top_vals[:, self.k_min - 1].detach().unsqueeze(1))
@@ -723,31 +723,31 @@ class BudgetTrustRegion:
         # ④ gate
         T = self.anneal()
         g = self.gumbel_coef()
-        noise = g * (-torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8))
-        soft_noisy = torch.sigmoid((logits + noise - tau) / T)      # exploration (mask path)
-        hard = (logits > tau).float()
+        noise = g * (-torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8))  # (B,N) Gumbel 噪声
+        soft_noisy = torch.sigmoid((logits + noise - tau) / T)      # (B,N) exploration (mask path)
+        hard = (logits > tau).float()                               # (B,N)
         # STE: forward=hard，梯度走 soft_noisy。
         # ⚠ 必须 soft 在前：写成 hard + (soft-hard).detach() 时，hard 是比较运算
         #   输出（无 grad_fn），加一个 detach 项后整张 mask requires_grad=False，
         #   recon 梯度到不了 τ 和 ScoreHead —— 路径静默死掉（smoke test 实测确认）。
-        mask = soft_noisy + (hard - soft_noisy).detach()
+        mask = soft_noisy + (hard - soft_noisy).detach()            # (B,N) STE 直通
 
         # ⑤ clean soft: logits detached → budget terms only push τ
-        soft = torch.sigmoid((logits.detach() - tau) / T)
+        soft = torch.sigmoid((logits.detach() - tau) / T)           # (B,N) clean, τ-grad only
         with torch.no_grad():
-            soft_ref = torch.sigmoid((logits - tau_ref) / T)
+            soft_ref = torch.sigmoid((logits - tau_ref) / T)        # (B,N) 参考策略 (no_grad)
 
         # ⑥ trust region: KL(Bern(p_ref) ‖ Bern(p))
         #    fp32 computation: under bf16 autocast, clamp(1e-5) can't be
         #    represented (bf16 precision ~1e-3) → pc.log() → -inf → NaN
         #    (observed at step ~980 under bf16; NaN only in rate_head).
         eps = 1e-3   # safe lower bound even in bf16
-        pr = soft_ref.float().clamp(eps, 1 - eps)
-        pc = soft.float().clamp(eps, 1 - eps)
+        pr = soft_ref.float().clamp(eps, 1 - eps)                  # (B,N) fp32
+        pc = soft.float().clamp(eps, 1 - eps)                      # (B,N) fp32
         kl = (pr * (pr.log() - pc.log()) +
-              (1 - pr) * ((1 - pr).log() - (1 - pc).log())).mean()
+              (1 - pr) * ((1 - pr).log() - (1 - pc).log())).mean()   # scalar KL
         # entropy (on clean soft)
-        ent = -(pc * pc.log() + (1 - pc) * (1 - pc).log()).mean()
+        ent = -(pc * pc.log() + (1 - pc) * (1 - pc).log()).mean()    # scalar 熵
 
         # ⑦ dead-zone hinge（per-sample、瞬时值、平方）—— 死区内预算力≡0，
         #    消除实测 30× 力失衡；梯度 ≈ 2·λh·err·φ。
@@ -757,11 +757,11 @@ class BudgetTrustRegion:
         #    vs 上一个临时版本（rate.detach() + 线性直通）:
         #      ① 它只有"上方"正确，rate < r_min 时线性直通方向错误（把 rate 继续往下推），
         #         塌缩恢复（k=4 → r_min）会失效；② float(...cpu()) 每步 GPU→CPU 同步。
-        rate = soft.mean()
+        rate = soft.mean()                                          # scalar 平均用量
         rate_j = soft.mean(dim=1)                        # (B,) per-sample usage
-        err = (F.relu(rate_j - rate_max)                 # 用退火后的 rate_max
+        err = (F.relu(rate_j - rate_max)                 # (B,) 用退火后的 rate_max
                + F.relu(self.rate_min - rate_j))         # 死区 [r_min, r_max] 内力=0
-        budget = self.lambda_rate * err.square().mean()
+        budget = self.lambda_rate * err.square().mean()             # scalar 死区 hinge
         # rate_ema 仅作日志统计（不再进入 loss）
         if self.rate_ema is None:
             self.rate_ema = torch.ones_like(rate)
@@ -771,7 +771,7 @@ class BudgetTrustRegion:
         # ⑧ raw 空间排斥正则：饱和区唯一存活的梯度信号（clamp 防复发、排斥管恢复）
         #    L_tau_reg = λ_tau · mean_j(ReLU(|raw_j| - raw_soft)²)
         #    ∂L/∂raw_j = 2·λ_tau·ReLU(|raw_j|-raw_soft)·sign(raw_j) —— 无 sigmoid/tanh 衰减
-        tau_reg = F.relu(raw.abs() - self.raw_soft).square().mean()
+        tau_reg = F.relu(raw.abs() - self.raw_soft).square().mean()  # scalar 排斥正则
 
         extras = {
             "tau_mean": tau.mean().item(),
