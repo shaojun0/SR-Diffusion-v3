@@ -56,32 +56,14 @@ from typing import Tuple, Optional
 
 
 # ═══════════════════════════════════════════════════════════════
-# 预算阈值 τ 的共享原语（trust-region 与非 trust-region 路径共用）
+# 预算阈值 τ 的唯一魔法数字来源
 # ═══════════════════════════════════════════════════════════════
-# τ = 2·tanh(raw)：tanh 提供有界性；bounded_raw 把 |raw| 限在 ±RAW_MAX，
-# 保证 dτ/draw = 2(1−tanh²raw) ≥ 0.38 永不消失（tanh 永不饱和）。
-# τ ∈ [-TAU_MAX, TAU_MAX] = [-1.8, 1.8] 覆盖 z-score logits 下 k ∈ [8, 250]
-# 的整个操作区间（与 BudgetTrustRegion 的 k 守卫自洽，见 _solve_tau 的 ①③）。
+# τ = 2·tanh(clamp(raw, ±RAW_MAX))：clamp 防 tanh 饱和（dτ/draw ≥ 0.38 永不
+# 消失），tanh 把 τ 限在 [-1.8, 1.8]——覆盖 z-score logits 下 k ∈ [8, 250] 的
+# 操作区间，与 BudgetTrustRegion 的 k 守卫自洽（见 _solve_tau 的 ①③）。
+# 该两行数学在 _solve_tau（trust-region）与 forward（plain 保险路径）直接内联。
 
-TAU_MAX = 1.8                       # τ 的结构界 ∈ [-1.8, 1.8]
-
-
-def raw_at_tau(tau: float) -> float:
-    """τ = 2·tanh(raw) 的逆：给定 τ，返回 tanh 恰好达到 τ/2 时的 raw 值。"""
-    return math.atanh(min(0.999, tau / 2.0))
-
-
-RAW_MAX = raw_at_tau(TAU_MAX)       # ≈1.4722：tanh 恰好达到 τ_max 时的 raw 值
-
-
-def bounded_raw(raw: Tensor, raw_max: float = RAW_MAX) -> Tensor:
-    """结构界：|raw| ≤ raw_max，防 tanh 饱和（dτ/draw ≥ 0.38 永不消失）。"""
-    return torch.clamp(raw, -raw_max, raw_max)
-
-
-def raw_to_tau(raw: Tensor) -> Tensor:
-    """raw → τ = 2·tanh(raw) ∈ [-1.8, 1.8]（对 bounded_raw 的输出调用）。"""
-    return 2.0 * torch.tanh(raw)
+RAW_MAX = math.atanh(1.8 / 2.0)     # ≈1.4722：tanh 恰好达到 τ=1.8 时的 raw 值
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -468,11 +450,10 @@ class SRPhase1(nn.Module):
             # stash KL for the callback's adaptive-β update
             self.trust_region._last_kl = float(kl_loss.detach().cpu())
         else:
-            # bounded threshold: 与 trust-region 路径共用同一组原语（bounded_raw +
-            # raw_to_tau，见模块头）。raw 先 clamp 防 tanh 饱和死锁，
-            # dτ/draw ≥ 0.38 永不消失；τ ∈ [-1.8, 1.8]。
-            raw = bounded_raw(self.rate_head(cls))                 # insurance
-            tau = raw_to_tau(raw)
+            # bounded threshold: 与 trust-region 路径相同的两行数学（见模块头
+            # RAW_MAX）。raw 先 clamp 防 tanh 饱和死锁，dτ/draw ≥ 0.38 永不消失。
+            raw = torch.clamp(self.rate_head(cls), -RAW_MAX, RAW_MAX)   # insurance
+            tau = 2.0 * torch.tanh(raw)                                 # ∈ [-1.8, 1.8]
             mask, soft = self.gate(logits, tau)    # (B,256) each
             budget_loss = torch.zeros((), device=x.device)
             kl_loss = torch.zeros((), device=x.device)
@@ -654,7 +635,7 @@ class BudgetTrustRegion:
         self.step = 0
         self.recon_tau_scale = recon_tau_scale
         self.raw_max = raw_max
-        self.raw_soft = raw_at_tau(tau_soft)                    # ≈0.973 (τ=1.5)
+        self.raw_soft = math.atanh(min(0.999, tau_soft / 2.0))   # ≈0.973 (τ=1.5)
         self.lambda_tau = lambda_tau
 
     # ── schedule helpers ──
@@ -704,11 +685,12 @@ class BudgetTrustRegion:
         """
         # ① 结构界（网络 + target 都要 clamp：target 共享同一条代码路径；
         #    梯度经 clamp 在界内为恒等，模块本身保持纯函数）
-        raw = bounded_raw(model.rate_head(cls), self.raw_max)
-        tau_net = raw_to_tau(raw)                                   # ∈ [-1.8, 1.8]
+        raw = torch.clamp(model.rate_head(cls), -self.raw_max, self.raw_max)
+        tau_net = 2.0 * torch.tanh(raw)                              # ∈ [-1.8, 1.8]
         with torch.no_grad():
-            raw_ref = bounded_raw(model.rate_head_target(cls), self.raw_max)
-            tau_ref = raw_to_tau(raw_ref)
+            raw_ref = torch.clamp(model.rate_head_target(cls),
+                                  -self.raw_max, self.raw_max)
+            tau_ref = 2.0 * torch.tanh(raw_ref)
         # ② 信任域
         tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
                           tau_ref + self.delta_tau)
