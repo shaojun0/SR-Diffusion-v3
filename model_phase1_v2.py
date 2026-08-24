@@ -230,4 +230,41 @@ class SRPhase1V2(nn.Module):
         z = self.re_encoder(enc_in)                     # (B,2N+1,D)
         z_cls = z[:, 0:1]                               # (B,1,D)
         z_s = z[:, 1:1 + N]                             # (B,N,D) ← 掩码选择对象（top-k 候选）
+        # [TODO] 物理剪枝：当前零填充 N+1 槽位（train/eval 一致），
+        #        "只算 k 个 token"的算力收益待实现（见模块头 TODO）。
+        dec_in = torch.cat([z_cls, z_s * mask.unsqueeze(-1)], dim=1)   # (B,N+1,D)
+        F_hat = self.decoder(dec_in)                    # (B,N,D)
 
+        # ── 步骤 3: 损失（全部按最小化实现）──
+        # L_recon: 最小化特征重建误差（主线；驱动保留概率学会"少留也能重建"）
+        recon = F.l1_loss(F_hat, patch)                 # scalar,0~1
+        # L_rate: 最小化保留 token 比例。sigmoid 下 mask.mean() 有真实梯度
+        #         （∂mean(σ)/∂scores = σ'/N > 0）——softmax 方案下这是
+        #         零梯度恒等式，正是弃用 softmax 的原因（见模块头）。
+
+        rate = mask.mean()                              # scalar 保留比例（前向 = k/N）
+        # L_ent: 反塌缩——最小化负熵；avg_sel 为跨 batch 平均选择，
+        #        退化"所有图选同一批位置"时 H→0，此项惩罚它
+        avg_sel = mask.mean(dim=0)                      # (N,)
+        ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
+                (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()  # scalar
+        loss = recon + self.lambda_rate * rate - self.lambda_ent * ent
+        # [TODO] 其余损失/机制（阈值退火、可学习 τ、z-score 校准、信任域、
+        #        k 守卫、温度退火、硬/软输入混合、recon 力放大）见模块头 TODO。
+
+        with torch.no_grad():
+            hard = (mask > 0.5).float()                 # (B,N) 前向即硬选择
+            k_used = hard.sum(dim=1)                    # (B,)
+            def _t(v):
+                return torch.as_tensor(v, device=x.device)
+            stats = {
+                "recon_l1": _t(recon),
+                "rate": _t(rate),
+                "entropy": _t(ent),
+                "threshold": _t(self.threshold),
+                "k_used_mean": _t(k_used.float().mean()),
+                "k_used_min": _t(k_used.float().min()),
+                "k_used_max": _t(k_used.float().max()),
+            }
+
+        return {"loss": loss, "F_hat": F_hat, "mask": mask, "p": p, "stats": stats}
