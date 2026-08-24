@@ -100,10 +100,7 @@ class BernoulliGate(nn.Module):
     def forward(self, scores: Tensor) -> Tuple[Tensor, Tensor]:
         B, N = scores.shape
         p = torch.sigmoid(scores / self.T)               # (B,N) 保留概率
-        hard = (p > self.threshold).float()              # (B,N) 0/1 阈值二值化
-        peak = p.argmax(dim=1, keepdim=True)             # (B,1) 峰值位置
-        hard = hard.scatter(1, peak, 1.0)                # 峰值恒保留 → k ≥ 1
-        mask = p + (hard - p).detach()                   # (B,N) STE
+        mask = (p > self.threshold).float()              # (B,N) 0/1 阈值二值化
         return mask, p
 
 
