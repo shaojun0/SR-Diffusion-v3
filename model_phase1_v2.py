@@ -11,15 +11,17 @@ SR-Diffusion Phase 1 v2 — 整体重构（按损失函数提取思想）
   保留概率 p = σ(scores) ∈ (0,1)^N（伯努利门控，无归一化耦合）。此时:
     · rate = mask.mean() 有真实梯度（∂mean(σ)/∂scores = σ' > 0）；
     · 阈值 0.5 是 sigmoid 的自然二值化点（"比保留更倾向保留"）；
-    · 峰值（argmax）位置恒保留 → k ≥ 1，与"最重要位置必选"的直觉一致。
+    · k=0 安全: dec_in 恒含 z_cls（保底牌），一个候选都不选 decoder
+      仍能重建 → 无需峰值锚定/k≥1 防御；k=0 可自愈（重建变差 →
+      recon 梯度经 STE 把 p 拉回）。注意: 此简化依赖 STE 保持梯度路径。
   即: 神经网络学习"这张图哪些空间位置值得保留"，budget 由阈值和
   保留概率的形状共同决定（内容自适应），而非固定维度瓶颈。
 
 三步实现:
   1. cls (B,D) --SelectHead--> scores (B,N) --sigmoid--> p (B,N) 保留概率
-  2. BernoulliGate: hard = (p > threshold) 且峰值恒保留（k ≥ 1），
-     STE 可微 0/1 掩码；作用于 z_s = z[:, 1:1+N]（ReEncoder 输出的
-     特殊 token 表示）→ decoder
+  2. BernoulliGate: hard = (p > threshold) 二值化 + STE 可微 0/1 掩码
+     （k=0 允许，cls 是保底牌）；作用于 z_s = z[:, 1:1+N]（ReEncoder
+     输出的特殊 token 表示）→ decoder
   3. 损失（全部按最小化实现，未实现项标注 TODO）:
        L_recon = L1(F_hat, F_patch)       — 最小化特征重建误差（主线：驱动
                                              保留概率学会"少留也能重建"）
@@ -37,7 +39,10 @@ SR-Diffusion Phase 1 v2 — 整体重构（按损失函数提取思想）
   [TODO] per-sample z-score 校准（v1 里"排序与计数分离、防军备竞赛"技巧；
          若 recon 与率项在同一组 logits 上打架时再启用）
   [TODO] 预算信任域（v1 BudgetTrustRegion：KL 限速、k 守卫、recon 力放大）
-  [TODO] k 硬守卫 [k_min, k_max]（当前仅 k ≥ 1 由峰值锚定保证）
+  [TODO] k 硬守卫 [k_min, k_max]（当前无下界；若 k=0 瞬态重建不可接受再加）
+  [TODO] sigmoid 饱和陷阱：scores 整体偏负时 σ'≈0，SelectHead 梯度被衰减
+         （实测 σ'(-5)≈0.0067 → 梯度弱 ~125×），k=0 自愈变慢——若训练中
+         k 长期为 0，启用 v1 的 raw clamp + 排斥正则或 z-score 校准
   [TODO] 物理剪枝（当前零填充 N+1 槽位、train/eval 一致；"只算 k 个 token"
           的算力收益待实现，对应 v1 的 _gather_selected / hard_mode）
   [TODO] 训练期硬/软输入混合（v1 hard_input_prob，消除 decoder 记忆分布差）
@@ -76,19 +81,24 @@ class SelectHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# BernoulliGate — sigmoid 伯努利门控 + 峰值锚定（可微 one-hot 选择）
+# BernoulliGate — sigmoid 伯努利门控（可微 one-hot 选择）
 # ═══════════════════════════════════════════════════════════════
 
 class BernoulliGate(nn.Module):
     """p = σ(scores/T) ∈ (0,1)^N：每个候选位置的独立保留概率。
 
     二值化: hard_i = (p_i > threshold)，阈值默认 0.5（sigmoid 自然中点）。
-    峰值锚定: argmax(p) 位置恒保留（scatter 置 1）→ 保证 k ≥ 1，
-      且"最重要位置必选"（用户 max 思路的正确落地——max 用于锚定
-      而不是当切片边界；逐样本可变 k 无法用单一切片实现）。
+
+    k=0 是允许的: dec_in 恒含 z_cls（ReEncoder 的 cls 输出），即使一个
+    候选 token 都没选，decoder 仍能靠 cls 重建（保底牌）——因此不需要
+    峰值锚定/k≥1 的硬性防御；若 k=0 导致重建变差，recon 梯度会经 STE
+    自动把 p 拉回，k=0 只是可自愈的过渡态。
 
     可微性（STE）: mask = p + (hard - p).detach()   → 前向是 one-hot 式
       硬选择，反向梯度经 p 流入 SelectHead。
+      ⚠ 不能直接返回 hard: (p > threshold) 是比较运算、无 grad_fn，
+      mask 会 requires_grad=False → recon/rate/ent 的梯度全部到不了
+      SelectHead（"路径静默死掉"，v1 ThresholdGate 实测过的坑）。
     threshold=0 时全保留（等价 v1 stage-1 预热，见模块头 TODO）。
     """
 
@@ -100,7 +110,10 @@ class BernoulliGate(nn.Module):
     def forward(self, scores: Tensor) -> Tuple[Tensor, Tensor]:
         B, N = scores.shape
         p = torch.sigmoid(scores / self.T)               # (B,N) 保留概率
-        mask = (p > self.threshold).float()              # (B,N) 0/1 阈值二值化
+        hard = (p > self.threshold).float()              # (B,N) 0/1 阈值二值化
+        # STE: 前向用 hard（one-hot 式硬选择），反向梯度经 p 流入 SelectHead。
+        # ⚠ 不能直接返回 hard——比较运算无 grad_fn，梯度路径会静默死掉。
+        mask = p + (hard - p).detach()                   # (B,N) STE
         return mask, p
 
 
