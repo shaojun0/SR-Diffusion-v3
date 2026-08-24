@@ -211,17 +211,17 @@ class SRPhase1V2(nn.Module):
 
         # ── 步骤 1: cls (B,D) → 能量谱 p (B,N) ──
         scores = self.select_head(cls)                  # (B,N)
-        mask, p = self.gate(scores)                     # mask (B,N) STE, p (B,N) 能量谱
-
+        s_top = torch.sigmoid(scores)
+        s_top_k = s_top.max(dim=1)
         # ── 步骤 2: ReEncoder 出 z_s，按 mask 选择后进 decoder ──
         specials = self.special_bank(B, x.device)       # (B,N,D)
         enc_in = torch.cat([cls.unsqueeze(1), specials, patch], dim=1)  # (B,2N+1,D)
         z = self.re_encoder(enc_in)                     # (B,2N+1,D)
         z_cls = z[:, 0:1]                               # (B,1,D)
-        z_s = z[:, 1:1 + N]                             # (B,N,D) ← top-k 唯一候选
+        z_s = z[:, 1:s_top_k]                             # 这里有错误，需要填充，后续按这个思路往下实现是否合理
         # [TODO] 物理剪枝：当前零填充 N+1 槽位（train/eval 一致），
         #        "只算 k 个 token"的算力收益待实现（见模块头 TODO）。
-        dec_in = torch.cat([z_cls, z_s * mask.unsqueeze(-1)], dim=1)   # (B,N+1,D)
+        dec_in = torch.cat([z_cls, z_s], dim=1)   # (B,N+1,D)
         F_hat = self.decoder(dec_in)                    # (B,N,D)
 
         # ── 步骤 3: 损失（全部按最小化实现）──
