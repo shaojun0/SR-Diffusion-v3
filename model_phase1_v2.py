@@ -164,7 +164,6 @@ class SRPhase1V2(nn.Module):
         self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches)
 
-
     # ── 预算旋钮：threshold（stage-1 设 0 全保留，stage-2 退火到目标值）──
     def set_threshold(self, threshold: float):
         """设置 sigmoid 二值化阈值。[TODO] 两阶段退火调度见模块头。"""
@@ -222,8 +221,11 @@ class SRPhase1V2(nn.Module):
 
         # ── 步骤 1: cls (B,D) → 保留概率 p (B,N) ──
         scores = self.select_head(cls)                  # (B,N)
-        top_scores = nn.functional.softmax(scores,dim=1)
-        mask = scores>torch.max(top_scores,dim=1,keepdim=True)
+        soft_max_scores = nn.functional.softmax(scores,dim=1)
+        # mask, p = self.gate(scores)                     # mask (B,N) STE, p (B,N) 保留概率
+        positions = torch.arange(scores.shape[-1]).unsqueeze(0)
+        indices = torch.argmax(soft_max_scores,dim=-1).unsqueeze(1)
+        mask = (positions < indices).float()
         # ── 步骤 2: ReEncoder 出 z_s，按 mask 选择后进 decoder ──
         specials = self.special_bank(B, x.device)       # (B,N,D)
         enc_in = torch.cat([cls.unsqueeze(1), specials, patch], dim=1)  # (B,2N+1,D)
@@ -237,34 +239,7 @@ class SRPhase1V2(nn.Module):
 
         # ── 步骤 3: 损失（全部按最小化实现）──
         # L_recon: 最小化特征重建误差（主线；驱动保留概率学会"少留也能重建"）
-        recon = F.l1_loss(F_hat, patch)                 # scalar,0~1
-        # L_rate: 最小化保留 token 比例。sigmoid 下 mask.mean() 有真实梯度
-        #         （∂mean(σ)/∂scores = σ'/N > 0）——softmax 方案下这是
-        #         零梯度恒等式，正是弃用 softmax 的原因（见模块头）。
-
-        rate = mask.mean()                              # scalar 保留比例（前向 = k/N）
-        # L_ent: 反塌缩——最小化负熵；avg_sel 为跨 batch 平均选择，
-        #        退化"所有图选同一批位置"时 H→0，此项惩罚它
-        avg_sel = mask.mean(dim=0)                      # (N,)
-        ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
-                (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()  # scalar
-        loss = recon + self.lambda_rate * rate - self.lambda_ent * ent
-        # [TODO] 其余损失/机制（阈值退火、可学习 τ、z-score 校准、信任域、
-        #        k 守卫、温度退火、硬/软输入混合、recon 力放大）见模块头 TODO。
-
-        with torch.no_grad():
-            hard = (mask > 0.5).float()                 # (B,N) 前向即硬选择
-            k_used = hard.sum(dim=1)                    # (B,)
-            def _t(v):
-                return torch.as_tensor(v, device=x.device)
-            stats = {
-                "recon_l1": _t(recon),
-                "rate": _t(rate),
-                "entropy": _t(ent),
-                "threshold": _t(self.threshold),
-                "k_used_mean": _t(k_used.float().mean()),
-                "k_used_min": _t(k_used.float().min()),
-                "k_used_max": _t(k_used.float().max()),
-            }
-
-        return {"loss": loss, "F_hat": F_hat, "mask": mask, "p": p, "stats": stats}
+        recon = F.l1_loss(F_hat, patch)                 # scalar
+        index_label = torch.zeros_like(scores)
+        index_label[range(len(indices)), torch.where(indices-1>=0,indices-1,0)] = 1
+        loss = recon + nn.functional.binary_cross_entropy(soft_max_scores,index_label)
