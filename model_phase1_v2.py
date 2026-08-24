@@ -2,37 +2,42 @@
 SR-Diffusion Phase 1 v2 — 整体重构（按损失函数提取思想）
 =================================================================
 
-设计思想（非线性 SVD 类比）:
-  SelectHead(cls) 把全局描述子映射为 N 个候选 token 位置上的"能量谱"
-  p = softmax(scores)（类比 SVD 奇异值归一化谱；README 的 SVD 预处理就是
-  按奇异值能量做 99% 截断）。按累计能量截断 ρ 自动决定保留多少个 token：
-  谱越尖（信息集中）→ k 越小；谱越平（信息分散）→ k 越大。
-  即：让神经网络近似拟合一个"非线性 SVD"——能量谱的形状由图像内容决定，
-  而不是固定维度瓶颈。softmax 的峰值位置（argmax）永远在保留集合内。
+设计思想（修正版：softmax 能量谱 → sigmoid 伯努利门控）:
+  softmax 方案的缺陷（上版实测/推导）:
+    · softmax 对整体平移不变、Σp≡1 → rate = mask.mean() 是零梯度恒等式，
+      率损失推不动 SelectHead；
+    · 累计能量截断 ρ 引入了与"逐位置重要性"无关的全局耦合。
+  修正: SelectHead(cls) 输出 scores (B,N)，逐位置过 sigmoid 得到独立的
+  保留概率 p = σ(scores) ∈ (0,1)^N（伯努利门控，无归一化耦合）。此时:
+    · rate = mask.mean() 有真实梯度（∂mean(σ)/∂scores = σ' > 0）；
+    · 阈值 0.5 是 sigmoid 的自然二值化点（"比保留更倾向保留"）；
+    · 峰值（argmax）位置恒保留 → k ≥ 1，与"最重要位置必选"的直觉一致。
+  即: 神经网络学习"这张图哪些空间位置值得保留"，budget 由阈值和
+  保留概率的形状共同决定（内容自适应），而非固定维度瓶颈。
 
 三步实现:
-  1. cls (B,D) --SelectHead--> scores (B,N) --softmax--> p (B,N) 能量谱
-  2. EnergyGate: 累计能量 ≥ ρ 的前 k 个位置 → 0/1 掩码（STE 可微），
-     作用于 z_s = z[:, 1:1+N]（ReEncoder 输出的特殊 token 表示）→ decoder
+  1. cls (B,D) --SelectHead--> scores (B,N) --sigmoid--> p (B,N) 保留概率
+  2. BernoulliGate: hard = (p > threshold) 且峰值恒保留（k ≥ 1），
+     STE 可微 0/1 掩码；作用于 z_s = z[:, 1:1+N]（ReEncoder 输出的
+     特殊 token 表示）→ decoder
   3. 损失（全部按最小化实现，未实现项标注 TODO）:
-       L_recon = L1(F_hat, F_patch)       — 最小化特征重建误差（主线，驱动
-                                             能量谱学会"截断 ρ 仍能重建"）
-       L_rate  = λ_rate · H(p)            — 最小化能量谱熵（谱越尖 → 越少
-                                             token 越过 ρ 截断；默认 λ_rate=0，
-                                             预算主旋钮是 ρ，此项作软正则备选）
+       L_recon = L1(F_hat, F_patch)       — 最小化特征重建误差（主线：驱动
+                                             保留概率学会"少留也能重建"）
+       L_rate  = λ_rate · mask.mean()     — 最小化保留 token 比例（sigmoid 下
+                                             有真实梯度；默认 0.1，同 v1）
        L_ent   = -λ_ent · H(平均选择)     — 反塌缩：最小化负熵，防止选择退化
                                              为"所有图都选同一批位置"
 
-  注：v1 里 rate = mask.mean() 的朴素率损失在 softmax 下是恒等零梯度
-      （softmax 对整体平移不变、Σp≡1），故 v2 改用 H(p) 作为率项。
-
 未实现（TODO，后续按模块化嵌入）:
-  [TODO] ρ 两阶段退火：stage-1 ρ=1.0（全保留，先教重建）→ stage-2 退火到目标
-  [TODO] 温度退火 T（当前固定 1.0；退火可让能量谱从软变硬，配合 STE）
-  [TODO] per-sample z-score 校准（v1 里"排序与计数分离、防军备竞赛"的技巧；
+  [TODO] 阈值两阶段退火：stage-1 threshold=0（全保留，先教重建）→
+         stage-2 退火到 0.5（对应 v1 的 fixed_tau 两阶段思想）
+  [TODO] 温度退火 T（当前固定 1.0；T 控制 sigmoid 的软硬程度）
+  [TODO] 可学习阈值 τ（v1 RateHead 思路：阈值随内容变化而非固定 0.5；
+         若固定阈值压不动再启用）
+  [TODO] per-sample z-score 校准（v1 里"排序与计数分离、防军备竞赛"技巧；
          若 recon 与率项在同一组 logits 上打架时再启用）
   [TODO] 预算信任域（v1 BudgetTrustRegion：KL 限速、k 守卫、recon 力放大）
-  [TODO] k 硬守卫 [k_min, k_max]（能量截断天然给 k；需要硬界时在此加 clamp）
+  [TODO] k 硬守卫 [k_min, k_max]（当前仅 k ≥ 1 由峰值锚定保证）
   [TODO] 物理剪枝（当前零填充 N+1 槽位、train/eval 一致；"只算 k 个 token"
           的算力收益待实现，对应 v1 的 _gather_selected / hard_mode）
   [TODO] 训练期硬/软输入混合（v1 hard_input_prob，消除 decoder 记忆分布差）
@@ -50,7 +55,7 @@ from model_phase1 import SpecialTokenBank, ReEncoder, FeatureDecoder
 # ═══════════════════════════════════════════════════════════════
 # SelectHead — cls (B,D) → scores (B,N)：全局描述子 → 位置重要性分数
 # ═══════════════════════════════════════════════════════════════
-# 步骤 1 的"cls (B,D) → (B,N)"。softmax（能量谱化）在 EnergyGate 里做。
+# 步骤 1 的"cls (B,D) → (B,N)"。sigmoid（概率化）在 BernoulliGate 里做。
 # 注意：cls 是全局描述子，只能学"区域级"重要性（如人脸区域重要），
 # 感知不到具体 patch 内容——这是纯 cls 选择的已知局限（v1 的 ScoreHead
 # 作用在 z_s 上能看到逐位置内容；如需恢复可把输入换成 [cls; z_s]）。
@@ -71,39 +76,34 @@ class SelectHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# EnergyGate — SVD 式能量截断 top-k（可微 one-hot 选择）
+# BernoulliGate — sigmoid 伯努利门控 + 峰值锚定（可微 one-hot 选择）
 # ═══════════════════════════════════════════════════════════════
 
-class EnergyGate(nn.Module):
-    """p = softmax(scores/T) 视作候选 token 的归一化能量谱（Σ=1）。
+class BernoulliGate(nn.Module):
+    """p = σ(scores/T) ∈ (0,1)^N：每个候选位置的独立保留概率。
 
-    按 p 降序累计，保留"累计质量首次 ≥ ρ"的前 k 个位置：
-        k_i = min{ k : Σ_{j≤k} p_sorted[j] ≥ ρ }，且 k_i ≥ 1
-    k 完全由谱形状决定（内容自适应）：谱越尖 k 越小，谱越平 k 越大。
-    softmax 的峰值位置（argmax，排序名次 0）恒在保留集合内。
+    二值化: hard_i = (p_i > threshold)，阈值默认 0.5（sigmoid 自然中点）。
+    峰值锚定: argmax(p) 位置恒保留（scatter 置 1）→ 保证 k ≥ 1，
+      且"最重要位置必选"（用户 max 思路的正确落地——max 用于锚定
+      而不是当切片边界；逐样本可变 k 无法用单一切片实现）。
 
-    可微性（STE）：hard 为 0/1 掩码（前向），soft = p（梯度路径）：
-        mask = p + (hard - p).detach()   → 前向是 one-hot 式硬选择，
-                                           反向梯度经 p 流入 SelectHead。
-
-    rho=1.0 时保留全部（等价 v1 stage-1 的全保留预热）。
+    可微性（STE）: mask = p + (hard - p).detach()   → 前向是 one-hot 式
+      硬选择，反向梯度经 p 流入 SelectHead。
+    threshold=0 时全保留（等价 v1 stage-1 预热，见模块头 TODO）。
     """
 
-    def __init__(self, rho: float = 0.99, T: float = 1.0):
+    def __init__(self, threshold: float = 0.5, T: float = 1.0):
         super().__init__()
-        self.rho = rho
+        self.threshold = threshold
         self.T = T
 
     def forward(self, scores: Tensor) -> Tuple[Tensor, Tensor]:
         B, N = scores.shape
-        p = F.softmax(scores / self.T, dim=-1)             # (B,N) 能量谱, Σ=1
-        order = torch.argsort(p, dim=1, descending=True)   # (B,N) 降序排列的位置
-        sorted_p = p.gather(1, order)                      # (B,N) 降序能量
-        cum = torch.cumsum(sorted_p, dim=1)                # (B,N) 累计质量
-        k = (cum < self.rho).sum(dim=1) + 1                # (B,) 首次累计 ≥ ρ 的个数（≥1）
-        rank = torch.argsort(order, dim=1)                 # (B,N) 每个位置的排序名次
-        hard = (rank < k.unsqueeze(1)).float()             # (B,N) 0/1: 名次 < k_i 的位置保留
-        mask = p + (hard - p).detach()                     # (B,N) STE
+        p = torch.sigmoid(scores / self.T)               # (B,N) 保留概率
+        hard = (p > self.threshold).float()              # (B,N) 0/1 阈值二值化
+        peak = p.argmax(dim=1, keepdim=True)             # (B,1) 峰值位置
+        hard = hard.scatter(1, peak, 1.0)                # 峰值恒保留 → k ≥ 1
+        mask = p + (hard - p).detach()                   # (B,N) STE
         return mask, p
 
 
@@ -112,16 +112,16 @@ class EnergyGate(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class SRPhase1V2(nn.Module):
-    """自适应 token 预算 tokenizer（v2，纯 cls 全局选择 + 能量截断）。
+    """自适应 token 预算 tokenizer（v2，纯 cls 全局选择 + sigmoid 伯努利门控）。
 
     Args:
         dinov2: frozen Dinov2Model (transformers)。输入 224×224, patch 14
                 → 256 patch tokens + cls。
         num_patches: 候选 token 数（224²/patch14 → 256）
         dim: DINO hidden size（base=768, giant=1536）
-        rho: 能量截断阈值（0,1]，默认 0.99；1.0 = 全保留（stage-1 预热）
-        T: softmax 温度（默认 1.0；退火见 TODO）
-        lambda_rate: 能量谱熵惩罚权重（默认 0.0——预算主旋钮是 ρ）
+        threshold: sigmoid 二值化阈值（默认 0.5；0 = 全保留预热，见 TODO）
+        T: sigmoid 温度（默认 1.0；退火见 TODO）
+        lambda_rate: 保留比例惩罚权重（默认 0.1，同 v1）
         lambda_ent: 反塌缩熵惩罚权重（默认 0.01，同 v1）
     """
 
@@ -130,9 +130,9 @@ class SRPhase1V2(nn.Module):
         dinov2: nn.Module,
         num_patches: int = 256,
         dim: int = 768,
-        rho: float = 0.99,
+        threshold: float = 0.5,
         T: float = 1.0,
-        lambda_rate: float = 0.0,
+        lambda_rate: float = 0.1,
         lambda_ent: float = 0.01,
     ):
         super().__init__()
@@ -143,22 +143,22 @@ class SRPhase1V2(nn.Module):
 
         self.num_patches = num_patches
         self.dim = dim
-        self.rho = rho
+        self.threshold = threshold
         self.T = T
         self.lambda_rate = lambda_rate
         self.lambda_ent = lambda_ent
 
         self.select_head = SelectHead(in_dim=dim, num_patches=num_patches)
-        self.gate = EnergyGate(rho=rho, T=T)
+        self.gate = BernoulliGate(threshold=threshold, T=T)
         self.special_bank = SpecialTokenBank(num_patches=num_patches, dim=dim)
         self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches)
 
-    # ── 预算旋钮：ρ（stage-1 设 1.0 全保留，stage-2 退火到目标值）──
-    def set_rho(self, rho: float):
-        """设置能量截断阈值。[TODO] 两阶段退火调度见模块头。"""
-        self.rho = rho
-        self.gate.rho = rho
+    # ── 预算旋钮：threshold（stage-1 设 0 全保留，stage-2 退火到目标值）──
+    def set_threshold(self, threshold: float):
+        """设置 sigmoid 二值化阈值。[TODO] 两阶段退火调度见模块头。"""
+        self.threshold = threshold
+        self.gate.threshold = threshold
 
     # ── 从冻结 DINO 热启动 ReEncoder（同 v1，避免从零学）──
     def init_reencoder_from_dino(self, num_layers: int = 4):
@@ -195,7 +195,7 @@ class SRPhase1V2(nn.Module):
 
     # ── forward ──
     def forward(self, pixel_values: Tensor) -> dict:
-        """x (B,3,224,224) → 能量谱选择 + 特征重建。
+        """x (B,3,224,224) → sigmoid 伯努利选择 + 特征重建。
 
         Returns dict with loss + stats.
         """
@@ -209,35 +209,36 @@ class SRPhase1V2(nn.Module):
         cls = feats[:, 0]                               # (B,D)
         patch = feats[:, 1:]                            # (B,N,D)
 
-        # ── 步骤 1: cls (B,D) → 能量谱 p (B,N) ──
+        # ── 步骤 1: cls (B,D) → 保留概率 p (B,N) ──
         scores = self.select_head(cls)                  # (B,N)
-        s_top = torch.sigmoid(scores)
-        s_top_k = s_top.max(dim=1)
+        mask, p = self.gate(scores)                     # mask (B,N) STE, p (B,N) 保留概率
+
         # ── 步骤 2: ReEncoder 出 z_s，按 mask 选择后进 decoder ──
         specials = self.special_bank(B, x.device)       # (B,N,D)
         enc_in = torch.cat([cls.unsqueeze(1), specials, patch], dim=1)  # (B,2N+1,D)
         z = self.re_encoder(enc_in)                     # (B,2N+1,D)
         z_cls = z[:, 0:1]                               # (B,1,D)
-        z_s = z[:, 1:s_top_k]                             # 这里有错误，需要填充，后续按这个思路往下实现是否合理
+        z_s = z[:, 1:1 + N]                             # (B,N,D) ← 掩码选择对象（top-k 候选）
         # [TODO] 物理剪枝：当前零填充 N+1 槽位（train/eval 一致），
         #        "只算 k 个 token"的算力收益待实现（见模块头 TODO）。
-        dec_in = torch.cat([z_cls, z_s], dim=1)   # (B,N+1,D)
+        dec_in = torch.cat([z_cls, z_s * mask.unsqueeze(-1)], dim=1)   # (B,N+1,D)
         F_hat = self.decoder(dec_in)                    # (B,N,D)
 
         # ── 步骤 3: 损失（全部按最小化实现）──
-        # L_recon: 最小化特征重建误差（主线；驱动能量谱学会"截断 ρ 仍能重建"）
+        # L_recon: 最小化特征重建误差（主线；驱动保留概率学会"少留也能重建"）
         recon = F.l1_loss(F_hat, patch)                 # scalar
-        # L_rate: 最小化能量谱熵 → 谱越尖、越过 ρ 截断的 token 越少。
-        #         （v1 的 rate=mask.mean() 在 softmax 下是零梯度恒等式，见模块头注）
-        rate = -(p * torch.log(p + 1e-8)).sum(dim=1).mean()   # scalar H(p)
+        # L_rate: 最小化保留 token 比例。sigmoid 下 mask.mean() 有真实梯度
+        #         （∂mean(σ)/∂scores = σ'/N > 0）——softmax 方案下这是
+        #         零梯度恒等式，正是弃用 softmax 的原因（见模块头）。
+        rate = mask.mean()                              # scalar 保留比例（前向 = k/N）
         # L_ent: 反塌缩——最小化负熵；avg_sel 为跨 batch 平均选择，
         #        退化"所有图选同一批位置"时 H→0，此项惩罚它
         avg_sel = mask.mean(dim=0)                      # (N,)
         ent = -(avg_sel * torch.log(avg_sel + 1e-8) +
                 (1 - avg_sel) * torch.log(1 - avg_sel + 1e-8)).mean()  # scalar
         loss = recon + self.lambda_rate * rate - self.lambda_ent * ent
-        # [TODO] 其余损失/机制（信任域、z-score 校准、k 守卫、温度退火、
-        #        硬/软输入混合、recon 力放大）见模块头 TODO 列表。
+        # [TODO] 其余损失/机制（阈值退火、可学习 τ、z-score 校准、信任域、
+        #        k 守卫、温度退火、硬/软输入混合、recon 力放大）见模块头 TODO。
 
         with torch.no_grad():
             hard = (mask > 0.5).float()                 # (B,N) 前向即硬选择
@@ -246,9 +247,9 @@ class SRPhase1V2(nn.Module):
                 return torch.as_tensor(v, device=x.device)
             stats = {
                 "recon_l1": _t(recon),
-                "rate_ent": _t(rate),
+                "rate": _t(rate),
                 "entropy": _t(ent),
-                "rho": _t(self.rho),
+                "threshold": _t(self.threshold),
                 "k_used_mean": _t(k_used.float().mean()),
                 "k_used_min": _t(k_used.float().min()),
                 "k_used_max": _t(k_used.float().max()),
