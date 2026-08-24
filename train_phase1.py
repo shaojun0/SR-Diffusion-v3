@@ -27,7 +27,7 @@ from transformers import (
     Dinov2Model, Trainer, TrainingArguments, TrainerCallback,
 )
 
-from model_phase1 import SRPhase1, BudgetTrustRegion
+from model_phase1 import SRPhase1, BudgetTrustRegion, RAW_MAX
 
 # ═══════════════════════════════════════════════════════════════
 # Dataset — flat JPEG dir or ImageFolder; returns raw path (like
@@ -194,8 +194,8 @@ def main():
                     help="dead-zone hinge 刚度（独立于 lambda_rate_target；勿混用）")
     ap.add_argument("--recon_tau_scale", type=float, default=50.0,
                     help="recon 的 τ 路径梯度放大倍数（力平衡标定，主旋钮）")
-    ap.add_argument("--raw_max", type=float, default=1.472,
-                    help="atanh(1.8/2)：raw clamp，τ≤1.8 且 dτ/draw≥0.38")
+    ap.add_argument("--raw_max", type=float, default=RAW_MAX,
+                    help=f"atanh(1.8/2)≈{RAW_MAX:.4f}：raw clamp，τ≤1.8 且 dτ/draw≥0.38")
     ap.add_argument("--tau_soft", type=float, default=1.5)
     ap.add_argument("--lambda_tau", type=float, default=1.0)
 

@@ -56,6 +56,35 @@ from typing import Tuple, Optional
 
 
 # ═══════════════════════════════════════════════════════════════
+# 预算阈值 τ 的共享原语（trust-region 与非 trust-region 路径共用）
+# ═══════════════════════════════════════════════════════════════
+# τ = 2·tanh(raw)：tanh 提供有界性；bounded_raw 把 |raw| 限在 ±RAW_MAX，
+# 保证 dτ/draw = 2(1−tanh²raw) ≥ 0.38 永不消失（tanh 永不饱和）。
+# τ ∈ [-TAU_MAX, TAU_MAX] = [-1.8, 1.8] 覆盖 z-score logits 下 k ∈ [8, 250]
+# 的整个操作区间（与 BudgetTrustRegion 的 k 守卫自洽，见 _solve_tau 的 ①③）。
+
+TAU_MAX = 1.8                       # τ 的结构界 ∈ [-1.8, 1.8]
+
+
+def raw_at_tau(tau: float) -> float:
+    """τ = 2·tanh(raw) 的逆：给定 τ，返回 tanh 恰好达到 τ/2 时的 raw 值。"""
+    return math.atanh(min(0.999, tau / 2.0))
+
+
+RAW_MAX = raw_at_tau(TAU_MAX)       # ≈1.4722：tanh 恰好达到 τ_max 时的 raw 值
+
+
+def bounded_raw(raw: Tensor, raw_max: float = RAW_MAX) -> Tensor:
+    """结构界：|raw| ≤ raw_max，防 tanh 饱和（dτ/draw ≥ 0.38 永不消失）。"""
+    return torch.clamp(raw, -raw_max, raw_max)
+
+
+def raw_to_tau(raw: Tensor) -> Tensor:
+    """raw → τ = 2·tanh(raw) ∈ [-1.8, 1.8]（对 bounded_raw 的输出调用）。"""
+    return 2.0 * torch.tanh(raw)
+
+
+# ═══════════════════════════════════════════════════════════════
 # RateHead — predicts the token-budget threshold τ from [cls]
 # ═══════════════════════════════════════════════════════════════
 
@@ -439,10 +468,11 @@ class SRPhase1(nn.Module):
             # stash KL for the callback's adaptive-β update
             self.trust_region._last_kl = float(kl_loss.detach().cpu())
         else:
-            # bounded threshold: 2·tanh keeps τ in [-1.8, 1.8] (raw 先 clamp 防
-            # tanh 饱和死锁，dτ/draw ≥ 0.38 永不消失)。与 trust-region 路径一致。
-            raw = torch.clamp(self.rate_head(cls), -1.472, 1.472)   # insurance
-            tau = 2.0 * torch.tanh(raw)                             # ∈ [-1.8, 1.8]
+            # bounded threshold: 与 trust-region 路径共用同一组原语（bounded_raw +
+            # raw_to_tau，见模块头）。raw 先 clamp 防 tanh 饱和死锁，
+            # dτ/draw ≥ 0.38 永不消失；τ ∈ [-1.8, 1.8]。
+            raw = bounded_raw(self.rate_head(cls))                 # insurance
+            tau = raw_to_tau(raw)
             mask, soft = self.gate(logits, tau)    # (B,256) each
             budget_loss = torch.zeros((), device=x.device)
             kl_loss = torch.zeros((), device=x.device)
@@ -593,7 +623,7 @@ class BudgetTrustRegion:
         lambda_ent: float = 0.01,
         ref_momentum: float = 0.99,
         recon_tau_scale: float = 50.0,     # NEW: recon 的 τ 路径梯度放大倍数（力平衡标定）
-        raw_max: float = 1.472,            # NEW: atanh(1.8/2) — raw clamp，dτ/draw ≥ 0.38
+        raw_max: float = RAW_MAX,          # ≈1.4722 = atanh(1.8/2)，见模块头
         tau_soft: float = 1.5,             # NEW: raw 空间排斥正则起点（τ=1.5）
         lambda_tau: float = 1.0,           # NEW: 排斥强度
     ):
@@ -624,7 +654,7 @@ class BudgetTrustRegion:
         self.step = 0
         self.recon_tau_scale = recon_tau_scale
         self.raw_max = raw_max
-        self.raw_soft = math.atanh(min(0.999, tau_soft / 2.0))   # ≈ 0.973 (τ=1.5)
+        self.raw_soft = raw_at_tau(tau_soft)                    # ≈0.973 (τ=1.5)
         self.lambda_tau = lambda_tau
 
     # ── schedule helpers ──
@@ -655,6 +685,40 @@ class BudgetTrustRegion:
         if math.isfinite(new_beta):
             self.beta = min(max(new_beta, self.beta_min), self.beta_max)
 
+    # ── τ 求解：三步 clamp 的显式级联 ──
+    def _solve_tau(self, model: "SRPhase1", logits: Tensor, cls: Tensor
+                   ) -> Tuple[Tensor, Tensor, Tensor]:
+        """由 RateHead 输出 + logits 分位数求出最终阈值 τ（gate 前的 ① ② ③）。
+
+        三个 clamp 职责正交、区间可能不相交，不能合并成一个 clamp：
+          ① 结构界：|raw| ≤ raw_max 防 tanh 饱和，dτ/draw ≥ 0.38 永不消失
+             （对应故障：τ 撞边后梯度冻结、噪声随机游走）
+          ② 信任域：τ 每步偏离参考策略 ≤ δ_τ（≈Δk ≤ 5 token/步），PPO 风格
+             （对应故障：一步把 k 从 256 打到 4）
+          ③ k 守卫：k ∈ [k_min, k_max] 硬保证（topk 取 k_max+1 使索引存在；
+             第 k_max+1 大值作下界 ⇒ k ≤ k_max，第 k_min 大值作上界 ⇒ k ≥ k_min）
+             （对应故障：k=4 塌缩 / k=256 永不压缩）
+
+        Returns: (tau, tau_ref, raw) — tau 为最终阈值；tau_ref 供 KL 的参考概率
+        soft_ref；raw 供 ⑧ 的 raw 空间排斥正则（tau_reg）。
+        """
+        # ① 结构界（网络 + target 都要 clamp：target 共享同一条代码路径；
+        #    梯度经 clamp 在界内为恒等，模块本身保持纯函数）
+        raw = bounded_raw(model.rate_head(cls), self.raw_max)
+        tau_net = raw_to_tau(raw)                                   # ∈ [-1.8, 1.8]
+        with torch.no_grad():
+            raw_ref = bounded_raw(model.rate_head_target(cls), self.raw_max)
+            tau_ref = raw_to_tau(raw_ref)
+        # ② 信任域
+        tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
+                          tau_ref + self.delta_tau)
+        # ③ k 守卫
+        top_vals, _ = torch.topk(logits, self.k_max + 1, dim=1)     # descending
+        tau = torch.clamp(tau,
+                          top_vals[:, self.k_max].detach().unsqueeze(1),
+                          top_vals[:, self.k_min - 1].detach().unsqueeze(1))
+        return tau, tau_ref, raw
+
     # ── forward-time gate + budget (called from SRPhase1.forward) ──
     def gate_forward(self, model: "SRPhase1", logits: Tensor, cls: Tensor) -> dict:
         """
@@ -671,26 +735,10 @@ class BudgetTrustRegion:
         f = min(1.0, self.step / max(1, self.anneal_steps))
         rate_max = self.rate_max + (1.0 - self.rate_max) * (1.0 - f)
 
-        # ① raw clamp（网络 + target 都要）: dτ/draw = 2(1-tanh²(raw)) ≥ 0.38 永不消失
-        #    （在 forward 处 clamp 而非 RateHead 输出层：target 共享同一条代码路径；
-        #     梯度经 clamp 在界内为恒等，模块本身保持纯函数）
-        raw = torch.clamp(model.rate_head(cls), -self.raw_max, self.raw_max)
-        tau_net = 2.0 * torch.tanh(raw)                              # ∈ [-1.8, 1.8]
-        with torch.no_grad():
-            raw_ref = torch.clamp(model.rate_head_target(cls),
-                                  -self.raw_max, self.raw_max)       # target 也必须 clamp！
-            tau_ref = 2.0 * torch.tanh(raw_ref)
-        tau = torch.clamp(tau_net, tau_ref - self.delta_tau,
-                          tau_ref + self.delta_tau)
+        # ① 结构界 + ② 信任域 + ③ k 守卫：三步 clamp 的级联，详见 _solve_tau
+        tau, tau_ref, raw = self._solve_tau(model, logits, cls)
 
-        # ② k hard guard: keep k ∈ [k_min, k_max]
-        #   topk(k_max+1) so index k_max = (k_max+1)-th largest logit exists.
-        top_vals, _ = torch.topk(logits, self.k_max + 1, dim=1)     # descending
-        tau = torch.clamp(tau,
-                          top_vals[:, self.k_max].detach().unsqueeze(1),
-                          top_vals[:, self.k_min - 1].detach().unsqueeze(1))
-
-        # ③ gate
+        # ④ gate
         T = self.anneal()
         g = self.gumbel_coef()
         noise = g * (-torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8))
@@ -702,12 +750,12 @@ class BudgetTrustRegion:
         #   recon 梯度到不了 τ 和 ScoreHead —— 路径静默死掉（smoke test 实测确认）。
         mask = soft_noisy + (hard - soft_noisy).detach()
 
-        # ④ clean soft: logits detached → budget terms only push τ
+        # ⑤ clean soft: logits detached → budget terms only push τ
         soft = torch.sigmoid((logits.detach() - tau) / T)
         with torch.no_grad():
             soft_ref = torch.sigmoid((logits - tau_ref) / T)
 
-        # ⑤ trust region: KL(Bern(p_ref) ‖ Bern(p))
+        # ⑥ trust region: KL(Bern(p_ref) ‖ Bern(p))
         #    fp32 computation: under bf16 autocast, clamp(1e-5) can't be
         #    represented (bf16 precision ~1e-3) → pc.log() → -inf → NaN
         #    (observed at step ~980 under bf16; NaN only in rate_head).
@@ -719,7 +767,7 @@ class BudgetTrustRegion:
         # entropy (on clean soft)
         ent = -(pc * pc.log() + (1 - pc) * (1 - pc).log()).mean()
 
-        # ⑥ dead-zone hinge（per-sample、瞬时值、平方）—— 死区内预算力≡0，
+        # ⑦ dead-zone hinge（per-sample、瞬时值、平方）—— 死区内预算力≡0，
         #    消除实测 30× 力失衡；梯度 ≈ 2·λh·err·φ。
         #    精确形式（v3）:
         #      err_j   = ReLU(rate_j - r_max) + ReLU(r_min - rate_j)
@@ -738,7 +786,7 @@ class BudgetTrustRegion:
         self.rate_ema = ((1 - self.rate_ema_alpha) * self.rate_ema.detach()
                          + self.rate_ema_alpha * rate)
 
-        # ⑦ raw 空间排斥正则：饱和区唯一存活的梯度信号（clamp 防复发、排斥管恢复）
+        # ⑧ raw 空间排斥正则：饱和区唯一存活的梯度信号（clamp 防复发、排斥管恢复）
         #    L_tau_reg = λ_tau · mean_j(ReLU(|raw_j| - raw_soft)²)
         #    ∂L/∂raw_j = 2·λ_tau·ReLU(|raw_j|-raw_soft)·sign(raw_j) —— 无 sigmoid/tanh 衰减
         tau_reg = F.relu(raw.abs() - self.raw_soft).square().mean()
