@@ -27,7 +27,8 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
     mask_soft[p] = P(k > p) = 1 − cumsum(p)[p] ← 可导软前缀掩码
     gate = mask_soft + (hard − mask_soft).detach()   ← STE 单路径
     dec_z = gate·z_s + (1−gate)·pad_token            （前向恒 hard，反向软梯度）
-    L = L_recon + lambda_rate·E[k]/N   (+ lambda_ent·H(p) 可选锐化)
+    L = L_recon + λ·ReLU(rate − R_target)   (R_target=None 时无预算约束)
+                              (+ lambda_ent·H(p) 可选锐化)
 
     · 重建梯度经 cumsum∘softmax 直达 SelectHead —— 选择器真正学会
       "少留也能重建"，不再依赖任何自指监督。
@@ -36,8 +37,9 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
       见过 hard 输入——无软插值 gap；反向梯度走 mask_soft（期望掩码），
       被剪位置仍在张量里（pad）→ 梯度非零 → 选择器能学"扩张 k"。
       代价: 不裁剪，decoder 恒算 (2N+1)²（省算力需另加 eval 裁剪路径）。
-    · 预算 = 简单率惩罚（lambda_rate 旋钮），与 v1/v2.5 的拉格朗日
-      对偶求解器相比更直接：不需要对偶变量/阈值。
+    · 预算 = 目标铰链（不是盲压）: 只对"超出 R_target 的部分"惩罚，
+      rate ≤ 目标时惩罚恒为 0——不会再出现 λ 大就把 k 压到 0 的
+      "为了惩罚而惩罚"；R_target=None（默认）则完全关闭预算约束。
 
 数学
 ----
@@ -46,21 +48,22 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
     率: E[k]/N = mean(mask_soft)。
     STE: 前向 gate = hard（与推理一致），反向 dL/dgate 经 mask_soft 回传
     （= 期望掩码梯度，Jensen 式近似）——"前向硬、反向软"即"统一 hard"。
+    预算: λ·ReLU(rate − R_target)，rate ≤ R_target 时梯度为零。
 
 训练配方（推荐）
 ----------------
-    stage-1 预热（~前 10% 步）:  model.set_lambda_rate(0.0)
-        只训 L_recon，让 decoder/ReEncoder 先学会"用尽量多的信息重建"。
-    stage-2 预算退火: 每 k 步把 lambda_rate 从 0 增大（如 ×1.5），
-        直到 rate = E[k]/N 逼近目标（如 0.25）；或按
-        lambda_rate += η·(rate − target) 闭环微调。lambda_rate 越大
-        k 越小；recon 梯度决定"哪些位置最值得留"（前缀语义见局限）。
+    stage-1 预热（~前 10% 步）:  budget_target=None（纯重建，
+        让 decoder/ReEncoder 先学会"用尽量多的信息重建"）。
+    stage-2 预算约束:  set_budget_target(R_target)（如 0.25），
+        lambda_rate 从 0 逐步增大（如 ×1.5 每 k 步）直到 rate 稳定在
+        ≈ R_target（铰链在目标处停住，不会压过头）。
+    若想要"能压多低压多低"的旧语义（不推荐）: R_target=0 + 大 λ。
 
 与 v2.5/v3 的差异（为什么不用拉格朗日）:
     v2.5/v3 用 sigmoid 逐位置门控 + STE + 拉格朗日对偶变量 λ，能精确
     打到目标率，但引入阈值 τ、对偶步，且是"逐位置任意子集"而非"前缀"。
     本版要的是干净的前缀选择：一个 softmax + cumsum 就可导，预算用
-    单个标量 lambda_rate 控制，无阈值、无对偶变量。
+    单个目标铰链 λ·ReLU(rate−R_target) 控制，无阈值、无对偶变量。
 
 已知局限（继承旧版，如需可后续换）:
     · 前缀语义: 低位置编号的特殊 token 永远比高位置"更优先保留"。
@@ -312,6 +315,7 @@ class SRPhase1V2(nn.Module):
         dim: int = 768,
         lambda_rate: float = 0.1,
         lambda_ent: float = 0.0,
+        budget_target: Optional[float] = None,
         reencoder_depth: int = 4,
         decoder_depth: int = 4,
         heads: int = 8,
@@ -324,6 +328,7 @@ class SRPhase1V2(nn.Module):
         self.dim = dim
         self.lambda_rate = lambda_rate
         self.lambda_ent = lambda_ent
+        self.budget_target = budget_target
 
         self.pad_token = nn.Parameter(torch.zeros(1, dim))
         self.select_head = SelectHead(in_dim=dim, num_patches=num_patches)
@@ -337,11 +342,18 @@ class SRPhase1V2(nn.Module):
                                       depth=decoder_depth, heads=heads,
                                       mlp_ratio=mlp_ratio)
 
-    # ── 预算旋钮：stage-1 设 0.0 全量预热，stage-2 递增退火到目标率 ──
+    # ── 预算旋钮：目标铰链（只有超预算才惩罚，不会"为了惩罚而惩罚"）──
+    def set_budget_target(self, target: Optional[float]):
+        """目标率 R_target ∈ (0,1]，None = 关闭预算约束（纯重建驱动）。
+
+        惩罚 = λ·ReLU(rate − R_target): rate ≤ R_target 时惩罚恒为 0，
+        只超出预算才施加压力 → k 收敛到 ≈ R_target·N，不会塌到 0。
+        训练配方: stage-1 预热 None（纯重建）→ stage-2
+        set_budget_target(R_target) 并逐步增大 lambda_rate。"""
+        self.budget_target = target
+
     def set_lambda_rate(self, value: float):
-        """预算惩罚权重。0 = 只训重建（k 自由），越大 k 越小。
-        推荐: stage-1 预热 0.0 → stage-2 每 k 步 ×1.5，或
-              lambda_rate += η·(rate − target) 闭环微调。"""
+        """预算约束强度（目标铰链的系数）。只在 rate > R_target 时起作用。"""
         self.lambda_rate = value
 
     def set_entropy(self, value: float):
@@ -418,7 +430,14 @@ class SRPhase1V2(nn.Module):
 
         # ── 步骤 3: 损失（全部按最小化实现）──
         recon = F.l1_loss(F_hat, patch)                 # 主线: 特征重建
-        loss = recon + self.lambda_rate * rate_soft     # 预算: 率惩罚
+        # 预算: 目标铰链（只有超预算才惩罚，不"为了惩罚而惩罚"）
+        #   budget_target=None → 无预算约束（纯重建驱动，k 倾向全保留）
+        #   否则 → λ·ReLU(rate_soft − R_target)，rate ≤ 目标时惩罚恒为 0
+        if self.budget_target is None:
+            loss = recon
+        else:
+            over = torch.clamp(rate_soft - self.budget_target, min=0.0)
+            loss = recon + self.lambda_rate * over
         if self.lambda_ent > 0:                         # 可选: 边界锐化
             H = -(p * torch.log(p.clamp_min(1e-9))).sum(dim=1).mean()
             loss = loss + self.lambda_ent * H
@@ -437,10 +456,12 @@ class SRPhase1V2(nn.Module):
 
 # ═══════════════════════════════════════════════════════════════
 # 自检（python model_v2.py）
-#   1. 形状正确性（软/硬模式）
-#   2. 梯度流向 SelectHead（旧版断链问题的回归测试）
-#   3. 预算响应: lambda_rate 越大 → rate 越小
-#   4. init_reencoder_from_dino 可跑
+#   1. 形状正确性
+#   2. 两处块掩码结构（ReEncoder / FeatureDecoder）
+#   3. STE 前向 == 纯 hard 掩码前向
+#   4. 梯度流向 SelectHead（旧版断链问题的回归测试）
+#   5. 预算目标铰链（无目标=纯重建; 有目标=收敛到目标不塌缩）
+#   6. eval 同路径
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -549,10 +570,11 @@ if __name__ == "__main__":
     assert g is not None and g.abs().sum() > 0, "SelectHead 收不到梯度！"
     print(f"[ok] recon 梯度直达 SelectHead: |grad|={g.abs().sum().item():.4f}")
 
-    # ── 4. 预算响应: λ=0 vs λ=10 各训 30 步，rate 应显著下降 ──
-    def train_rates(lmb: float, steps: int = 30) -> float:
+    # ── 4. 预算目标铰链: 无目标=纯重建（无惩罚）; 目标 0.25+强 λ → 收敛到 ≈0.25
+    def train_rate(target, lmb, steps: int = 30) -> float:
         m = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       lambda_rate=lmb, reencoder_depth=2, decoder_depth=2)
+                       lambda_rate=lmb, budget_target=target,
+                       reencoder_depth=2, decoder_depth=2)
         opt = torch.optim.Adam(m.parameters(), lr=1e-2)
         r = None
         for _ in range(steps):
@@ -563,10 +585,11 @@ if __name__ == "__main__":
             r = o["rate_soft"].item()
         return r
 
-    r0 = train_rates(0.0)
-    r1 = train_rates(10.0)
-    print(f"[ok] 预算响应: λ=0 → rate={r0:.3f}, λ=10 → rate={r1:.3f}")
-    assert r1 < r0, f"预算惩罚失效: {r0} → {r1}"
+    r_free = train_rate(None, 10.0)      # 无预算目标 → 惩罚恒 0，纯重建驱动
+    r_tgt = train_rate(0.25, 10.0)       # 目标 0.25 + 强 λ → 铰链在目标处停住
+    print(f"[ok] 预算目标铰链: 无目标→rate={r_free:.3f}, 目标0.25→rate={r_tgt:.3f}")
+    assert r_free > r_tgt, f"无目标应保留更多: {r_free} vs {r_tgt}"
+    assert 0.05 <= r_tgt <= 0.45, f"目标铰链失控(应≈0.25): {r_tgt}"
 
     # ── 5. 推理: 同一 forward（eval + no_grad）──
     model.eval()
