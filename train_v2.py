@@ -308,8 +308,8 @@ def main():
     acc.wait_for_everyone()
     if acc.is_main_process:
         sd = acc.unwrap_model(model).state_dict()
-        sd = {k: (v.to(torch.bfloat16) if v.is_floating_point() else v)
-              for k, v in sd.items()}
+        # 必须 fp32: 本模型重建精度极高(L1~0.001), bf16 导出会因权重量化
+        # 使 L1 劣化约 2 倍(实测 0.0011 → 0.0021)。不省这个空间。
         final = os.path.join(args.output_dir, "final_model.pt")
         torch.save(sd, final)
         info = {"input_size": [W, H], "canvas": [CW, CH],
@@ -319,10 +319,11 @@ def main():
                 "dino_dir": args.dino_dir,
                 "text_decoder": bool(args.text_decoder),
                 "qwen_dir": args.qwen_dir if args.text_decoder else None,
-                "pad_token_id": pad_id if args.text_decoder else None}
+                "pad_token_id": pad_id if args.text_decoder else None,
+                "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
             json.dump(info, f, indent=2)
-        acc.print(f"[final] {final} 已保存 (bf16, 含 DINO 权重)")
+        acc.print(f"[final] {final} 已保存 (fp32, 含 DINO 权重)")
 
 
 if __name__ == "__main__":

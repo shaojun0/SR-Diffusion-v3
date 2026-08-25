@@ -84,5 +84,7 @@ NUM_GPUS=2 ./run_v2_train.sh \
   模型），默认冻结（--unfreeze_text_embed 解冻）; 优化器只收可训练参数。
 - 检查点: `accelerate.save_state` → `output_dir/ckpt-<step>`；续训
   `--resume output_dir/ckpt-<step>`。最终推理权重: `output_dir/final_model.pt`
-  （bf16 state_dict, 含 DINO + 可选 TextDecoder）。
+  （**fp32** state_dict, 含 DINO + 可选 TextDecoder —— 勿用 bf16 导出,
+  实测权重量化会使重建 L1 劣化约 2 倍）。
+- 还原精度 vs z_s 前缀扫描: `python infer_k_sweep.py --final_model ...`
 

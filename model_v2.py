@@ -181,13 +181,15 @@ class ReEncoder(nn.Module):
 class FeatureDecoder(nn.Module):
     """块掩码解码器: 从 z_cls + z_s 解码出完整特征图 F_hat (B,N,D)。
 
-    输入序列（恒长 2N+1）: [z_cls(1); z_s(N, 全量); <patch_token>×N]
+    输入序列: [z_cls(1); z_s(k, k∈[1,N]); <patch_token>×N]，长度 N+k+1
     注意力掩码（True=屏蔽，torch 2.x bool 约定）:
-        z 部分 (0..N)        → 因果链: z 行 i 只见 z≤i + 全部 patch 行
-        patch 部分 (N+1..2N) → 全局: 见所有人、被所有人见
+        z 部分 (0..k)        → 因果链: z 行 i 只见 z≤i + 全部 patch 行
+        patch 部分 (k+1..N+k) → 全局: 见所有人、被所有人见
     掩码在 forward 内现算（build_prefix_mask），按实际序列长度构建。
     输出: patch 位置的最终表示 = F_hat（L1 监督 vs DINO patch 特征）。
 
+    · 支持 z_s 前缀输入（k<N，"预算/渐进还原"场景）: 只喂前 k 个 z_s 仍
+      输出全量 N 个 patch 重建；k=N 时与全量语义完全一致（向后兼容）。
     · 单栈自注意力 + 块掩码（无 query/cross-attention 两套机制）；
     · z 前缀链（因果）与 encoder 侧 causal specials 语义一致:
       每个 z 是"前缀 0..i 的表示"，patch 全局汇聚这些前缀；
@@ -213,16 +215,17 @@ class FeatureDecoder(nn.Module):
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
         B = z_cls.shape[0]
         N = self.num_patches
+        k = z_s.shape[1]                                   # z_s 前缀长度, 1≤k≤N
         patch_tokens = self.patch_token.expand(B, N, -1)   # (B,N,D)
-        x = torch.cat([z_cls, z_s, patch_tokens], dim=1)   # (B,2N+1,D)
+        x = torch.cat([z_cls, z_s, patch_tokens], dim=1)   # (B,N+k+1,D)
         L = x.shape[1]
-        # forward 内现算掩码（True=屏蔽; z 区域 0..N 因果，尾部=patch 全局）
-        self.attn_mask = build_prefix_mask(L, 0, N + 1, device=x.device)
+        # forward 内现算掩码（True=屏蔽; z 区域 0..k 因果，尾部=patch 全局）
+        self.attn_mask = build_prefix_mask(L, 0, k + 1, device=x.device)
         x = x + self.pos_embed[:, :L, :]
         for layer in self.layers:
             x = layer(x, src_mask=self.attn_mask)
         x = self.norm(x)
-        return x[:, N + 1:]                                # (B,N,D) patch 输出
+        return x[:, k + 1:]                                # (B,N,D) patch 输出
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -578,6 +581,20 @@ if __name__ == "__main__":
         assert not dm[i, N + 1:].any()               #  可见全部 patch 行
     assert not dm[N + 1:].any()                      # patch 行全局
     print(f"[ok] Decoder block mask: z 因果链 + patch 全局, 结构正确")
+
+    # ── 3b. FeatureDecoder z_s 前缀(k<N): 掩码 z_end=k+1, 输出仍全量 N ──
+    z_cls_t = torch.randn(2, 1, D)
+    k = 5
+    F_hat_p = model.decoder(z_cls_t, torch.randn(2, k, D))
+    assert F_hat_p.shape == (2, N, D), F_hat_p.shape       # 前缀仍出全量 N
+    dm_p = model.decoder.attn_mask                         # (N+k+1, N+k+1)
+    assert dm_p.shape == (N + k + 1, N + k + 1)
+    for i in range(k + 1):                                 # z 行 0..k: 前缀内因果
+        assert not dm_p[i, :i + 1].any()
+        assert dm_p[i, i + 1:k + 1].all()                  # 屏蔽前缀内后面的 z
+        assert not dm_p[i, k + 1:].any()                   # 仍可见全部 patch 行
+    assert not dm_p[k + 1:].any()                          # patch 行全局
+    print(f"[ok] Decoder z_s 前缀: k={k}<N 掩码 z_end=k+1 正确, 输出全量 {N} patch")
 
     # ── 4. 梯度流向（整模型可训）──
     out["loss"].backward()
