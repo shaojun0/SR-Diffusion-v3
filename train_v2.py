@@ -133,6 +133,11 @@ def main():
 
     # ── 模型: DINOv2-large 不冻结 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
+    # 权重带 mask_token(use_mask_token=True) 但本任务不传 bool_masked_pos,
+    # 该参数从不参与前向 → DDP 报"未用参数"。移除并关掉 flag。
+    if getattr(dino.config, "use_mask_token", False):
+        dino.config.use_mask_token = False
+        del dino.embeddings.mask_token
     # 不调用 requires_grad_(False) —— 参数全部可训练
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
