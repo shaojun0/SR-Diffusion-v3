@@ -80,6 +80,8 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
         z 部分因果链（z 行 i 只见 z≤i + 全部 patch 行）；patch 部分
         全局（见所有人、被所有人见）；输出 = patch 位置的表示 = F_hat。
     两处共用同一语义: "潜变量前缀链 + 输出侧全局汇聚"，k = 链长。
+    掩码（build_prefix_mask）在 forward 内现算、按实际序列长度构建：
+    牺牲一点速度，换可扩展性（变长序列 / 运行时切换掩码只改传参）。
 
 用法
 ----
@@ -124,6 +126,29 @@ class SpecialTokenBank(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
+# build_prefix_mask — 块状前缀掩码（forward 内现算，可扩展）
+# ═══════════════════════════════════════════════════════════════
+
+def build_prefix_mask(seq_len: int, z_start: int, z_end: int,
+                      device: torch.device = None) -> Tensor:
+    """构建块状前缀注意力掩码（torch bool，True=屏蔽）。
+
+    布局: [z 区域 (z_start..z_end-1) | 尾部 (z_end..seq_len-1)]
+        · z 行 i: 屏蔽 z 列 (i+1..z_end-1)（因果链），可看尾部（全局）
+        · 尾部行: 全开放（全局，见所有人、被所有人见）
+    用于 ReEncoder（z=specials 1..N，尾部=patches）与 FeatureDecoder
+    （z=z_cls+z_s 0..N，尾部=<patch_token>×N），传不同 z_start/z_end 即可。
+
+    在 forward 内现算而非 __init__ 缓存: 牺牲一点速度，换可扩展性——
+    之后支持变长序列（z 裁剪）、运行时切换掩码都只需改传参。
+    """
+    m = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+    for i in range(z_start, z_end):
+        m[i, i + 1:z_end] = True          # 屏蔽 z 内部"后面的"
+    return m
+
+
+# ═══════════════════════════════════════════════════════════════
 # ReEncoder — pass 2, 组合编码器 [cls; specials; patches]
 #   （内联自 v1 model_phase1.py，行为不变）
 # ═══════════════════════════════════════════════════════════════
@@ -141,6 +166,7 @@ class ReEncoder(nn.Module):
         patches(N+1..2N)    → 全局（图像无时序，全双向）
     即 M[i,j]=1 除 special 行 i 的 special 列 j>i 之外——special p 的编码
     z_s[p] 不依赖任何"后面的 special"（前缀稳定性：直接路径上）。
+    掩码在 forward 内现算（build_prefix_mask），按实际序列长度构建。
 
     注意: 当前实现里 patches 仍会关注 specials（M 的 1_{patch×special} 块），
     因此若将来要"encoder 输入也裁前缀"以省算力，需同时把 patch→special
@@ -156,6 +182,7 @@ class ReEncoder(nn.Module):
                  causal_specials: bool = True):
         super().__init__()
         self.num_patches = num_patches
+        self.causal_specials = causal_specials
         L = 2 * num_patches + 1              # cls + N specials + N patches
         self.pos_embed = nn.Parameter(torch.randn(1, L, dim) * 0.02)
         self.layers = nn.ModuleList([
@@ -165,15 +192,13 @@ class ReEncoder(nn.Module):
             ) for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
-        # 块状注意力掩码（True=屏蔽，torch 2.x bool 掩码约定）: [cls; specials; patches]
-        m = torch.zeros(L, L, dtype=torch.bool)
-        if causal_specials:
-            for i in range(1, num_patches + 1):      # special 行 i
-                m[i, i + 1:num_patches + 1] = True   # 屏蔽后面的 special
-        self.register_buffer("attn_mask", m)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.pos_embed[:, :x.shape[1], :]   # (B, 2N+1, D)
+        L = x.shape[1]
+        # forward 内现算掩码（True=屏蔽; 可扩展: 变长/运行时切换只改传参）
+        z_end = self.num_patches + 1 if self.causal_specials else 1
+        self.attn_mask = build_prefix_mask(L, 1, z_end, device=x.device)
+        x = x + self.pos_embed[:, :L, :]
         for layer in self.layers:
             x = layer(x, src_mask=self.attn_mask)
         return self.norm(x)
@@ -187,9 +212,10 @@ class FeatureDecoder(nn.Module):
     """块掩码解码器: 从 z_cls + z_s 解码出完整特征图 F_hat (B,N,D)。
 
     输入序列（恒长 2N+1）: [z_cls(1); z_s(N, 未选位置已填 pad); <patch_token>×N]
-    注意力掩码（True=允许）:
+    注意力掩码（True=屏蔽，torch 2.x bool 约定）:
         z 部分 (0..N)        → 因果链: z 行 i 只见 z≤i + 全部 patch 行
         patch 部分 (N+1..2N) → 全局: 见所有人、被所有人见
+    掩码在 forward 内现算（build_prefix_mask），按实际序列长度构建。
     输出: patch 位置的最终表示 = F_hat（L1 监督 vs DINO patch 特征）。
 
     与旧版（query cross-attention）的差异:
@@ -197,7 +223,8 @@ class FeatureDecoder(nn.Module):
         · z 前缀链（因果）与 encoder 侧 causal specials 语义一致:
           每个 z 是"前缀 0..i 的表示"，patch 全局汇聚这些前缀；
         · 若不想让 z 看到 patch（更纯粹的"潜变量前缀→输出"语义），
-          把 z 行的 patch 列也置 False（1_{6×5} 块的取舍，见模块头）。
+          在 build_prefix_mask 调用处把 z 行的尾部列也置 True（屏蔽）
+          （1_{6×5} 块的取舍，见模块头）。
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
@@ -214,18 +241,16 @@ class FeatureDecoder(nn.Module):
             ) for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
-        # 块状掩码（True=屏蔽，torch 2.x bool 约定）: [z_cls; z_s; patches]
-        m = torch.zeros(L, L, dtype=torch.bool)
-        for i in range(num_patches + 1):         # z 行 0..N
-            m[i, i + 1:num_patches + 1] = True   # 屏蔽后面的 z（z 内部因果）
-        self.register_buffer("attn_mask", m)
 
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
         B = z_cls.shape[0]
         N = self.num_patches
         patch_tokens = self.patch_token.expand(B, N, -1)   # (B,N,D)
         x = torch.cat([z_cls, z_s, patch_tokens], dim=1)   # (B,2N+1,D)
-        x = x + self.pos_embed
+        L = x.shape[1]
+        # forward 内现算掩码（True=屏蔽; z 区域 0..N 因果，尾部=patch 全局）
+        self.attn_mask = build_prefix_mask(L, 0, N + 1, device=x.device)
+        x = x + self.pos_embed[:, :L, :]
         for layer in self.layers:
             x = layer(x, src_mask=self.attn_mask)
         x = self.norm(x)
@@ -485,9 +510,10 @@ if __name__ == "__main__":
         assert not am[i, :i + 1].any()               # special i 可见 cls + specials≤i
         assert am[i, i + 1:N + 1].all()              # 屏蔽后面的 special
         assert not am[i, N + 1:].any()               # special i 可见全部 patches
-    # 关掉 causal 时掩码全 False（回退全双向）
+    # 关掉 causal 时掩码全 False（回退全双向；掩码 forward 内现算，先跑一次）
     m_free = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
                         causal_specials=False, reencoder_depth=2, decoder_depth=2)
+    _ = m_free.re_encoder(torch.randn(2, 2 * N + 1, D))
     assert not m_free.re_encoder.attn_mask.any()
     print(f"[ok] ReEncoder block mask: causal_specials=True 结构正确, "
           f"causal_specials=False 全开放回退")
