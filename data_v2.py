@@ -82,11 +82,12 @@ def fit_to_canvas(img: Image.Image, canvas=(CANVAS_W, CANVAS_H),
 
 
 # ═══════════════════════════════════════════════════════════════
-# Dataset — parquet（datasets 库）→ 原始 image bytes
+# Dataset — parquet（datasets 库）→ 原始 image bytes + 中文 caption
 # ═══════════════════════════════════════════════════════════════
 
 class ParquetImageDataset(Dataset):
-    """__getitem__ → {"image_bytes": bytes}。解码/变换/归一化交给 collate。
+    """__getitem__ → {"image_bytes": bytes, "image_caption": str|None,
+    "violations": str|None}。解码/变换/归一化/编码交给 collate。
 
     data_dir 下形如 train-*.parquet / test-*.parquet 的分片, image 列为
     struct{bytes, path}（datasets parquet 默认结构）。
@@ -104,22 +105,43 @@ class ParquetImageDataset(Dataset):
         return len(self.ds)
 
     def __getitem__(self, idx: int) -> dict:
-        im = self.ds[idx]["image"]
-        b = im["bytes"] if isinstance(im, dict) else im
-        return {"image_bytes": b}
+        row = self.ds[idx]
+        im = row["image"]
+        return {
+            "image_bytes": im["bytes"] if isinstance(im, dict) else im,
+            "image_caption": row.get("image_caption"),
+            "violations": row.get("violations"),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════
 # Collator — bytes → fit_to_canvas(1600:900) → 模型输入 → 张量
+# （text 模式可选: caption → Qwen tokenizer → text_ids）
 # ═══════════════════════════════════════════════════════════════
+
+DEFAULT_TEXT_TEMPLATE = "描述这张建筑工地图片：{caption}"
+
 
 class V2Collator:
     def __init__(self, model_size=(448, 252), canvas=(CANVAS_W, CANVAS_H),
-                 angle_step: float = 0.5):
+                 angle_step: float = 0.5, tokenizer=None,
+                 max_text_len: int = 256, pad_token_id: int = 0,
+                 text_template: str = DEFAULT_TEXT_TEMPLATE):
         self.model_w, self.model_h = model_size
         assert abs(self.model_w / self.model_h - canvas[0] / canvas[1]) < 1e-6, \
             "模型输入必须与画布同为 16:9, 否则缩放会变形"
         self.canvas, self.angle_step = canvas, angle_step
+        self.tokenizer = tokenizer          # None = 纯重建模式
+        self.max_text_len = max_text_len
+        self.pad_token_id = pad_token_id
+        self.text_template = text_template
+
+    def _format_text(self, caption, violations) -> str:
+        cap = caption or ""
+        text = self.text_template.format(caption=cap)
+        if violations:
+            text += f"\n隐患：{violations}"
+        return text
 
     def __call__(self, batch: list) -> dict:
         xs = []
@@ -131,7 +153,19 @@ class V2Collator:
             arr = np.asarray(img, np.float32)
             arr = (arr - DINO_MEAN) / DINO_STD
             xs.append(torch.from_numpy(arr).permute(2, 0, 1))
-        return {"pixel_values": torch.stack(xs)}
+        out = {"pixel_values": torch.stack(xs)}
+        if self.tokenizer is not None:
+            # 文字: template(+隐患) → tokenize(截断) → batch 内动态 padding
+            texts = [self._format_text(it["image_caption"], it["violations"])
+                     for it in batch]
+            ids = self.tokenizer(texts, truncation=True,
+                                 max_length=self.max_text_len)["input_ids"]
+            T = max(max(len(t) for t in ids), 2)          # 错位 CE 至少 2 token
+            padded = torch.full((len(ids), T), self.pad_token_id, dtype=torch.long)
+            for r, t in enumerate(ids):
+                padded[r, :len(t)] = torch.tensor(t[:T], dtype=torch.long)
+            out["text_ids"] = padded
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -184,11 +218,26 @@ if __name__ == "__main__":
     Image.new("RGB", (1200, 900), (128, 64, 200)).save(buf, format="JPEG")
     b = buf.getvalue()
     coll = V2Collator()
-    out = coll([{"image_bytes": b}, {"image_bytes": b}])
+    out = coll([{"image_bytes": b, "image_caption": None, "violations": None},
+                {"image_bytes": b, "image_caption": None, "violations": None}])
     assert out["pixel_values"].shape == (2, 3, 252, 448), out["pixel_values"].shape
     assert out["pixel_values"].dtype == torch.float32
     assert out["pixel_values"].abs().max() < 10
     print(f"[ok] V2Collator: {tuple(out['pixel_values'].shape)} 归一化范围 "
           f"[{out['pixel_values'].min():.2f}, {out['pixel_values'].max():.2f}]")
+
+    # 5) 文字模式: 假 tokenizer → text_ids (动态 padding, ≥2, pad 补位)
+    class FakeTok:
+        pad_token_id = 7
+        def __call__(self, texts, **kw):
+            return {"input_ids": [list(range(2, 2 + (len(t) % 5) + 1)) for t in texts]}
+    coll_t = V2Collator(tokenizer=FakeTok(), max_text_len=8, pad_token_id=7)
+    out_t = coll_t([{"image_bytes": b, "image_caption": "塔吊", "violations": None},
+                    {"image_bytes": b, "image_caption": None, "violations": "无安全帽"}])
+    assert out_t["text_ids"].shape == (2, 5), out_t["text_ids"].shape
+    assert out_t["text_ids"].min() >= 2 and (out_t["text_ids"] == 7).any()  # 有 pad
+    assert out_t["text_ids"].size(1) >= 2
+    print(f"[ok] V2Collator text: text_ids {tuple(out_t['text_ids'].shape)} "
+          f"pad={out_t['text_ids'][-1].tolist()}")
 
     print("\nALL DATA CHECKS PASSED")

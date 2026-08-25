@@ -60,11 +60,18 @@ text = model.generate(svd_matrix, prompt="描述这张图片：")
 多卡训练（train_v2.py + run_v2_train.sh）:
 
 ```bash
-# 双卡
+# 双卡（纯重建: L = L1 重建 DINO patch 特征）
 NUM_GPUS=2 ./run_v2_train.sh \
     --data_dir /root/autodl-tmp/construction_site \
     --dino_dir /root/autodl-tmp/models/dinov2-large \
     --output_dir output/phase1_v2
+
+# 双卡（多任务: + 文字自回归, L = L1 + CE, 中文 caption 为目标）
+NUM_GPUS=2 ./run_v2_train.sh \
+    --data_dir /root/autodl-tmp/construction_site \
+    --dino_dir /root/autodl-tmp/models/dinov2-large \
+    --qwen_dir /root/autodl-tmp/models/Qwen3.8-27B --text_decoder \
+    --output_dir output/phase1_v2_text
 ```
 
 要点:
@@ -73,7 +80,9 @@ NUM_GPUS=2 ./run_v2_train.sh \
   torch 2.13 混合设备 conv dtype 报错）；权重保持 fp32。
 - 加载后移除 DINO `mask_token`（本任务不传 bool_masked_pos, 该参数不参与
   前向, DDP 会报未用参数）。
+- 文字模式: Qwen 词表 embedding 从 safetensors 分片直接读取（不加载全
+  模型），默认冻结（--unfreeze_text_embed 解冻）; 优化器只收可训练参数。
 - 检查点: `accelerate.save_state` → `output_dir/ckpt-<step>`；续训
   `--resume output_dir/ckpt-<step>`。最终推理权重: `output_dir/final_model.pt`
-  （bf16 state_dict, 含 DINO）。
+  （bf16 state_dict, 含 DINO + 可选 TextDecoder）。
 
