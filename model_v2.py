@@ -9,6 +9,7 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
     历史可找回），k 固定 = 全量 N——decoder 恒吃全部 z_s。
     后续若真需要预算（"少留也能重建"），再把 SelectHead/边界分布
     加回来。
+    后续该模型的编码器可想办法作为model.py的编码器，实现基于数据分布的极致token压缩。
 
 当前架构（无选择、无预算）:
     DINOv2(冻结) → cls + patch 特征 (B,257,D)
