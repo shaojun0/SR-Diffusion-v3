@@ -66,6 +66,18 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
     · 硬模式剪枝收益只在 decoder cross-attention（k vs N memory）；
       ReEncoder 仍全量计算（O((2N)²)）。
 
+块状注意力掩码（ReEncoder，causal_specials=True 默认）:
+    [cls; specials; patches] 的 (2N+1)×(2N+1) 掩码:
+        cls(0)           → 全局（见所有人、被所有人见）
+        specials(1..N)   → 只见 cls + specials≤i + 全部 patches（前缀链）
+        patches(N+1..2N) → 全局（图像无时序，全双向）
+    special p 的编码 z_s[p] 不依赖"后面的 special"（前缀稳定性）——每个
+    special 就是"前缀 0..p 的表示"（呼应时序前缀问题里 GPT 的位置表示）；
+    配合 decoder 侧的前缀选择，k 的语义 = "这条因果链用多长"。
+    注意: patches 仍可关注 specials（1_{patch×special} 块），因此
+    z_s[:k] 对"encoder 输入裁剪"不变量不成立——将来若想裁 encoder
+    输入省算力，需同时屏蔽 patch→special 关注（见 ReEncoder docstring）。
+
 用法
 ----
     model = SRPhase1V2(dinov2=dinov2_model, num_patches=256, dim=768)
@@ -73,7 +85,7 @@ SR-Diffusion Phase 1 v2 — 可导软前缀掩码（边界分布版）
     out = model(pixel_values, hard_mode=True)     # 推理（argmax 硬剪枝）
     loss = out["loss"]; loss.backward()
 
-    自检: python model_v2.py（形状 / 梯度流向 / 预算响应 / 硬模式）
+    自检: python model_v2.py（形状 / 掩码结构 / 梯度流向 / 预算响应 / 硬模式）
 """
 
 import torch
@@ -113,18 +125,31 @@ class SpecialTokenBank(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 
 class ReEncoder(nn.Module):
-    """对 [cls; 特殊 token; patch] 组合序列做全量自注意力。
+    """对 [cls; 特殊 token; patch] 组合序列做自注意力（带块状掩码）。
 
     输出中特殊 token 位置的表示 z_s 是前缀选择的唯一候选；patch 位置的
     输出直接丢弃。输入始终是完整 2N+1 序列（训练/推理全量计算），预算
     收益体现在 decoder 的 cross-attention（k vs N memory）。
+
+    块状注意力掩码（causal_specials=True，默认）:
+        cls(0)              → 全局（见所有人、被所有人见）
+        specials(1..N)      → 只见 cls + specials≤i + 全部 patches（前缀链）
+        patches(N+1..2N)    → 全局（图像无时序，全双向）
+    即 M[i,j]=1 除 special 行 i 的 special 列 j>i 之外——special p 的编码
+    z_s[p] 不依赖任何"后面的 special"（前缀稳定性：直接路径上）。
+
+    注意: 当前实现里 patches 仍会关注 specials（M 的 1_{patch×special} 块），
+    因此若将来要"encoder 输入也裁前缀"以省算力，需同时把 patch→special
+    关注也屏蔽（patches 只关注 patches+cls），否则 patch 编码会经 specials
+    间接变化、破坏 z_s[:k] 的裁剪不变性。
 
     Input:  x (B, 2N+1, D) = [cls; special_1..N; patch_1..N]
     Output: z (B, 2N+1, D)
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256, depth: int = 4,
-                 heads: int = 8, mlp_ratio: float = 4.0):
+                 heads: int = 8, mlp_ratio: float = 4.0,
+                 causal_specials: bool = True):
         super().__init__()
         self.num_patches = num_patches
         L = 2 * num_patches + 1              # cls + N specials + N patches
@@ -136,11 +161,17 @@ class ReEncoder(nn.Module):
             ) for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
+        # 块状注意力掩码（True=允许）: [cls; specials; patches]
+        m = torch.ones(L, L, dtype=torch.bool)
+        if causal_specials:
+            for i in range(1, num_patches + 1):      # special 行 i
+                m[i, i + 1:num_patches + 1] = False  # 不能见后面的 special
+        self.register_buffer("attn_mask", m)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.pos_embed[:, :x.shape[1], :]   # (B, 2N+1, D)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, src_mask=self.attn_mask)
         return self.norm(x)
 
 
@@ -248,6 +279,7 @@ class SRPhase1V2(nn.Module):
         decoder_depth: int = 4,
         heads: int = 8,
         mlp_ratio: float = 4.0,
+        causal_specials: bool = True,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -262,7 +294,8 @@ class SRPhase1V2(nn.Module):
         self.special_bank = SpecialTokenBank(num_patches=num_patches, dim=dim)
         self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches,
                                     depth=reencoder_depth, heads=heads,
-                                    mlp_ratio=mlp_ratio)
+                                    mlp_ratio=mlp_ratio,
+                                    causal_specials=causal_specials)
         self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches,
                                       depth=decoder_depth, heads=heads,
                                       mlp_ratio=mlp_ratio)
@@ -439,6 +472,22 @@ if __name__ == "__main__":
     print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} "
           f"mask{tuple(out['mask_soft'].shape)} p{tuple(out['p'].shape)} "
           f"k={out['k'].tolist()} rate_soft={out['rate_soft'].item():.3f}")
+
+    # ── 1.5 块状注意力掩码结构（causal specials）──
+    am = model.re_encoder.attn_mask                  # (2N+1, 2N+1) bool
+    assert am.shape == (2 * N + 1, 2 * N + 1)
+    assert am[0].all()                               # cls 全局
+    assert am[N + 1:].all()                          # patches 全局（全双向）
+    for i in range(1, N + 1):
+        assert am[i, :i + 1].all()                   # special i 见 cls + specials≤i
+        assert not am[i, i + 1:N + 1].any()          # 不见后面的 special
+        assert am[i, N + 1:].all()                   # special i 见全部 patches
+    # 关掉 causal 时掩码全 1（回退旧行为）
+    m_free = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                        causal_specials=False, reencoder_depth=2, decoder_depth=2)
+    assert m_free.re_encoder.attn_mask.all()
+    print(f"[ok] block mask: causal_specials=True 结构正确, "
+          f"causal_specials=False 全 1 回退")
 
     # ── 2. 梯度流向 SelectHead（旧版断链的回归测试）──
     out["loss"].backward()
