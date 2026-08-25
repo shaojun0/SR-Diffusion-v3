@@ -45,3 +45,35 @@ model = SRQwenVLv10.from_pretrained("./output/final")
 model.cuda()
 text = model.generate(svd_matrix, prompt="描述这张图片：")
 ```
+
+---
+
+## Phase 1 v2 — 特征压缩自监督训练（DINOv2-large 不冻结）
+
+架构（model_v2.py）: DINOv2-large(可训练) → ReEncoder → FeatureDecoder,
+唯一损失 = L1 重建 DINO patch 特征。
+
+数据管线（data_v2.py）: 原图 → **旋转到最优角度 → 等比缩放 → 居中填充
+到 1600×900（16:9）画布**。轮廓不变形（只做刚体旋转 + 均匀缩放），
+信息量最大化（最优角使画布内内容面积最大）→ 16:9 模型输入 (448×252)。
+
+多卡训练（train_v2.py + run_v2_train.sh）:
+
+```bash
+# 双卡
+NUM_GPUS=2 ./run_v2_train.sh \
+    --data_dir /root/autodl-tmp/construction_site \
+    --dino_dir /root/autodl-tmp/models/dinov2-large \
+    --output_dir output/phase1_v2
+```
+
+要点:
+- DINOv2-large 权重来自 ModelScope `facebook/dinov2-large`（HF 官方站不可达）。
+- bf16 用显式 `torch.autocast`（规避 accelerate prepare 自动包装 +
+  torch 2.13 混合设备 conv dtype 报错）；权重保持 fp32。
+- 加载后移除 DINO `mask_token`（本任务不传 bool_masked_pos, 该参数不参与
+  前向, DDP 会报未用参数）。
+- 检查点: `accelerate.save_state` → `output_dir/ckpt-<step>`；续训
+  `--resume output_dir/ckpt-<step>`。最终推理权重: `output_dir/final_model.pt`
+  （bf16 state_dict, 含 DINO）。
+
