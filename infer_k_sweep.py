@@ -7,9 +7,12 @@ SR-Diffusion Phase 1 v2 — 还原精度 vs z_s 前缀长度 k 扫描（推理�
 
 两种模式:
     1) k 扫描（默认）: 前缀长度扫描。训练后预期 k=1..32 平台期消失。
+       全家桶模型（--all_k）: 只扫训练时 k_list 内的 k（一次前向出全部，
+       须与训练 k_list 一致，否则 state_dict 不匹配）。
     2) 滑窗探针（--window N）: 扫描所有连续 N-token 窗口的还原 L1,
        验证"信息前置"（DESIGN §7.2）——前段窗口应明显好于后段；
        训练前实测任意 32-token 窗口 ≈0.0033 无差异（信息摊匀）。
+       （与 --all_k 互斥: 全家桶只支持前缀扫描）
 
 用法:
     python infer_k_sweep.py \
@@ -54,6 +57,13 @@ def parse_args():
                         "window-token 窗口的还原 L1，验证信息前置")
     p.add_argument("--window_chunk", type=int, default=64,
                    help="窗口探针分块大小（控制峰值显存，默认 64）")
+    p.add_argument("--all_k", action="store_true",
+                   help="全家桶模型（训练时 --prefix_all_k）: 构造 "
+                        "FeatureDecoderAllK，k 扫描只扫 --k_list 内的 k"
+                        "（一次前向出全部; 与 --window 互斥）")
+    p.add_argument("--k_list", default="",
+                   help="全家桶 k 集, 逗号分隔（**必须与训练时一致**, "
+                        "否则 state_dict 不匹配）; 空=自动 log 网格含全量")
     return p.parse_args()
 
 
@@ -135,8 +145,25 @@ def main():
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
+    if args.all_k and args.window > 0:
+        raise SystemExit("--all_k 与 --window 互斥（全家桶只支持 k_list 前缀扫描）")
+    k_list = None
+    if args.all_k:
+        k_list = [int(v) for v in args.k_list.split(",") if v.strip()]
+        if not k_list:
+            k_list = [1]
+            v = 2
+            while v < num_patches:
+                k_list.append(v)
+                v *= 2
+            k_list.append(num_patches)
+        if num_patches not in k_list:
+            k_list.append(num_patches)
+        k_list = sorted(set(k_list))
+        assert all(1 <= kk <= num_patches for kk in k_list), k_list
+        print(f"[allk] k_list={k_list} —— k 扫描只扫这些 k（须与训练一致）")
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       dim=dino.config.hidden_size)
+                       dim=dino.config.hidden_size, k_list=k_list)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected
@@ -159,10 +186,13 @@ def main():
         window_sweep(args, model, loader, num_patches, W, H)
         return
 
-    # ── k 扫描: 0..kmax + 锚点 + 全量 N ──
+    # ── k 扫描: 单 k 模式 0..kmax+锚点+全量；全家桶模式只扫 k_list ──
     anchors = [int(v) for v in args.anchors.split(",") if v.strip()]
-    ks = sorted(set([0] + list(range(1, args.kmax + 1)) + anchors
-                    + [num_patches]))
+    if getattr(model, "k_list", None):
+        ks = list(model.k_list)      # 全家桶: 只扫训练时的 k 集
+    else:
+        ks = sorted(set([0] + list(range(1, args.kmax + 1)) + anchors
+                        + [num_patches]))
     sum_l1 = {k: 0.0 for k in ks}
     sum_l1sq = {k: 0.0 for k in ks}
     n = 0
@@ -172,12 +202,19 @@ def main():
             x = batch["pixel_values"].cuda()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 z_cls, z_s, patch = model._encode_z(x)
-                for k in ks:
-                    F_hat = model.decoder(z_cls, z_s[:, :k])
-                    # fp32 度量（bf16 分辨率不足以量化 ~0.001 的 L1）
-                    l1 = (F_hat.float() - patch.float()).abs().mean(dim=(1, 2))
-                    sum_l1[k] += l1.sum().item()
-                    sum_l1sq[k] += (l1 ** 2).sum().item()
+                if getattr(model, "k_list", None):
+                    F_hat = model.decoder(z_cls, z_s)   # (B,N,K,D) 一次前向
+                    for k, kk in enumerate(model.k_list):
+                        l1 = (F_hat[:, :, k].float() - patch.float()).abs().mean(dim=(1, 2))
+                        sum_l1[kk] += l1.sum().item()
+                        sum_l1sq[kk] += (l1 ** 2).sum().item()
+                else:
+                    for k in ks:
+                        F_hat = model.decoder(z_cls, z_s[:, :k])
+                        # fp32 度量（bf16 分辨率不足以量化 ~0.001 的 L1）
+                        l1 = (F_hat.float() - patch.float()).abs().mean(dim=(1, 2))
+                        sum_l1[k] += l1.sum().item()
+                        sum_l1sq[k] += (l1 ** 2).sum().item()
             n += x.shape[0]
             if (bi + 1) % 10 == 0 or (bi + 1) == len(loader):
                 print(f"  ... {n}/{n_total} ({time.time() - t0:.0f}s)",

@@ -47,6 +47,15 @@ SR-Diffusion Phase 1 v2 — 训练（v2.1: 可选文字自回归）
         --prefix_curriculum --prefix_p_full 0.5 --prefix_k_min 8 \
         --prefix_k_count 3 \
         --output_dir output/phase1_v2_prefix
+
+    全家桶（三维方案 C，DESIGN §10，与 --prefix_curriculum 互斥）:
+    --prefix_all_k —— FeatureDecoderAllK 一次前向输出所有前缀 k 的重建
+    (B,N,K,D) 并监督全部（k 是显式结构维度，非循环展开）; 推理 k 受限
+    k_list（最近邻）; --prefix_k_list 指定 k 集（空=自动 log 网格含全量）:
+    accelerate launch --multi_gpu --num_processes 2 \
+        train_v2.py --data_dir ... --dino_dir ... \
+        --prefix_all_k --prefix_k_list "1,4,16,64,256,576" \
+        --output_dir output/phase1_v2_allk
 """
 import argparse
 import glob
@@ -157,6 +166,14 @@ def parse_args():
                    help="power 形状指数 p（--prefix_w power 时生效）")
     p.add_argument("--prefix_w_floor", type=float, default=0.05,
                    help="w(k) 地板（防全量分支权重趋零/数值过小）")
+    # ── 全家桶（三维方案 C，DESIGN §10）: 与 --prefix_curriculum 互斥 ──
+    p.add_argument("--prefix_all_k", action="store_true",
+                   help="启用全家桶 decoder（FeatureDecoderAllK）: 一次前向输出"
+                        "所有前缀 k 的重建 (B,N,K,D)，一步监督全部——k 是显式"
+                        "结构维度（非循环展开）；推理 k 受限 k_list（最近邻）")
+    p.add_argument("--prefix_k_list", default="",
+                   help="全家桶 k 集, 逗号分隔（如 '1,4,16,64,256,576'）; "
+                        "空=自动 log 网格 [1,2,4,...,N/2,N]（含全量保底）")
     return p.parse_args()
 
 
@@ -164,19 +181,31 @@ def parse_args():
 # Eval — 仅主进程, 全量 test 分片
 # ═══════════════════════════════════════════════════════════════
 
-def evaluate(acc, model: torch.nn.Module, loader: DataLoader) -> float:
+def evaluate(acc, model: torch.nn.Module, loader: DataLoader, args=None) -> float:
     model.eval()
     sums = {}
     n = 0
+    wfn = None
+    if args is not None and getattr(model, "k_list", None):
+        wfn = lambda k: prefix_weight(k, model.num_patches, args.prefix_w,
+                                      args.prefix_w_p, args.prefix_w_floor)
     with torch.no_grad():
         for batch in loader:
             x = batch["pixel_values"].to(acc.device)   # eval loader 未 prepare, 显式搬设备
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = model(x, text_ids=batch.get("text_ids"))
+                if getattr(model, "k_list", None):       # 全家桶: 平均 + 全量块
+                    out = model.forward_all_k(x, text_ids=batch.get("text_ids"),
+                                              w_fn=wfn)
+                else:
+                    out = model(x, text_ids=batch.get("text_ids"))
             bs = x.shape[0]
             for k in ("loss", "recon", "text_loss"):
                 if k in out:
                     sums[k] = sums.get(k, 0.0) + out[k].item() * bs
+            if getattr(model, "k_list", None) and model.num_patches in model.k_list:
+                idx = model.k_list.index(model.num_patches)   # 全量 k=N 块
+                sums["recon_full"] = sums.get("recon_full", 0.0) \
+                    + out["l1_per_k"][idx].item() * bs
             n += bs
     line = ", ".join(f"{k} {v / max(n, 1):.6f}" for k, v in sums.items())
     acc.print(f"[eval] {line}  (n={n})")
@@ -201,6 +230,26 @@ def main():
     CW, CH = (int(v) for v in args.canvas.lower().split("x"))
     assert W % 14 == 0 and H % 14 == 0, "DINOv2-large patch=14, 输入须为 14 的倍数"
     num_patches = (W // 14) * (H // 14)
+
+    # ── 全家桶 k 集（--prefix_all_k）: 与 --prefix_curriculum 互斥 ──
+    if args.prefix_all_k and args.prefix_curriculum:
+        raise SystemExit("--prefix_all_k 与 --prefix_curriculum 互斥，请二选一")
+    k_list = None
+    if args.prefix_all_k:
+        ks = [int(v) for v in args.prefix_k_list.split(",") if v.strip()]
+        if not ks:
+            ks = [1]
+            v = 2
+            while v < num_patches:
+                ks.append(v)
+                v *= 2
+            ks.append(num_patches)                  # 自动 log 网格, 含全量保底
+        if num_patches not in ks:
+            ks.append(num_patches)
+        k_list = sorted(set(ks))
+        assert all(1 <= kk <= num_patches for kk in k_list), k_list
+        acc.print(f"[prefix-allk] k_list={k_list} (K={len(k_list)}) —— 一次前向"
+                  f"监督全部前缀（k 为显式结构维度, 推理 k 受限 k_list 最近邻）")
 
     # mixed_precision="no" + 显式 torch.autocast(bf16)：本环境（torch 2.13）
     # 在「输入在 CPU、模型在 CUDA」且开 autocast 时 conv 会报 dtype 错，
@@ -262,7 +311,8 @@ def main():
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
-                       decoder_depth=args.decoder_depth, **text_kw)
+                       decoder_depth=args.decoder_depth,
+                       k_list=k_list, **text_kw)
     model.init_reencoder_from_dino(args.reencoder_depth)
     if args.text_decoder:
         emb = load_qwen_embedding(args.qwen_dir)
@@ -297,6 +347,8 @@ def main():
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
     # ── 训练循环（手动梯度累积: 显式、无插件魔法）──
+    wfn = (lambda k: prefix_weight(k, num_patches, args.prefix_w,
+                                   args.prefix_w_p, args.prefix_w_floor))
     if args.prefix_curriculum:
         assert 1 <= args.prefix_k_min <= num_patches, \
             f"prefix_k_min={args.prefix_k_min} 超出 [1,{num_patches}]"
@@ -319,7 +371,12 @@ def main():
             ctx = acc.no_sync(model) if micro % args.grad_accum != 0 else nullcontext()
             with ctx:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    if args.prefix_curriculum:
+                    if args.prefix_all_k:
+                        # 全家桶: 一次前向输出所有 k 的重建并监督全部
+                        # （k 是显式结构维度; 文字对每个 k 并行 CE）
+                        out = model.forward_all_k(x, text_ids=text_ids, w_fn=wfn)
+                        loss = out["loss"]
+                    elif args.prefix_curriculum:
                         # 前缀课程: p_full 概率全量保底，否则采样 k。
                         # k_count=1 → 随机单 k；k_count>1 → 多 k 并行
                         # （重建/文字均对每个 k 前向后平均，一步覆盖所有尺度）
@@ -371,7 +428,7 @@ def main():
 
                 if test_loader is not None and global_step % args.eval_every == 0:
                     if acc.is_main_process:
-                        evaluate(acc, model, test_loader)
+                        evaluate(acc, model, test_loader, args)
                     model.train()
 
                 if not args.smoke and global_step % args.save_every == 0:
@@ -400,6 +457,7 @@ def main():
                 "text_decoder": bool(args.text_decoder),
                 "qwen_dir": args.qwen_dir if args.text_decoder else None,
                 "pad_token_id": pad_id if args.text_decoder else None,
+                "k_list": k_list,
                 "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
             json.dump(info, f, indent=2)
@@ -468,6 +526,24 @@ if __name__ == "__main__":
     out_p["loss"].backward()
     print(f"  [curriculum] 多 k 并行 ks={ks_par}: recon={out_p['recon'].item():.4f} "
           f"text={out_p['text_loss'].item():.4f} → loss={out_p['loss'].item():.4f}")
-    print("[ok] 前缀课程: z_keep 统一前缀 + w(k) 加权损失 + 多 k 并行 梯度 正确")
+
+    # 全家桶（--prefix_all_k 路径）: forward_all_k 一次监督全部 k_list
+    m_allk = SRPhase1V2(FakeDinoS(), num_patches=16, dim=64,
+                        reencoder_depth=2, decoder_depth=2, vocab_size=128,
+                        qwen_hidden=64, max_text_len=32, text_decoder_depth=2,
+                        k_list=[16, 4, 1])
+    out_a = m_allk.forward_all_k(x, text_ids=tid,
+                                 w_fn=lambda k: prefix_weight(k, Nm))
+    assert out_a["F_hat"].shape == (2, Nm, 3, 64)
+    assert len(out_a["l1_per_k"]) == 3 and out_a["l1_per_k"][0].shape == ()
+    assert abs(out_a["loss"].item()
+               - (out_a["recon"].item() + out_a["text_loss"].item())) < 1e-5
+    out_a["loss"].backward()
+    assert m_allk.decoder.layers[0].linear1.weight.grad is not None
+    print(f"  [allk] k_list={m_allk.k_list}: recon={out_a['recon'].item():.4f} "
+          f"l1_per_k={[round(v.item(), 4) for v in out_a['l1_per_k']]} "
+          f"text={out_a['text_loss'].item():.4f} → loss={out_a['loss'].item():.4f}")
+    print("[ok] 前缀课程: z_keep 统一前缀 + w(k) 加权 + 多 k 并行 + "
+          "全家桶(forward_all_k) 梯度 正确")
 
     print("\nALL TRAIN CHECKS PASSED")

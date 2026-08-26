@@ -292,6 +292,93 @@ class FeatureDecoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
+# FeatureDecoderAllK — 全家桶解码器: 一次前向输出所有前缀 k 的重建
+# （"k 轴并入输出位置"，用户选定的三维方案 C）
+# ═══════════════════════════════════════════════════════════════
+
+def build_allk_mask(num_patches: int, k_list: list,
+                    device: torch.device = None) -> Tensor:
+    """全家桶掩码: [z_cls; z_s(1..N); out 块×K（每块 N 个位置）]。
+
+    True=屏蔽（torch 2.x 约定）。设计目标: out 块 k 的输出**只依赖**
+    {z_cls, z_s[:k], 同块 out} —— "任意前缀重建"一次前向全家桶，无跨 k 泄漏:
+        z_cls 行  : 只见自己（透传常量；若看任何 z_s 会被所有块共享 → 泄漏）
+        z_s[i] 行 : 只见 z_cls + z_s[:i]（内部因果链），**不看任何 out**
+                    （若看 out 块 k'，则块 k≥i 经 z_s[i] 间接拿到 k' 信息 → 泄漏）
+        out 块 k  : 见 z_cls + z_s[:k] + 同块全部 out；屏蔽 z_s[k:] 与其他块
+    """
+    N = num_patches
+    K = len(k_list)
+    assert K > 0 and all(0 <= kk <= N for kk in k_list), \
+        f"k_list={k_list} 须非空且 kk∈[0,{N}]"
+    L = 1 + N + N * K
+    m = torch.zeros(L, L, dtype=torch.bool, device=device)
+    z_end = N + 1                 # z_s 区域 1..N
+    out0 = N + 1
+    m[0, 1:] = True               # z_cls 行: 只见自己
+    for i in range(1, z_end):     # z_s 行: 内部因果 + 不看任何 out
+        m[i, i + 1:z_end] = True
+        m[i, out0:] = True
+    for k, kk in enumerate(k_list):          # out 行: 块 k 见 z_cls+z_s[:kk]+同块
+        b0 = out0 + k * N
+        b1 = b0 + N
+        for r in range(b0, b1):
+            m[r, 1 + kk:z_end] = True        # 屏蔽 z_s[kk+1..N]
+            m[r, out0:b0] = True             # 屏蔽前面块
+            m[r, b1:] = True                 # 屏蔽后面块
+    return m
+
+
+class FeatureDecoderAllK(nn.Module):
+    """全家桶解码器: 输入 [z_cls; z_s(全量); out 块×K] → (B,N,K,D)。
+
+    F_hat[:, :, k] = "只用前 k_list[k] 个 z_s 的重建" —— k 是显式结构维度，
+    一个前向同时给出所有 K 个前缀的重建，训练一步可监督全部（并行原生）。
+    与单 k FeatureDecoder 的差异（防泄漏所必需）:
+        · z_s 行不看输出（纯读出源；单 k 版 z_s 看 patch）;
+        · z_cls 行只见自己（透传常量条件）;
+        · 块内 out 保留全局双向（patch 间协作），块间全屏蔽。
+    注意: 推理时 k' ∉ k_list 只能取最近邻（K 集受限，见 DESIGN §10）。
+    """
+
+    def __init__(self, dim: int = 768, num_patches: int = 256,
+                 k_list: Optional[list] = None,
+                 heads: int = 8, depth: int = 4, mlp_ratio: float = 4.0):
+        super().__init__()
+        assert k_list, "FeatureDecoderAllK 需要 k_list"
+        self.num_patches = num_patches
+        self.k_list = sorted(set(k_list))          # 去重排序，块序 = 此序
+        self.K = len(self.k_list)
+        L = 1 + num_patches + num_patches * self.K
+        self.out_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)  # 共享输出 token
+        self.pos_embed = nn.Parameter(torch.randn(1, L, dim) * 0.02)
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=dim, nhead=heads, dim_feedforward=int(dim * mlp_ratio),
+                dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+            ) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
+        B, N, D = z_s.shape
+        assert N == self.num_patches, f"z_s={N} != num_patches={self.num_patches}"
+        outs = self.out_token.expand(B, N * self.K, -1)   # (B, N*K, D)
+        x = torch.cat([z_cls, z_s, outs], dim=1)          # (B, 1+N+NK, D)
+        L = x.shape[1]
+        self.attn_mask = build_allk_mask(N, self.k_list, device=x.device)
+        x = x + self.pos_embed[:, :L, :]
+        for layer in self.layers:
+            x = layer(x, src_mask=self.attn_mask)
+        x = self.norm(x)
+        # 展平顺序 = [块0(N), 块1(N), ...]（k 慢变）→ reshape (B,K,N,D)
+        # 再 permute 为 (B,N,K,D): F_hat[:,:,k] = 块 k。
+        # ⚠️ 不能直接 reshape(B,N,K,D): 那是 n 慢变 k 快变（跨块交错采样），
+        # 会把块边界打乱导致 F_hat[:,:,k] 不是"只用前 k_list[k] 个 z_s 的重建"。
+        return x[:, N + 1:].reshape(B, self.K, N, D).permute(0, 2, 1, 3)
+
+
+# ═══════════════════════════════════════════════════════════════
 # TextDecoder — 仅文字自回归: [z_cls; z_s; 文字×T] → 文字 logits
 # ═══════════════════════════════════════════════════════════════
 
@@ -384,6 +471,7 @@ class SRPhase1V2(nn.Module):
         heads: int = 8,
         mlp_ratio: float = 4.0,
         causal_specials: bool = True,
+        k_list: Optional[list] = None,
         # ── 文字自回归（可选，vocab_size>0 时启用 TextDecoder）──
         vocab_size: int = 0,
         qwen_hidden: Optional[int] = None,
@@ -405,9 +493,18 @@ class SRPhase1V2(nn.Module):
                                     depth=reencoder_depth, heads=heads,
                                     mlp_ratio=mlp_ratio,
                                     causal_specials=causal_specials)
-        self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches,
-                                      depth=decoder_depth, heads=heads,
-                                      mlp_ratio=mlp_ratio)
+        # 单 k（默认）: FeatureDecoder 一次前向一个前缀；全家桶: k_list 传入
+        # 时用 FeatureDecoderAllK，一次前向输出 (B,N,K,D) 全部前缀重建。
+        self.k_list = sorted(set(k_list)) if k_list else None
+        if self.k_list:
+            assert all(0 <= kk <= num_patches for kk in self.k_list), self.k_list
+            self.decoder = FeatureDecoderAllK(
+                dim=dim, num_patches=num_patches, k_list=self.k_list,
+                heads=heads, depth=decoder_depth, mlp_ratio=mlp_ratio)
+        else:
+            self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches,
+                                          depth=decoder_depth, heads=heads,
+                                          mlp_ratio=mlp_ratio)
         self.text_decoder = None
         if vocab_size > 0:
             self.text_decoder = TextDecoder(
@@ -501,6 +598,8 @@ class SRPhase1V2(nn.Module):
             （位置 i 预测 i+1，ignore_index=pad_token_id），
             loss = L1 + text_loss_weight*L_text。
         """
+        assert self.k_list is None, \
+            "全家桶模式（构造传了 k_list）请用 forward_all_k()，forward() 仅单 k 模式"
         x = pixel_values                                # (B,3,224,224)
         z_cls, z_s, patch = self._encode_z(x)           # (B,1,D) (B,N,D) (B,N,D)
         z_s_in = z_s[:, :z_keep] if z_keep is not None else z_s   # 统一前缀
@@ -524,6 +623,48 @@ class SRPhase1V2(nn.Module):
             out["text_loss"] = text_loss
             out["text_logits"] = logits
             out["loss"] = recon + self.text_loss_weight * text_loss
+        return out
+
+    def forward_all_k(self, pixel_values: Tensor,
+                      text_ids: Optional[Tensor] = None,
+                      w_fn=None) -> dict:
+        """全家桶（三维方案 C）: 一次前向输出**所有**前缀 k 的重建并监督。
+
+        仅构造传 k_list 时可用。重建损失 = Σ_k w(k)·L1(F_hat[:,:,k], patch)/K
+        —— 一个训练步同时监督全部 K 个前缀（"任意前缀重建"的原生并行，
+        k 是显式结构维度，非循环展开）。
+        text_ids 传入时: 文字 CE 对每个 k 也并行计算后平均（z_s[:k] 切片
+        喂 TextDecoder，文字分支同样覆盖全部前缀；K 次小前向成本可忽略）。
+        w_fn: k → 重建权重（默认 1/(k+1)，递减 ⇒ 梯度压力前置）。
+        返回 {"loss","recon","F_hat"(B,N,K,D),"k_list"}（+text_loss）。
+        """
+        assert self.k_list, "forward_all_k 需要构造时传 k_list（全家桶模式）"
+        z_cls, z_s, patch = self._encode_z(pixel_values)
+        F_hat = self.decoder(z_cls, z_s)                 # (B,N,K,D)
+        K = self.decoder.K
+        if w_fn is None:
+            w_fn = lambda k: 1.0 / (k + 1)
+        l1_per_k = [F.l1_loss(F_hat[:, :, k], patch) for k in range(K)]
+        recon = sum(w_fn(self.k_list[k]) * l1_per_k[k]
+                    for k in range(K)) / K
+        out = {"loss": recon, "recon": recon, "F_hat": F_hat,
+               "l1_per_k": l1_per_k, "k_list": list(self.k_list)}
+        if text_ids is not None:
+            assert self.text_decoder is not None, \
+                "text_ids 传入但 TextDecoder 未配置（构造需 vocab_size>0）"
+            assert text_ids.size(1) >= 2, "text_ids 至少 2 个 token（错位需要）"
+            V = self.text_decoder.lm_head.out_features
+            tloss = 0.0
+            for kk in self.k_list:
+                logits = self.text_decoder(text_ids, z_cls, z_s[:, :kk])
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = text_ids[..., 1:].contiguous()
+                tloss = tloss + F.cross_entropy(
+                    shift_logits.view(-1, V), shift_labels.view(-1),
+                    ignore_index=self.pad_token_id)
+            tloss = tloss / K
+            out["text_loss"] = tloss
+            out["loss"] = recon + self.text_loss_weight * tloss
         return out
 
     def forward_prefix_set(self, pixel_values: Tensor,
@@ -830,6 +971,75 @@ if __name__ == "__main__":
         tmodel.text_decoder.layers[0].linear1.weight.grad is not None
     print(f"[ok] forward_prefix_set: 多 k={ks_test} 并行损失 = 逐 k 平均 "
           f"(recon 差<1e-6, text 差<1e-6), 梯度覆盖全部 ks 路径")
+
+    # ── 11. 全家桶 FeatureDecoderAllK: 掩码结构 + 无泄漏（数值验证）──
+    k_list_t = [16, 4, 1]                        # N=16, 全量+中+小
+    am = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                    reencoder_depth=2, decoder_depth=2, k_list=k_list_t)
+    out_a = am.forward_all_k(x)
+    assert out_a["F_hat"].shape == (2, N, 3, D), out_a["F_hat"].shape
+    # forward() 在全家桶模式应拒绝（防误用）
+    try:
+        am(x)
+        raise AssertionError("全家桶模式 forward 应拒绝")
+    except AssertionError:
+        pass
+    # 掩码结构（True=屏蔽）
+    amk = am.decoder.attn_mask
+    L_a = 1 + N + N * 3
+    assert amk.shape == (L_a, L_a)
+    assert not amk[0, 0] and amk[0, 1:].all()                # z_cls 只见自己
+    for i in range(1, N + 1):                                # z_s 行
+        assert not amk[i, :i + 1].any()                      # 见 z_cls+z_s[:i]
+        assert amk[i, i + 1:N + 1].all()                     # 屏蔽后面 z
+        assert amk[i, N + 1:].all()                          # 不看任何 out
+    out0 = N + 1
+    kl = am.decoder.k_list                       # 排序去重后的块序 [1,4,16]
+    assert kl == [1, 4, 16]
+    for k, kk in enumerate(kl):                  # out 块 k
+        b0 = out0 + k * N
+        for r in range(b0, b0 + N):
+            assert not amk[r, 0].any()                       # 见 z_cls
+            assert not amk[r, 1:1 + kk].any()                # 见 z_s[:kk]
+            assert amk[r, 1 + kk:N + 1].all()                # 屏蔽 z_s[kk+1..N]
+            assert not amk[r, b0:b0 + N].any()               # 同块全允许
+            assert amk[r, out0:b0].all() and amk[r, b0 + N:].all()  # 其他块屏蔽
+    # 无泄漏数值验证: 扰动 z_s[:, kk+1:] 不得改变块 k 的输出。
+    # ⚠️ 扰动必须各向异性（随机噪声）: LayerNorm 对均匀偏移/缩放不变
+    # （LN(a·x+b)=LN(x)），+10 均匀扰动会被归一化完全抵消（坑，勿踩）。
+    # 注意力屏蔽精确 ⇒ 噪声扰动下块 k 输出应逐位不变（<1e-6）。
+    with torch.no_grad():
+        z_c, z_s_a, _ = am._encode_z(x)
+        F0 = am.decoder(z_c, z_s_a)                          # (2,N,3,D)
+        noise = 3.0 * torch.randn_like(z_s_a)
+        for k, kk in enumerate(kl):
+            z_b = z_s_a.clone(); z_b[:, kk + 1:] += noise[:, kk + 1:]
+            F1 = am.decoder(z_c, z_b)
+            d_out = (F0[:, :, k] - F1[:, :, k]).abs().max().item()
+            assert d_out < 1e-6, f"块 k={kk} 泄漏: 扰动 z_s[>k] 改变输出 {d_out}"
+            z_b2 = z_s_a.clone(); z_b2[:, :kk] += noise[:, :kk]
+            F2 = am.decoder(z_c, z_b2)
+            d_in = (F0[:, :, k] - F2[:, :, k]).abs().max().item()
+            assert d_in > 1e-2, f"块 k={kk} 应对 z_s[:k] 敏感, got {d_in}"
+    print(f"[ok] FeatureDecoderAllK: 掩码块结构正确, 无泄漏(扰动 z_s[>k] 差<1e-6), "
+          f"对 z_s[:k] 敏感, forward() 全家桶拒绝")
+
+    # ── 11b. 全家桶 + 文字: 损失构成 / 梯度 / k_list 含 0 ──
+    am_t = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                      reencoder_depth=2, decoder_depth=2, vocab_size=V,
+                      qwen_hidden=D, max_text_len=64, text_decoder_depth=2,
+                      k_list=[16, 0])
+    out_at = am_t.forward_all_k(x, text_ids=tid,
+                                w_fn=lambda k: prefix_weight(k, N, "inv"))
+    assert out_at["text_loss"].shape == () and out_at["recon"].shape == ()
+    assert abs(out_at["loss"].item()
+               - (out_at["recon"].item() + out_at["text_loss"].item())) < 1e-5
+    out_at["loss"].backward()
+    assert am_t.decoder.layers[0].linear1.weight.grad is not None and \
+        am_t.text_decoder.layers[0].linear1.weight.grad is not None
+    assert am_t.decoder.k_list == [0, 16]                    # 排序去重
+    print(f"[ok] 全家桶+文字: k_list={am_t.decoder.k_list} 损失构成/梯度 正确, "
+          f"recon={out_at['recon'].item():.6f} text={out_at['text_loss'].item():.6f}")
 
     with torch.no_grad():
         gen = tmodel.generate_text(x, torch.randint(0, V, (2, 3)), max_new_tokens=5)
