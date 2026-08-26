@@ -51,6 +51,33 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
 
     自检: python model_v2.py（形状 / 两处块掩码结构 / 梯度 /
           init_reencoder_from_dino / eval 同路径）
+
+参考资料（防止遗忘参考来源）:
+    [1] Hawthorne, C., Jaegle, A., Cangea, C., Borgeaud, S., Nash, C.,
+        Malinowski, M., Dieleman, S., Vinyals, O., Botvinick, M.,
+        Simon, I., Sheahan, H., Zeghidour, N., Alayrac, J.-B.,
+        Carreira, J., & Engel, J. (2022).
+        General-purpose, long-context autoregressive modeling with
+        Perceiver AR. ICML 2022, PMLR 162, 8535-8558.
+        解码器机制来源: 交叉注意力输出查询 + 因果掩码（Perceiver 家族;
+        见 OutputQueryDecoder 文档）。
+        https://mlanthology.org/icml/2022/hawthorne2022icml-generalpurpose/
+    [2] Li, J., Li, D., Savarese, S., & Hoi, S. C. H. (2023).
+        BLIP-2: Bootstrapping language-image pre-training with frozen
+        image encoders and large language models. ICML 2023.
+        可学习查询基（query_base）与 Q-Former 的可学习 query 设计同源;
+        冻结视觉编码器 + 可训练查询桥接的思路。
+        https://arxiv.org/abs/2301.12597
+    [3] Fan, Y., Tong, J., Zhao, A., & Shen, X. (2026).
+        What do visual tokens really encode? Uncovering sparsity and
+        redundancy in multimodal large language models. arXiv:2603.00510.
+        视觉 token 稀疏性/冗余分析——token 压缩与 specials 设计的背景。
+        https://arxiv.org/abs/2603.00510
+    [4] Apedo, Y., Poreba, M., Szczepanski, M., & Bouchafa, S. (2026).
+        Beyond attention scores: SVD-based vision token pruning for
+        efficient vision-language models (SVD-Prune). arXiv:2604.11530.
+        视觉 token 剪枝——与已移除的"可学习前缀预算"机制相关的文献。
+        https://arxiv.org/abs/2604.11530
 """
 
 import torch
@@ -228,6 +255,10 @@ class OutputQueryDecoder(nn.Module):
     掩码约定: 统一用加法浮点掩码(-inf=屏蔽)。实测 torch 2.8:
         SDPA 的 bool 掩码 True=允许, 与 TransformerEncoderLayer 的
         True=屏蔽 相反（见文件头踩坑记录）。
+
+    参考: 交叉注意力输出查询范式源自 Perceiver 家族（文件头 [1]
+        Perceiver AR / Perceiver IO）; 可学习查询基 query_base 的"行 k↔
+        patch k"设计同源于 BLIP-2 Q-Former 的可学习 query（[2]）。
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
