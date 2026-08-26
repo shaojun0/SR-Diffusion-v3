@@ -14,24 +14,33 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
 当前架构（无选择、无预算）:
     DINOv2(冻结) → cls + patch 特征 (B,257,D)
     ReEncoder:    [cls; specials; patches] 因果 specials 块掩码 → z_cls, z_s
-    FeatureDecoder: [z_cls; z_s(全量); <patch_token>×N] 块掩码
-                    （z 因果链 + patch 全局）→ F_hat (B,N,D)
-    L = L1(F_hat, patch)          ← 唯一损失
+    OutputQueryDecoder: [z_cls; z_s] = 时序序列 A(S,H)；在采样时刻
+                    T_sub（自然数平方计划: 前面密后面疏, 自动适配任意 N）
+                    上输出 (N,D) 矩阵 = 全部 patch 的预测（输出查询注意力,
+                    查询基行 k 对应 patch k）；KV 因果（前缀）
+                    → F_hat = 采样步平均 (B,N,D)
+    L = Σ_t w_t·L1(Y_t, patch) / Σ w_t   ← 全覆盖损失（默认密度补偿权重,
+        即对全时刻无偏; w_t 可换 uniform / capability）
 
-块状注意力掩码（两处一致的前缀链语义）:
+块状注意力掩码:
     ReEncoder（causal_specials=True 默认）: [cls; specials; patches]
         cls 全局；specials 因果链（special i 只见 specials≤i + 全部
-        patches）；patches 全局。
-    FeatureDecoder: [z_cls; z_s; <patch_token>×N]
-        z 部分因果链（z 行 i 只见 z≤i + 全部 patch 行）；patch 部分
-        全局（见所有人、被所有人见）；输出 = patch 位置表示 = F_hat。
-    掩码（build_prefix_mask）在 forward 内现算、按实际序列长度构建
-    （牺牲一点速度，换可扩展性）。
+        patches）；patches 全局。掩码（build_prefix_mask）在 forward
+        内现算、按实际序列长度构建（牺牲一点速度，换可扩展性）。
+    OutputQueryDecoder: [z_cls; z_s] 为时序序列 A=(S,H)，KV 因果——
+        每步 t 只见前缀 s≤t；每步由输出查询注意力产生 (N,D) 矩阵 =
+        全部 patch 的预测（每步全覆盖, 见类文档）。
+    时刻采样（显存优化）: 查询只对 T_sub 构造（默认自然数平方计划,
+        见 square_step_schedule）——Q 从 (S·N,D) 降到 (|T|·N,D)。
 
 踩坑记录（重要）:
     torch 2.x 的 bool 注意力掩码约定是 True=屏蔽（_canonical_mask:
     masked_fill_(mask, -inf)），与直觉相反。初版写成 True=允许导致
     输出不依赖输入、梯度为零（自检抓到），已按 True=屏蔽 实现。
+    注意该约定只对 nn.TransformerEncoderLayer/MultiheadAttention 成立；
+    F.scaled_dot_product_attention 的 bool 掩码实测 True=允许（torch
+    2.8 本机验证: mask=[True,False] 只 attend 第一个 key）。OutputQuery
+    Decoder 因此统一用加法浮点掩码(-inf=屏蔽)规避歧义。
 
 用法
 ----
@@ -48,6 +57,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from typing import Optional, Sequence
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,8 +94,8 @@ def build_prefix_mask(seq_len: int, z_start: int, z_end: int,
     布局: [z 区域 (z_start..z_end-1) | 尾部 (z_end..seq_len-1)]
         · z 行 i: 屏蔽 z 列 (i+1..z_end-1)（因果链），可看尾部（全局）
         · 尾部行: 全开放（全局，见所有人、被所有人见）
-    用于 ReEncoder（z=specials 1..N，尾部=patches）与 FeatureDecoder
-    （z=z_cls+z_s 0..N，尾部=<patch_token>×N），传不同 z_start/z_end 即可。
+    用于 ReEncoder（z=specials 1..N，尾部=patches）与旧版 FeatureDecoder
+    （已被 OutputQueryDecoder 取代），传不同 z_start/z_end 即可。
 
     在 forward 内现算而非 __init__ 缓存: 牺牲一点速度，换可扩展性——
     之后支持变长序列、运行时切换掩码都只需改传参。
@@ -150,54 +160,134 @@ class ReEncoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-# FeatureDecoder — 块掩码解码器: [z_cls; z_s(全量); <patch_token>×N]
+# square_step_schedule — 时刻采样计划（自然数平方数, 自动适配任意 N）
 # ═══════════════════════════════════════════════════════════════
 
-class FeatureDecoder(nn.Module):
-    """块掩码解码器: 从 z_cls + z_s 解码出完整特征图 F_hat (B,N,D)。
+def square_step_schedule(num_patches: int) -> list:
+    """生成 decoder 的时刻采样计划 T_sub = {0} ∪ {k² ≤ N} ∪ {N}。
 
-    输入序列（恒长 2N+1）: [z_cls(1); z_s(N, 全量); <patch_token>×N]
-    注意力掩码（True=屏蔽，torch 2.x bool 约定）:
-        z 部分 (0..N)        → 因果链: z 行 i 只见 z≤i + 全部 patch 行
-        patch 部分 (N+1..2N) → 全局: 见所有人、被所有人见
-    掩码在 forward 内现算（build_prefix_mask），按实际序列长度构建。
-    输出: patch 位置的最终表示 = F_hat（L1 监督 vs DINO patch 特征）。
+    采样时刻就是自然数平方数: 0, 1, 4, 9, 16, 25, …
+    相邻间距是 (k+1)²−k² = 2k+1 的奇数: 1, 3, 5, 7, 9, …（线性递增）——
+    所以"前面密、后面疏"，且比幂次计划（间距成倍拉开）温和得多。
+    0 和 N 是额外补的: t=0 = 仅 z_cls 时刻; t=N = 全前缀（能力最强）。
+    计划完全由 N 推导，自动适配任意序列长度（N=256→17 步,
+    N=512→24 步, …），改 N 无需动代码。
 
-    · 单栈自注意力 + 块掩码（无 query/cross-attention 两套机制）；
-    · z 前缀链（因果）与 encoder 侧 causal specials 语义一致:
-      每个 z 是"前缀 0..i 的表示"，patch 全局汇聚这些前缀；
-    · 若不想让 z 看到 patch（更纯粹的"潜变量前缀→输出"语义），
-      在 build_prefix_mask 调用处把 z 行的尾部列也置 True（屏蔽）。
+    例: square_step_schedule(256)
+        → [0,1,4,9,16,25,36,49,64,81,100,121,144,169,196,225,256]
+    """
+    steps = {0}
+    k = 1
+    while k * k <= num_patches:
+        steps.add(k * k)
+        k += 1
+    steps.add(num_patches)          # 最后一步（全前缀, 能力最强）总是保留
+    return sorted(steps)
+
+
+# ═══════════════════════════════════════════════════════════════
+# OutputQueryDecoder — 输出查询注意力解码器（采样时刻上输出全部 patch）
+# ═══════════════════════════════════════════════════════════════
+
+class OutputQueryDecoder(nn.Module):
+    """把 [z_cls; z_s] 当作时序序列 A=(S,H)，在采样时刻 T_sub 上每个
+    时刻输出一个 (N,D) 矩阵 = 全部 patch 的预测，再沿时刻集成得到
+    F_hat (B,N,D)。
+
+    机制（一次前向，采样时刻 × 所有 patch 行完全并行）:
+        A = [z_cls; z_s] + pos_embed      (B, S, D)     ← 上文的 A=(S,H)
+        Q = W_q(A_t) + E                  (B, |T|, N, D)  E=查询基, 行 k↔patch k
+        Y = SDPA(Q, K=V=A, mask)          (B, |T|·N, D)   一次 matmul
+        Y = norm(ffn(Y))                  (B, |T|, N, D)  采样时刻 t = 全部 patch
+        F_hat = mean_t(Y)                 (B, N, D)      采样步集成
+
+    时刻采样（显存优化, 默认开启）:
+        查询只对 T_sub 构造——Q 从 (S·N,D) 降到 (|T|·N,D)，显存与算力
+        同比例下降（N=256: 全量 257 步 → 平方计划 17 步, 约 15×）。
+        · 默认计划 = square_step_schedule(N)（自然数平方, 前面密后面疏,
+          自动适配任意 N）;
+        · 传 steps= 可自定义采样时刻列表（如 [0, 64, 128, 256]）;
+        · 传 steps=list(range(N+1)) 即退化为全量不采样。
+        注意: 未采样时刻不参与损失, 也不出现在 F_hat 集成里。
+
+    损失权重 loss_weight（配合采样步使用）:
+        "density"     (默认)  w_t ∝ 采样间隔 —— 密度补偿, 对全时刻无偏
+                    （等价于全覆盖损失的蒙特卡洛估计, 前后端公平）
+        "uniform"            w_t = 1 —— 采样步均匀（前面密的弱步主导梯度）
+        "capability"         w_t = t+1 —— 按可见键数加权（强步主导）
+
+    覆盖语义（每步全覆盖）:
+        每个采样时刻 t 都预测全部 N 个 patch（查询基 E 的行 k 对应
+        patch k, 对所有 t 相同）; 每个采样时刻都被监督还原全部 patch。
+
+    KV 因果（kv_causal=True）:
+        每步 t 只见前缀 s≤t。t 越小的键越少（t=0 只有 z_cls 一个键,
+        N 行查询只能输出同一向量）, 重建越粗糙——"前缀越短越粗"是
+        该设计的固有性质（渐进重建）。kv_causal=False 则每步见全部 z。
+
+    掩码约定: 统一用加法浮点掩码(-inf=屏蔽)。实测 torch 2.8:
+        SDPA 的 bool 掩码 True=允许, 与 TransformerEncoderLayer 的
+        True=屏蔽 相反（见文件头踩坑记录）。
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
-                 heads: int = 8, depth: int = 4, mlp_ratio: float = 4.0):
+                 mlp_ratio: float = 4.0, kv_causal: bool = True,
+                 steps: Optional[Sequence[int]] = None,
+                 loss_weight: str = "density"):
         super().__init__()
         self.num_patches = num_patches
-        L = 2 * num_patches + 1                # z_cls + N z + N patch
-        self.patch_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)  # 共享输出 token
-        self.pos_embed = nn.Parameter(torch.randn(1, L, dim) * 0.02)
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=dim, nhead=heads, dim_feedforward=int(dim * mlp_ratio),
-                dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
-            ) for _ in range(depth)
-        ])
+        self.kv_causal = kv_causal
+        if steps is None:
+            steps = square_step_schedule(num_patches)
+        steps = sorted(set(int(s) for s in steps))
+        assert steps and all(0 <= s <= num_patches for s in steps), \
+            f"steps 越界: {steps} (N={num_patches})"
+        self.steps = steps
+        self.loss_weight = loss_weight
+        self.step_weights = self._build_weights(steps)   # (|T|,) CPU
+        S = num_patches + 1                                # z_cls + N z_s
+        self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
+        self.W_q = nn.Linear(dim, dim, bias=False)         # z_t → 查询偏置
+        self.pos_embed = nn.Parameter(torch.randn(1, S, dim) * 0.02)
+        self.ffn = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)),
+                                 nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
         self.norm = nn.LayerNorm(dim)
 
+    def _build_weights(self, steps: list) -> Tensor:
+        """按 loss_weight 模式构造每步损失权重（CPU 张量, forward 里移设备）。"""
+        T = len(steps)
+        if T == 1:
+            return torch.ones(1)
+        if self.loss_weight == "uniform":
+            return torch.ones(T)
+        if self.loss_weight == "capability":
+            return torch.tensor([t + 1 for t in steps], dtype=torch.float)
+        # density: w_t = 相邻采样步中点间距（边界取轴端点, 对全时刻无偏）
+        w = torch.zeros(T)
+        for i, t in enumerate(steps):
+            prev = steps[i - 1] if i > 0 else 0
+            nxt = steps[i + 1] if i < T - 1 else steps[-1]
+            w[i] = max((nxt - prev) / 2, 0.5)
+        return w
+
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
-        B = z_cls.shape[0]
-        N = self.num_patches
-        patch_tokens = self.patch_token.expand(B, N, -1)   # (B,N,D)
-        x = torch.cat([z_cls, z_s, patch_tokens], dim=1)   # (B,2N+1,D)
-        L = x.shape[1]
-        # forward 内现算掩码（True=屏蔽; z 区域 0..N 因果，尾部=patch 全局）
-        self.attn_mask = build_prefix_mask(L, 0, N + 1, device=x.device)
-        x = x + self.pos_embed[:, :L, :]
-        for layer in self.layers:
-            x = layer(x, src_mask=self.attn_mask)
-        x = self.norm(x)
-        return x[:, N + 1:]                                # (B,N,D) patch 输出
+        B, N, D = z_s.shape[0], self.num_patches, z_s.shape[-1]
+        A = torch.cat([z_cls, z_s], dim=1) + self.pos_embed      # (B,S,D)
+        A_t = A[:, self.steps]                                   # (B,|T|,D) 采样时刻
+        Q = (self.W_q(A_t).unsqueeze(2) + self.query_base) \
+            .reshape(B, len(self.steps) * N, D)                  # 展平 (t,k), t∈T_sub
+        K = V = A
+        mask = None
+        if self.kv_causal:   # 行(t,k) 只允许 s≤t（前缀因果; -inf=屏蔽）
+            tril = torch.tril(torch.ones(N + 1, N + 1, device=A.device)).bool()
+            mask = torch.where(tril[self.steps], 0.0, float("-inf")) \
+                .repeat_interleave(N, dim=0)                     # (|T|·N, S)
+        self.attn_mask = mask                                    # 供自检
+        Y = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)  # (B,|T|·N,D)
+        Y = self.norm(self.ffn(Y)).reshape(B, len(self.steps), N, D)  # (B,|T|,N,D)
+        self.last_Y = Y                                          # 采样步全部 patch 预测
+        self.step_weights = self.step_weights.to(A.device)
+        return Y.mean(dim=1)                                     # (B,N,D) 采样步集成
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -212,10 +302,11 @@ class SRPhase1V2(nn.Module):
         num_patches: int = 256,
         dim: int = 768,
         reencoder_depth: int = 4,
-        decoder_depth: int = 4,
         heads: int = 8,
         mlp_ratio: float = 4.0,
         causal_specials: bool = True,
+        decoder_steps: Optional[Sequence[int]] = None,
+        decoder_loss_weight: str = "density",
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -227,9 +318,10 @@ class SRPhase1V2(nn.Module):
                                     depth=reencoder_depth, heads=heads,
                                     mlp_ratio=mlp_ratio,
                                     causal_specials=causal_specials)
-        self.decoder = FeatureDecoder(dim=dim, num_patches=num_patches,
-                                      depth=decoder_depth, heads=heads,
-                                      mlp_ratio=mlp_ratio)
+        self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
+                                          mlp_ratio=mlp_ratio,
+                                          steps=decoder_steps,
+                                          loss_weight=decoder_loss_weight)
 
     def init_reencoder_from_dino(self, num_layers: int = 4):
         """用 DINO 编码器前 num_layers 层 warm-start ReEncoder（结构对齐
@@ -260,7 +352,10 @@ class SRPhase1V2(nn.Module):
     def forward(self, pixel_values: Tensor) -> dict:
         """pixel_values: (B,3,224,224) → dict{loss, recon, F_hat}
 
-        唯一损失: L1(F_hat, patch)。全量 z_s 进 decoder，无选择无预算。
+        损失: 每个采样时刻 t∈T_sub 都监督还原全部 patch——加权全覆盖
+        损失 L = Σ_t w_t·L1(Y_t, patch)/Σ w_t（w_t 由 decoder 的
+        loss_weight 模式决定, 默认密度补偿=对全时刻无偏）。F_hat =
+        采样步平均; recon = L1(F_hat, patch) 仅作监控。
         """
         x = pixel_values                                # (B,3,224,224)
         B = x.shape[0]
@@ -278,17 +373,22 @@ class SRPhase1V2(nn.Module):
         z_cls = z[:, 0:1]                               # (B,1,D)
         z_s = z[:, 1:1 + N]                             # (B,N,D)
 
-        # ── FeatureDecoder: [z_cls; z_s(全量); patch×N] → F_hat ──
-        F_hat = self.decoder(z_cls, z_s)                # (B,N,D)
-
-        recon = F.l1_loss(F_hat, patch)                 # 唯一损失
-        return {"loss": recon, "recon": recon, "F_hat": F_hat}
+        # ── OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖 → F_hat ──
+        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步集成
+        Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
+        w = self.decoder.step_weights                   # (|T|,)
+        # 加权全覆盖损失: 每个采样时刻都要还原全部 patch
+        per_step = F.l1_loss(Y, patch.unsqueeze(1).expand_as(Y),
+                             reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
+        loss = (per_step * w).sum() / w.sum()
+        recon = F.l1_loss(F_hat, patch)                 # 集成重建（监控用）
+        return {"loss": loss, "recon": recon, "F_hat": F_hat}
 
 
 # ═══════════════════════════════════════════════════════════════
 # 自检（python model_v2.py）
 #   1. 形状正确性
-#   2. 两处块掩码结构（ReEncoder / FeatureDecoder）
+#   2. 两处块掩码结构（ReEncoder / OutputQueryDecoder KV 因果掩码）
 #   3. 梯度流向（整模型可训: ReEncoder / Decoder / SpecialTokenBank）
 #   4. eval 同路径
 # ═══════════════════════════════════════════════════════════════
@@ -333,7 +433,7 @@ if __name__ == "__main__":
     N, D = 16, 64
     dino = FakeDino(dim=D, num_patches=N)
     model = SRPhase1V2(dino, num_patches=N, dim=D,
-                       reencoder_depth=2, decoder_depth=2)
+                       reencoder_depth=2)
     model.init_reencoder_from_dino(2)
     x = torch.randn(2, 3, 224, 224)
 
@@ -354,32 +454,45 @@ if __name__ == "__main__":
         assert not am[i, N + 1:].any()               # special i 可见全部 patches
     # 关掉 causal 时掩码全 False（回退全双向；掩码 forward 内现算，先跑一次）
     m_free = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                        causal_specials=False, reencoder_depth=2, decoder_depth=2)
+                        causal_specials=False, reencoder_depth=2)
     _ = m_free.re_encoder(torch.randn(2, 2 * N + 1, D))
     assert not m_free.re_encoder.attn_mask.any()
     print(f"[ok] ReEncoder block mask: causal_specials=True 结构正确, "
           f"causal_specials=False 全开放回退")
 
-    # ── 3. FeatureDecoder 块掩码结构（[z_cls; z_s; patch×N]）──
-    dm = model.decoder.attn_mask                     # (2N+1, 2N+1) bool, True=屏蔽
-    assert dm.shape == (2 * N + 1, 2 * N + 1)
-    for i in range(N + 1):                           # z 行 0..N: z 内部因果
-        assert not dm[i, :i + 1].any()               #  可见 z≤i
-        assert dm[i, i + 1:N + 1].all()              #  屏蔽后面的 z
-        assert not dm[i, N + 1:].any()               #  可见全部 patch 行
-    assert not dm[N + 1:].any()                      # patch 行全局
-    print(f"[ok] Decoder block mask: z 因果链 + patch 全局, 结构正确")
+    # ── 3. OutputQueryDecoder: 平方采样计划 + KV 因果掩码 + 全覆盖损失 ──
+    T_steps = model.decoder.steps
+    assert T_steps == square_step_schedule(N), T_steps       # N=16 → [0,1,4,9,16]
+    am = model.decoder.attn_mask                             # (|T|·N, N+1) float
+    assert am is not None and am.shape == (len(T_steps) * N, N + 1), am.shape
+    for ti, t in enumerate(T_steps):                         # 行(t,k): 只允许 s≤t
+        row = am[ti * N]
+        assert (row[:t + 1] == 0).all()
+        assert (row[t + 1:] == float("-inf")).all()
+    Y = model.decoder.last_Y
+    assert Y.shape == (2, len(T_steps), N, D)                # (B,|T|,N,D)
+    assert out["F_hat"].shape == (2, N, D)                   # 采样步平均
+    w = model.decoder.step_weights
+    per = F.l1_loss(Y, dino._feat[:2, 1:].unsqueeze(1).expand_as(Y),
+                    reduction="none").mean(dim=(0, 2, 3))
+    assert torch.isclose(out["loss"], (per * w).sum() / w.sum())   # 加权全覆盖损失
+    # 计划自动适配任意 N（可扩展性）: 256→17 步, 512→24 步
+    assert square_step_schedule(256) == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81,
+                                         100, 121, 144, 169, 196, 225, 256]
+    assert len(square_step_schedule(512)) == 24
+    print(f"[ok] OutputQueryDecoder: 平方采样 {len(T_steps)} 步 + KV 因果掩码 "
+          f"+ 加权全覆盖损失正确")
 
     # ── 4. 梯度流向（整模型可训）──
     out["loss"].backward()
     for name, p in [("re_encoder.0", model.re_encoder.layers[0].linear1.weight),
-                    ("decoder.0", model.decoder.layers[0].linear1.weight),
-                    ("special_bank.pos", model.special_bank.pos),
-                    ("decoder.patch_token", model.decoder.patch_token)]:
+                    ("decoder.W_q", model.decoder.W_q.weight),
+                    ("decoder.query_base", model.decoder.query_base),
+                    ("special_bank.pos", model.special_bank.pos)]:
         g = p.grad
         assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
-    print(f"[ok] 梯度: ReEncoder/Decoder/SpecialTokenBank/patch_token 全部可训 "
-          f"(|grad|={model.re_encoder.layers[0].linear1.weight.grad.abs().sum().item():.4f})")
+    print(f"[ok] 梯度: ReEncoder/OutputQueryDecoder(W_q,query_base)/SpecialTokenBank "
+          f"全部可训 (|grad|={model.re_encoder.layers[0].linear1.weight.grad.abs().sum().item():.4f})")
 
     # ── 5. 推理: 同一 forward（eval + no_grad）──
     model.eval()
