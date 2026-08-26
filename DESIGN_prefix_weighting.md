@@ -137,12 +137,20 @@ git 历史中的 SelectHead/边界分布/STE/率惩罚是**学习式门控 + 预
   - 新增 `sample_prefix_k(k_min, N, dist, rng)`: `dist` ∈ `uniform` / `log_uniform`。
 - **`train_v2.py`**: 新增 `--prefix_curriculum` 及参数 `--prefix_k_min=8`、
   `--prefix_p_full=0.5`、`--prefix_dist=uniform`、`--prefix_w=inv`、
-  `--prefix_w_p=1.0`、`--prefix_w_floor=0.05`。训练循环: 每步以 `p_full`
-  概率全量 k=N 保底，否则从 [k_min, N] 按 `dist` 采样 k；调
-  `model(x, text_ids, z_keep=k)`，loss = w(k)·L1_k + text_weight·L_text
-  （文字不额外按 k 加权——其 z_s 梯度压力来自采样频率 N−i+1，且与重建
-  共享同一前缀 k）。transformers/accelerate 重依赖延迟到 `main()` 导入，
-  `python train_v2.py` 自检（采样器分布 + 前缀课程损失构成）不依赖重依赖。
+  `--prefix_w_p=1.0`、`--prefix_w_floor=0.05`、`--prefix_k_count=1`。
+  训练循环: 每步以 `p_full` 概率全量 k=N 保底，否则从 [k_min, N] 按
+  `dist` 采样 k；调 `model(x, text_ids, z_keep=k)`，loss = w(k)·L1_k +
+  text_weight·L_text（文字不额外按 k 加权——其 z_s 梯度压力来自采样频率
+  N−i+1，且与重建共享同一前缀 k）。**`--prefix_k_count>1` = 多 k 并行**:
+  一步通过 `forward_prefix_set` 同时监督多个前缀（重建/文字均对每个 k
+  前向后平均）——一个训练步覆盖全量/大/中/小所有尺度，decoder 4 层
+  小网络成本可忽略。transformers/accelerate 重依赖延迟到 `main()` 导入，
+  `python train_v2.py` 自检（采样器分布 + 前缀课程损失构成 + 多 k 并行）
+  不依赖重依赖。
+- **`model_v2.py` 新增 `forward_prefix_set(pixel_values, ks, text_ids, w_fn)`**:
+  一次编码（z_s 因果链 ⇒ z_s[:k] 是自足前缀，直接切片）+ 对多个前缀 k
+  并行监督；重建 = Σ_k w(k)·L1_k/|ks|，文字 CE 对每个 k 平均。自检验证
+  与逐 k 独立 forward 数值等价（差 <1e-6）。
 - **`infer_k_sweep.py`**: 新增滑窗探针模式 `--window N`（滑窗合并进 batch
   一次 decoder 前向，分块控显存）——训练后验证"信息前置"（§7.2 判据:
   前段窗口应明显好于后段；训练前实测任意 32-token 窗口 ≈0.0033 无差异）。

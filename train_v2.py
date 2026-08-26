@@ -40,10 +40,12 @@ SR-Diffusion Phase 1 v2 — 训练（v2.1: 可选文字自回归）
     前缀课程（预算/渐进，DESIGN_prefix_weighting.md）: 追加
     --prefix_curriculum —— 每步 p_full 概率全量 k=N 保底，否则从
     [k_min, N] 按 --prefix_dist 采样 k，重建+文字统一只喂 z_s[:k]，
-    重建损失加权 w(k)（默认 1/(k+1)）:
+    重建损失加权 w(k)（默认 1/(k+1)）; --prefix_k_count>1 时一步并行
+    监督多个前缀（重建/文字均对每个 k 前向后平均，覆盖所有尺度）:
     accelerate launch --multi_gpu --num_processes 2 \
         train_v2.py --data_dir ... --dino_dir ... \
         --prefix_curriculum --prefix_p_full 0.5 --prefix_k_min 8 \
+        --prefix_k_count 3 \
         --output_dir output/phase1_v2_prefix
 """
 import argparse
@@ -138,6 +140,11 @@ def parse_args():
                    help="前缀采样下限（防 k 过小损失爆炸/梯度不稳）")
     p.add_argument("--prefix_p_full", type=float, default=0.5,
                    help="每步以该概率仍用全量 k=N（保底全量精度）")
+    p.add_argument("--prefix_k_count", type=int, default=1,
+                   help="每步并行监督的前缀数: 1=随机单 k（默认，逐 k 采样）；"
+                        ">1=多 k 并行——一个训练步同时覆盖多个尺度的前缀"
+                        "（重建/文字均对每个 k 前向后平均，decoder 4 层"
+                        "小网络成本可忽略），见 forward_prefix_set")
     p.add_argument("--prefix_dist", default="uniform",
                    choices=["uniform", "log_uniform"],
                    help="k 采样分布: uniform 自带线性前置偏置 N−i+1; "
@@ -294,8 +301,10 @@ def main():
         assert 1 <= args.prefix_k_min <= num_patches, \
             f"prefix_k_min={args.prefix_k_min} 超出 [1,{num_patches}]"
         assert 0.0 <= args.prefix_p_full <= 1.0, "prefix_p_full ∈ [0,1]"
+        assert args.prefix_k_count >= 1, "prefix_k_count ≥ 1"
         acc.print(f"[prefix] 前缀课程: dist={args.prefix_dist} "
                   f"k_min={args.prefix_k_min} p_full={args.prefix_p_full} "
+                  f"k_count={args.prefix_k_count}(并行前缀数) "
                   f"w={args.prefix_w}(p={args.prefix_w_p}, "
                   f"floor={args.prefix_w_floor}) —— 重建损失 w(k)·L1_k, "
                   f"文字分支共享同一前缀 k（不额外加权，梯度压力来自采样频率）")
@@ -311,17 +320,32 @@ def main():
             with ctx:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     if args.prefix_curriculum:
-                        # 前缀课程: 采样 k（p_full 概率全量保底），重建+文字
-                        # 统一只喂 z_s[:k]，重建损失加权 w(k)（递减 ⇒ 前置）
+                        # 前缀课程: p_full 概率全量保底，否则采样 k。
+                        # k_count=1 → 随机单 k；k_count>1 → 多 k 并行
+                        # （重建/文字均对每个 k 前向后平均，一步覆盖所有尺度）
                         use_full = random.random() < args.prefix_p_full
-                        k = num_patches if use_full else sample_prefix_k(
-                            args.prefix_k_min, num_patches, args.prefix_dist)
-                        out = model(x, text_ids=text_ids, z_keep=k)
-                        w = prefix_weight(k, num_patches, args.prefix_w,
-                                          args.prefix_w_p, args.prefix_w_floor)
-                        loss = w * out["recon"]
-                        if "text_loss" in out:
-                            loss = loss + args.text_loss_weight * out["text_loss"]
+                        if args.prefix_k_count <= 1:
+                            k = num_patches if use_full else sample_prefix_k(
+                                args.prefix_k_min, num_patches,
+                                args.prefix_dist)
+                            out = model(x, text_ids=text_ids, z_keep=k)
+                            w = prefix_weight(k, num_patches, args.prefix_w,
+                                              args.prefix_w_p,
+                                              args.prefix_w_floor)
+                            loss = w * out["recon"]
+                            if "text_loss" in out:
+                                loss = loss + args.text_loss_weight * out["text_loss"]
+                        else:
+                            ks = ([num_patches] if use_full else []) + [
+                                sample_prefix_k(args.prefix_k_min, num_patches,
+                                                args.prefix_dist)
+                                for _ in range(args.prefix_k_count)]
+                            out = model.forward_prefix_set(
+                                x, ks=ks, text_ids=text_ids,
+                                w_fn=lambda k: prefix_weight(
+                                    k, num_patches, args.prefix_w,
+                                    args.prefix_w_p, args.prefix_w_floor))
+                            loss = out["loss"]
                     else:
                         loss = model(x, text_ids=text_ids)["loss"]
                     loss = loss / args.grad_accum
@@ -423,6 +447,8 @@ if __name__ == "__main__":
     x = torch.randn(2, 3, 224, 224)
     tid = torch.randint(0, 128, (2, 10))
     Nm = m.num_patches
+
+    # 单 k（k_count=1 路径）: w(k)·L1_k + L_text，梯度可回传
     for k in (Nm, 5, 1):
         out = m(x, text_ids=tid, z_keep=k)
         w = prefix_weight(k, Nm)
@@ -431,6 +457,17 @@ if __name__ == "__main__":
         assert out["F_hat"].shape == (2, Nm, 64)
         print(f"  [curriculum] k={k}: w={w:.4f} recon={out['recon'].item():.4f} "
               f"text={out['text_loss'].item():.4f} → loss={loss.item():.4f}")
-    print("[ok] 前缀课程: z_keep 统一前缀 + w(k) 加权损失 + 梯度 正确")
+
+    # 多 k 并行（k_count>1 路径）: forward_prefix_set 一次监督多个前缀
+    ks_par = [Nm, 8, 2]
+    out_p = m.forward_prefix_set(x, text_ids=tid, ks=ks_par,
+                                 w_fn=lambda k: prefix_weight(k, Nm))
+    assert out_p["loss"].shape == () and out_p["recon"].shape == ()
+    assert abs(out_p["loss"].item()
+               - (out_p["recon"].item() + out_p["text_loss"].item())) < 1e-5
+    out_p["loss"].backward()
+    print(f"  [curriculum] 多 k 并行 ks={ks_par}: recon={out_p['recon'].item():.4f} "
+          f"text={out_p['text_loss'].item():.4f} → loss={out_p['loss'].item():.4f}")
+    print("[ok] 前缀课程: z_keep 统一前缀 + w(k) 加权损失 + 多 k 并行 梯度 正确")
 
     print("\nALL TRAIN CHECKS PASSED")

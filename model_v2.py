@@ -57,9 +57,14 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
     文字两分支统一**只喂前 k 个 z_s（重建输出仍恒全量 N patch）；配合
     prefix_weight(k, N, ...) 给重建损失加权 w(k)（递减 ⇒ 梯度压力前置，
     见 DESIGN_prefix_weighting.md / MATH_mask_analysis.md §6）。
+    **多 k 并行**: forward_prefix_set(x, ks=[...], text_ids=?, w_fn=?) 一次
+    编码 + 对多个前缀 k 并行监督（重建/文字均对每个 k 前向后平均），
+    一个训练步同时覆盖全量/大/中/小所有尺度（decoder 4 层小网络，
+    成本可忽略）。
     自检: python model_v2.py（形状 / 两处块掩码结构 / 梯度 /
           init_reencoder_from_dino / eval 同路径 / TextDecoder /
-          z_keep 统一前缀 / prefix_weight）
+          z_keep 统一前缀 / prefix_weight / sample_prefix_k /
+          forward_prefix_set 多 k 并行）
 """
 
 import random
@@ -521,6 +526,48 @@ class SRPhase1V2(nn.Module):
             out["loss"] = recon + self.text_loss_weight * text_loss
         return out
 
+    def forward_prefix_set(self, pixel_values: Tensor,
+                           ks: list,
+                           text_ids: Optional[Tensor] = None,
+                           w_fn=None) -> dict:
+        """一次编码 + 多个前缀 k 的**并行监督**（前缀课程"多 k 并行"模式）。
+
+        ks: 前缀长度列表（每步监督这些 k 的重建；可含 N=全量）。
+        w_fn: k → 重建权重（默认 1/(k+1)，递减 ⇒ 梯度压力前置）。
+        重建损失 = Σ_k w(k)·L1_k / |ks| —— 一个训练步同时覆盖
+        大/中/小/全量所有尺度的前缀（用户要求"所有可能性且可并行"）;
+        编码器仅前向一次（z_s 因果链 ⇒ z_s[:k] 是自足前缀，直接切片）。
+        text_ids 传入时: 文字 CE 对**每个 k** 也并行计算后平均（文字分支
+        同样覆盖所有前缀；TextDecoder 成本相对 DINO 编码器可忽略）。
+        返回 {"loss", "recon", "text_loss"?}；loss = recon + text_weight·L_text。
+        """
+        assert ks and all(0 <= k <= self.num_patches for k in ks), \
+            f"ks={ks} 须非空且 k∈[0,{self.num_patches}]"
+        z_cls, z_s, patch = self._encode_z(pixel_values)
+        if w_fn is None:
+            w_fn = lambda k: 1.0 / (k + 1)
+        K = len(ks)
+        recon = sum(w_fn(k) * F.l1_loss(self.decoder(z_cls, z_s[:, :k]), patch)
+                    for k in ks) / K
+        out = {"loss": recon, "recon": recon}
+        if text_ids is not None:
+            assert self.text_decoder is not None, \
+                "text_ids 传入但 TextDecoder 未配置（构造需 vocab_size>0）"
+            assert text_ids.size(1) >= 2, "text_ids 至少 2 个 token（错位需要）"
+            V = self.text_decoder.lm_head.out_features
+            tloss = 0.0
+            for k in ks:
+                logits = self.text_decoder(text_ids, z_cls, z_s[:, :k])
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = text_ids[..., 1:].contiguous()
+                tloss = tloss + F.cross_entropy(
+                    shift_logits.view(-1, V), shift_labels.view(-1),
+                    ignore_index=self.pad_token_id)
+            tloss = tloss / K
+            out["text_loss"] = tloss
+            out["loss"] = recon + self.text_loss_weight * tloss
+        return out
+
     @torch.no_grad()
     def generate_text(self, pixel_values: Tensor, prompt_ids: Tensor,
                       max_new_tokens: int = 128,
@@ -762,6 +809,27 @@ if __name__ == "__main__":
     assert mu_l < mu_u, f"log_uniform 应偏小 k: {mu_l:.1f} vs {mu_u:.1f}"
     print(f"[ok] sample_prefix_k: 边界正确, uniform≈{(km + Nw) / 2:.0f}, "
           f"log_uniform 偏小 k ({mu_l:.0f} < {mu_u:.0f})")
+
+    # ── 10. forward_prefix_set: 多 k 并行 ≈ 逐 k 独立 forward 的平均 ──
+    ks_test = [N, 5, 1]                            # 全量 + 中 + 小
+    wf = lambda k: prefix_weight(k, N, "inv")      # 与 train 默认一致
+    out_ps = tmodel.forward_prefix_set(x, ks=ks_test, w_fn=wf)
+    ref_r = sum(wf(k) * tmodel(x, z_keep=k)["recon"] for k in ks_test) / len(ks_test)
+    assert abs(out_ps["recon"].item() - ref_r.item()) < 1e-6, \
+        (out_ps["recon"].item(), ref_r.item())
+    assert out_ps["loss"].shape == () and out_ps["recon"].shape == ()
+    out_ps_t = tmodel.forward_prefix_set(x, text_ids=tid, ks=ks_test, w_fn=wf)
+    ref_t = sum(tmodel(x, text_ids=tid, z_keep=k)["text_loss"]
+                for k in ks_test) / len(ks_test)
+    assert abs(out_ps_t["text_loss"].item() - ref_t.item()) < 1e-6, \
+        (out_ps_t["text_loss"].item(), ref_t.item())
+    assert abs(out_ps_t["loss"].item()
+               - (out_ps_t["recon"].item() + out_ps_t["text_loss"].item())) < 1e-5
+    out_ps_t["loss"].backward()                    # 梯度经全部 ks 路径
+    assert tmodel.decoder.layers[0].linear1.weight.grad is not None and \
+        tmodel.text_decoder.layers[0].linear1.weight.grad is not None
+    print(f"[ok] forward_prefix_set: 多 k={ks_test} 并行损失 = 逐 k 平均 "
+          f"(recon 差<1e-6, text 差<1e-6), 梯度覆盖全部 ks 路径")
 
     with torch.no_grad():
         gen = tmodel.generate_text(x, torch.randint(0, V, (2, 3)), max_new_tokens=5)

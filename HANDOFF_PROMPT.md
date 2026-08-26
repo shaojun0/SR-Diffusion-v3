@@ -35,8 +35,9 @@
 4. **数学分析结论**：掩码**有用（必要不充分）**，应保留；"只算前 k 的预算推理"（截断编码器）需注意**传递前缀自洽不成立**（patches 枢纽回渗，MATH §3.2）。
 5. **加权机制**：w(k) 递减 ⇒ 梯度压力 Σ_{j≥i}w_j 递减 ⇒ 信息前置（**正确论证**，DESIGN §3 已修正；均匀采样精确 ∝ N−i+1）；需配 p_full 全量保底 / w 地板 / k_min 下限。
 6. **前缀课程已实现（2026-08-26，待用户审核）**：`train_v2.py --prefix_curriculum`
-   + `--prefix_k_min / --prefix_p_full / --prefix_dist / --prefix_w / --prefix_w_p / --prefix_w_floor`；
-   `model_v2.py` 的 `z_keep` 统一作用于重建+文字两分支，新增 `prefix_weight` / `sample_prefix_k`；
+   + `--prefix_k_min / --prefix_p_full / --prefix_k_count / --prefix_dist / --prefix_w / --prefix_w_p / --prefix_w_floor`；
+   `model_v2.py` 的 `z_keep` 统一作用于重建+文字两分支，新增 `prefix_weight` / `sample_prefix_k` /
+   `forward_prefix_set`（**多 k 并行**：一步同时监督多个前缀，覆盖全量/大/中/小所有尺度）；
    `infer_k_sweep.py` 新增 `--window` 滑窗探针。全部自检通过（`python model_v2.py` /
    `python train_v2.py`）。详见 `DESIGN_prefix_weighting.md` §10 实施记录。
 
@@ -44,11 +45,13 @@
 1. **先确认服务器状态**（实例/端口/数据/产物）；不可达则向用户说明并讨论恢复方案。
 2. **审核前缀课程实现**（DESIGN §10 实施记录 + git commit）——通过后上服务器开训：
    ```bash
-   # 纯重建 + 前缀课程（示例默认参数，可调）
+   # 纯重建 + 前缀课程（示例默认参数，可调；--prefix_k_count 3 = 每步
+   # 并行监督 3 个前缀，覆盖全量/大/中/小尺度，推荐）
    accelerate launch --multi_gpu --num_processes 2 \
        train_v2.py --data_dir /root/autodl-tmp/construction_site \
        --dino_dir /root/autodl-tmp/models/dinov2-large \
        --prefix_curriculum --prefix_p_full 0.5 --prefix_k_min 8 \
+       --prefix_k_count 3 \
        --output_dir output/phase1_v2_prefix
    # 文字模式同加 --prefix_curriculum（文字条件与重建共享同一前缀 k）
    ```
