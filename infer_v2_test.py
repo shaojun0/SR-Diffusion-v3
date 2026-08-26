@@ -107,6 +107,10 @@ def main():
         Y = model.decoder.last_Y
         return F_hat, Y, patch
 
+    full_sum, full_sq, n = 0.0, 0.0, 0
+    step_sum = np.zeros(len(T_steps), np.float64)   # 每采样步 L1 累加
+    step_sq = np.zeros(len(T_steps), np.float64)
+    t0 = time.time()
     with torch.no_grad():
         for bi, batch in enumerate(loader):
             x = batch["pixel_values"].cuda()
