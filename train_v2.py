@@ -36,27 +36,35 @@ SR-Diffusion Phase 1 v2 — 训练（v2.1: 可选文字自回归）
         --dino_dir /root/autodl-tmp/models/dinov2-large \
         --qwen_dir /root/autodl-tmp/models/Qwen3.8-27B --text_decoder \
         --output_dir output/phase1_v2_text
+
+    前缀课程（预算/渐进，DESIGN_prefix_weighting.md）: 追加
+    --prefix_curriculum —— 每步 p_full 概率全量 k=N 保底，否则从
+    [k_min, N] 按 --prefix_dist 采样 k，重建+文字统一只喂 z_s[:k]，
+    重建损失加权 w(k)（默认 1/(k+1)）:
+    accelerate launch --multi_gpu --num_processes 2 \
+        train_v2.py --data_dir ... --dino_dir ... \
+        --prefix_curriculum --prefix_p_full 0.5 --prefix_k_min 8 \
+        --output_dir output/phase1_v2_prefix
 """
 import argparse
 import glob
 import json
 import os
+import random
 import time
 from contextlib import nullcontext
 
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import Dinov2Model, AutoConfig, AutoTokenizer, get_scheduler
-from accelerate import Accelerator
-from accelerate.utils import set_seed
 
 from data_v2 import ParquetImageDataset, V2Collator
-from model_v2 import SRPhase1V2
+from model_v2 import SRPhase1V2, prefix_weight, sample_prefix_k
 
 
 # ═══════════════════════════════════════════════════════════════
-# Qwen 辅助（不加载全模型）
+# Qwen 辅助（不加载全模型；transformers/accelerate 延迟到 main() 导入,
+# 保证 __main__ 自检不依赖重依赖）
 # ═══════════════════════════════════════════════════════════════
 
 def qwen_text_config(qwen_dir: str):
@@ -123,6 +131,25 @@ def parse_args():
     p.add_argument("--unfreeze_text_embed", action="store_true",
                    help="默认冻结 Qwen 词表 embedding")
     p.add_argument("--text_template", default="描述这张建筑工地图片：{caption}")
+    # ── 前缀课程（可选，DESIGN_prefix_weighting.md / MATH_mask_analysis.md §6）──
+    p.add_argument("--prefix_curriculum", action="store_true",
+                   help="启用 z_s 前缀课程训练: 按分布采样 k，重建损失 w(k)·L1_k")
+    p.add_argument("--prefix_k_min", type=int, default=8,
+                   help="前缀采样下限（防 k 过小损失爆炸/梯度不稳）")
+    p.add_argument("--prefix_p_full", type=float, default=0.5,
+                   help="每步以该概率仍用全量 k=N（保底全量精度）")
+    p.add_argument("--prefix_dist", default="uniform",
+                   choices=["uniform", "log_uniform"],
+                   help="k 采样分布: uniform 自带线性前置偏置 N−i+1; "
+                        "log_uniform 小 k 更密")
+    p.add_argument("--prefix_w", default="inv",
+                   choices=["inv", "power", "none"],
+                   help="重建损失权重形状: inv=1/(k+1); power=(N/k)^p; "
+                        "none=恒 1（仅靠采样频率前置）")
+    p.add_argument("--prefix_w_p", type=float, default=1.0,
+                   help="power 形状指数 p（--prefix_w power 时生效）")
+    p.add_argument("--prefix_w_floor", type=float, default=0.05,
+                   help="w(k) 地板（防全量分支权重趋零/数值过小）")
     return p.parse_args()
 
 
@@ -130,7 +157,7 @@ def parse_args():
 # Eval — 仅主进程, 全量 test 分片
 # ═══════════════════════════════════════════════════════════════
 
-def evaluate(acc: Accelerator, model: torch.nn.Module, loader: DataLoader) -> float:
+def evaluate(acc, model: torch.nn.Module, loader: DataLoader) -> float:
     model.eval()
     sums = {}
     n = 0
@@ -154,6 +181,12 @@ def evaluate(acc: Accelerator, model: torch.nn.Module, loader: DataLoader) -> fl
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    # 重依赖延迟导入（transformers/accelerate 仅训练路径需要；保证
+    # `python train_v2.py` 自检在本机无这些包时也可运行）
+    from transformers import Dinov2Model, AutoConfig, AutoTokenizer, get_scheduler
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+
     args = parse_args()
     set_seed(args.seed)
 
@@ -257,6 +290,15 @@ def main():
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
     # ── 训练循环（手动梯度累积: 显式、无插件魔法）──
+    if args.prefix_curriculum:
+        assert 1 <= args.prefix_k_min <= num_patches, \
+            f"prefix_k_min={args.prefix_k_min} 超出 [1,{num_patches}]"
+        assert 0.0 <= args.prefix_p_full <= 1.0, "prefix_p_full ∈ [0,1]"
+        acc.print(f"[prefix] 前缀课程: dist={args.prefix_dist} "
+                  f"k_min={args.prefix_k_min} p_full={args.prefix_p_full} "
+                  f"w={args.prefix_w}(p={args.prefix_w_p}, "
+                  f"floor={args.prefix_w_floor}) —— 重建损失 w(k)·L1_k, "
+                  f"文字分支共享同一前缀 k（不额外加权，梯度压力来自采样频率）")
     ema_loss, micro, t0 = None, 0, time.time()
     model.train()
     for epoch in range(args.epochs):
@@ -268,7 +310,21 @@ def main():
             ctx = acc.no_sync(model) if micro % args.grad_accum != 0 else nullcontext()
             with ctx:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = model(x, text_ids=text_ids)["loss"] / args.grad_accum
+                    if args.prefix_curriculum:
+                        # 前缀课程: 采样 k（p_full 概率全量保底），重建+文字
+                        # 统一只喂 z_s[:k]，重建损失加权 w(k)（递减 ⇒ 前置）
+                        use_full = random.random() < args.prefix_p_full
+                        k = num_patches if use_full else sample_prefix_k(
+                            args.prefix_k_min, num_patches, args.prefix_dist)
+                        out = model(x, text_ids=text_ids, z_keep=k)
+                        w = prefix_weight(k, num_patches, args.prefix_w,
+                                          args.prefix_w_p, args.prefix_w_floor)
+                        loss = w * out["recon"]
+                        if "text_loss" in out:
+                            loss = loss + args.text_loss_weight * out["text_loss"]
+                    else:
+                        loss = model(x, text_ids=text_ids)["loss"]
+                    loss = loss / args.grad_accum
                 acc.backward(loss)
 
             if micro % args.grad_accum == args.grad_accum - 1:
@@ -327,4 +383,54 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # ── 自检: sample_prefix_k 分布特性（无数据依赖）──
+    N, k_min = 576, 8
+    rng = random.Random(0)
+    for dist in ("uniform", "log_uniform"):
+        ks = [sample_prefix_k(k_min, N, dist, rng) for _ in range(50000)]
+        assert all(k_min <= k <= N for k in ks), (dist, min(ks), max(ks))
+        avg = sum(ks) / len(ks)
+        frac_small = sum(1 for k in ks if k <= 32) / len(ks)
+        print(f"  [sampler] {dist}: mean={avg:.1f} (uniform 理论 "
+              f"{(k_min + N) / 2:.1f})  k≤32 占比={frac_small:.3f}")
+    mu_u = sum(sample_prefix_k(k_min, N, "uniform", rng)
+               for _ in range(50000)) / 50000
+    mu_l = sum(sample_prefix_k(k_min, N, "log_uniform", rng)
+               for _ in range(50000)) / 50000
+    assert abs(mu_u - (k_min + N) / 2) < 5.0, f"uniform 均值 {mu_u:.1f} 偏离理论"
+    assert mu_l < mu_u, f"log_uniform 应偏小 k: {mu_l:.1f} vs {mu_u:.1f}"
+    print(f"[ok] sample_prefix_k: 边界/分布正确 "
+          f"(uniform≈{(k_min + N) / 2:.0f}, log_uniform 偏小 k)")
+
+    # ── 自检: 前缀课程损失构成（假模型，无数据/无加速）──
+    import torch.nn as nn
+    from model_v2 import SRPhase1V2
+    from types import SimpleNamespace
+
+    class FakeDinoS(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._feat = torch.randn(4, 17, 64)
+
+        def forward(self, pixel_values):
+            B = pixel_values.shape[0]
+            return SimpleNamespace(last_hidden_state=self._feat[:B].clone())
+
+    torch.manual_seed(0)
+    m = SRPhase1V2(FakeDinoS(), num_patches=16, dim=64,
+                   reencoder_depth=2, decoder_depth=2, vocab_size=128,
+                   qwen_hidden=64, max_text_len=32, text_decoder_depth=2)
+    x = torch.randn(2, 3, 224, 224)
+    tid = torch.randint(0, 128, (2, 10))
+    Nm = m.num_patches
+    for k in (Nm, 5, 1):
+        out = m(x, text_ids=tid, z_keep=k)
+        w = prefix_weight(k, Nm)
+        loss = w * out["recon"] + out["text_loss"]
+        loss.backward()
+        assert out["F_hat"].shape == (2, Nm, 64)
+        print(f"  [curriculum] k={k}: w={w:.4f} recon={out['recon'].item():.4f} "
+              f"text={out['text_loss'].item():.4f} → loss={loss.item():.4f}")
+    print("[ok] 前缀课程: z_keep 统一前缀 + w(k) 加权损失 + 梯度 正确")
+
+    print("\nALL TRAIN CHECKS PASSED")

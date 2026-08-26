@@ -34,11 +34,25 @@
 3. **k 扫描结论**：k=1..32 平台期（L1≈0.0033 = 全量 2.9×）；窗口探针显示编码器**信息摊匀**（任意 32-token 窗口还原能力相同）。
 4. **数学分析结论**：掩码**有用（必要不充分）**，应保留；"只算前 k 的预算推理"（截断编码器）需注意**传递前缀自洽不成立**（patches 枢纽回渗，MATH §3.2）。
 5. **加权机制**：w(k) 递减 ⇒ 梯度压力 Σ_{j≥i}w_j 递减 ⇒ 信息前置（**正确论证**，DESIGN §3 已修正；均匀采样精确 ∝ N−i+1）；需配 p_full 全量保底 / w 地板 / k_min 下限。
+6. **前缀课程已实现（2026-08-26，待用户审核）**：`train_v2.py --prefix_curriculum`
+   + `--prefix_k_min / --prefix_p_full / --prefix_dist / --prefix_w / --prefix_w_p / --prefix_w_floor`；
+   `model_v2.py` 的 `z_keep` 统一作用于重建+文字两分支，新增 `prefix_weight` / `sample_prefix_k`；
+   `infer_k_sweep.py` 新增 `--window` 滑窗探针。全部自检通过（`python model_v2.py` /
+   `python train_v2.py`）。详见 `DESIGN_prefix_weighting.md` §10 实施记录。
 
 ## 下一步（用户计划，待用户拍板后执行）
 1. **先确认服务器状态**（实例/端口/数据/产物）；不可达则向用户说明并讨论恢复方案。
-2. 实现 `train_v2.py --prefix_curriculum`：按 DESIGN §4 选项（k 采样分布、权重形状、k_min、p_full、是否退火）——细节等用户确认。
-3. 训练后重跑 `infer_k_sweep.py` + 窗口探针验证：预期 k=1..32 平台消失、前段窗口信息量>后段、全量 L1 退化 ≤1.5×（当前 0.00114）。
+2. **审核前缀课程实现**（DESIGN §10 实施记录 + git commit）——通过后上服务器开训：
+   ```bash
+   # 纯重建 + 前缀课程（示例默认参数，可调）
+   accelerate launch --multi_gpu --num_processes 2 \
+       train_v2.py --data_dir /root/autodl-tmp/construction_site \
+       --dino_dir /root/autodl-tmp/models/dinov2-large \
+       --prefix_curriculum --prefix_p_full 0.5 --prefix_k_min 8 \
+       --output_dir output/phase1_v2_prefix
+   # 文字模式同加 --prefix_curriculum（文字条件与重建共享同一前缀 k）
+   ```
+3. 训练后重跑 `infer_k_sweep.py`（k 扫描 + `--window 32` 滑窗探针）验证：预期 k=1..32 平台消失、前段窗口信息量>后段、全量 L1 退化 ≤1.5×（当前 0.00114）。
 4. 验证成功后并入正式版（改进 v2），届时再打版本 tag。
 
 ## 已知坑（勿重蹈，代码注释里也有）

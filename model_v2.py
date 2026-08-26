@@ -53,9 +53,16 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
         out = model(pixel_values, text_ids)   # 多任务: loss = L1 + L_text
         ids = model.generate_text(pixel_values, prompt_ids)   # 自回归生成
 
+    前缀课程（"预算/渐进"）: forward 传 z_keep=k（k∈[0,N]）即让**重建与
+    文字两分支统一**只喂前 k 个 z_s（重建输出仍恒全量 N patch）；配合
+    prefix_weight(k, N, ...) 给重建损失加权 w(k)（递减 ⇒ 梯度压力前置，
+    见 DESIGN_prefix_weighting.md / MATH_mask_analysis.md §6）。
     自检: python model_v2.py（形状 / 两处块掩码结构 / 梯度 /
-          init_reencoder_from_dino / eval 同路径 / TextDecoder）
+          init_reencoder_from_dino / eval 同路径 / TextDecoder /
+          z_keep 统一前缀 / prefix_weight）
 """
+
+import random
 
 import torch
 import torch.nn as nn
@@ -119,6 +126,57 @@ def build_prefix_mask(seq_len: int, z_start: int, z_end: int,
         for i in range(z_end, seq_len):
             m[i, i + 1:] = True           # 尾部因果: 见 z 全部 + 尾部≤i
     return m
+
+
+# ═══════════════════════════════════════════════════════════════
+# prefix_weight — 前缀重建损失权重 w(k)（随 k 递减，见 DESIGN §3 / MATH §6）
+# ═══════════════════════════════════════════════════════════════
+
+def prefix_weight(k: int, N: int, w_shape: str = "inv",
+                  w_p: float = 1.0, w_floor: float = 0.05) -> float:
+    """前缀长度 k 的重建损失权重 w(k)，要求 w_0 ≥ w_1 ≥ … ≥ w_N ≥ 0。
+
+    w_shape:
+        inv   : 1/(k+1)          （默认；MATH §6.4 梯度压力示例形状）
+        power : (N/k)^w_p        （k=1 → N^p 最大，k=N → 1；w_p 控陡度）
+        none  : 恒 1.0           （不加权，仅靠 k 采样频率的前置偏置 N−i+1）
+    w_floor: 权重下限 max(w, w_floor)（防全量分支权重趋零；默认 0.05，
+             见 DESIGN §4 选项 (c)）。
+    k=0（仅 z_cls）为退化边界: inv → 1.0（最大），power 发散故返回 w_floor。
+
+    用途: 训练时按前缀课程采样 k 后，重建损失取 w(k)·L1_k——梯度压力
+    Σ_{j≥i} w_j 随 i 递减 ⇒ 越早的 z_s 压力越大 ⇒ 信息前置
+    （正确论证见 MATH_mask_analysis.md §6.4，非草稿 §3 的 telescoping 恒等式）。
+    """
+    assert 0 <= k <= N, f"k={k} 超出 [0,{N}]"
+    if w_shape == "inv":
+        w = 1.0 / (k + 1)
+    elif w_shape == "power":
+        w = (N / max(k, 1)) ** w_p if k > 0 else w_floor   # k=0: 幂发散, 取地板
+    elif w_shape == "none":
+        w = 1.0
+    else:
+        raise ValueError(f"未知 w_shape={w_shape!r} (可选 inv|power|none)")
+    return max(w, w_floor)
+
+
+def sample_prefix_k(k_min: int, N: int, dist: str = "uniform",
+                    rng: Optional[random.Random] = None) -> int:
+    """按分布采样前缀长度 k ∈ [k_min, N]（prefix_curriculum 训练用）。
+
+    uniform     : [k_min, N] 整数均匀。天然自带前置偏置——token i 出现的
+                  前缀数 ∝ N−i+1（i=1→N, i=N→1，精确线性递减，
+                  MATH §6.4），均匀采样本身即梯度压力前置。
+    log_uniform : log 空间均匀 → 小 k 在整数轴上更密（DESIGN §4 选项 b）。
+    """
+    rng = rng or random
+    if dist == "uniform":
+        return rng.randint(k_min, N)               # 含两端 [k_min, N]
+    if dist == "log_uniform":
+        import math
+        lo, hi = math.log(k_min), math.log(N)
+        return max(k_min, min(N, int(round(math.exp(rng.uniform(lo, hi))))))
+    raise ValueError(f"未知 dist={dist!r} (可选 uniform|log_uniform)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -429,18 +487,21 @@ class SRPhase1V2(nn.Module):
                 z_keep: Optional[int] = None) -> dict:
         """pixel_values: (B,3,224,224) → dict{loss, recon, F_hat, ...}
 
-        重建损失: L1(F_hat, patch)（全量 z_s 进 decoder，无选择无预算）。
+        重建损失: L1(F_hat, patch)。z_keep=None 时全量 z_s 进 decoder
+        （无选择无预算，默认路径）；z_keep=k 时**重建与文字两分支统一**
+        只喂前 k 个 z_s（前缀课程/预算场景，k∈[0,N]，FeatureDecoder 输出
+        恒为全量 N 个 patch）。
         text_ids 传入时（(B,T) long, T≥2）追加仅文字自回归:
-            TextDecoder: [z_cls; z_s(全量); 文字] → 错位 CE（位置 i 预测
-            i+1，ignore_index=pad_token_id），loss = L1 + text_loss_weight*L_text。
-        z_keep: 可选（仅文字分支），只喂前 z_keep 个 z_s 作为文字条件
-        （"预算/渐进"场景，k∈[0,N]；重建分支仍用全量 z_s）。
+            TextDecoder: [z_cls; z_s(与重建同一前缀); 文字] → 错位 CE
+            （位置 i 预测 i+1，ignore_index=pad_token_id），
+            loss = L1 + text_loss_weight*L_text。
         """
         x = pixel_values                                # (B,3,224,224)
         z_cls, z_s, patch = self._encode_z(x)           # (B,1,D) (B,N,D) (B,N,D)
+        z_s_in = z_s[:, :z_keep] if z_keep is not None else z_s   # 统一前缀
 
-        # ── FeatureDecoder: [z_cls; z_s(全量); patch×N] → F_hat ──
-        F_hat = self.decoder(z_cls, z_s)                # (B,N,D)
+        # ── FeatureDecoder: [z_cls; z_s(前缀); patch×N] → F_hat（输出恒全量 N）──
+        F_hat = self.decoder(z_cls, z_s_in)             # (B,N,D)
         recon = F.l1_loss(F_hat, patch)                 # 重建损失
 
         out = {"loss": recon, "recon": recon, "F_hat": F_hat}
@@ -448,8 +509,7 @@ class SRPhase1V2(nn.Module):
             assert self.text_decoder is not None, \
                 "text_ids 传入但 TextDecoder 未配置（构造需 vocab_size>0）"
             assert text_ids.size(1) >= 2, "text_ids 至少 2 个 token（错位需要）"
-            z_s_txt = z_s[:, :z_keep] if z_keep is not None else z_s
-            logits = self.text_decoder(text_ids, z_cls, z_s_txt)   # (B,T,V)
+            logits = self.text_decoder(text_ids, z_cls, z_s_in)    # (B,T,V)
             V = logits.size(-1)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = text_ids[..., 1:].contiguous()
@@ -647,7 +707,7 @@ if __name__ == "__main__":
           f"text_loss={out_t['text_loss'].item():.4f}")
 
     # ── 7. z_s 前缀输入（k<N）: 绝对位置稳定，掩码不含缺失 z 列 ──
-    z_cls_p, z_s_p, _ = tmodel._encode_z(x)                  # (2,1,D) (2,N,D)
+    z_cls_p, z_s_p, patch_p = tmodel._encode_z(x)            # (2,1,D) (2,N,D)
     k = 5
     out_p = tmodel.text_decoder(tid, z_cls_p, z_s_p[:, :k])  # 只喂前 5 个 z_s
     assert out_p.shape == (2, 20, V), out_p.shape
@@ -665,7 +725,43 @@ if __name__ == "__main__":
         f"kept={tmodel.text_decoder.kept.cpu().tolist()} != {kept_exp.tolist()}"
     out_t2 = tmodel(x, text_ids=tid, z_keep=k)             # forward 内 z_keep 切片
     assert out_t2["text_logits"].shape == (2, 20, V)
-    print(f"[ok] TextDecoder 前缀输入: k={k}<N 形状/掩码/绝对位置/forward z_keep 正确")
+    # z_keep 现在统一作用于重建+文字两分支: recon 应为"前缀重建"（L1 与
+    # 直接调 decoder(z_cls, z_s[:, :k]) 一致），输出仍全量 N patch
+    F_hat_ref = tmodel.decoder(z_cls_p, z_s_p[:, :k])
+    recon_ref = F.l1_loss(F_hat_ref, patch_p)
+    assert abs(out_t2["recon"].item() - recon_ref.item()) < 1e-6, \
+        (out_t2["recon"].item(), recon_ref.item())
+    assert out_t2["F_hat"].shape == (2, N, D)
+    print(f"[ok] TextDecoder 前缀输入: k={k}<N 形状/掩码/绝对位置/forward "
+          f"z_keep(重建+文字统一) 正确, recon={out_t2['recon'].item():.6f}")
+
+    # ── 8. prefix_weight: 递减 / 地板 / 三种形状 / 边界 ──
+    Nw = 576
+    ws = [prefix_weight(kk, Nw, "inv", w_floor=0.0) for kk in range(Nw + 1)]
+    assert all(ws[i] >= ws[i + 1] for i in range(Nw)), "inv 必须非增"
+    assert ws[0] == 1.0 and abs(ws[Nw] - 1.0 / (Nw + 1)) < 1e-12
+    assert prefix_weight(1, Nw) > prefix_weight(Nw, Nw)      # 递减
+    assert prefix_weight(Nw, Nw, w_floor=0.05) == 0.05       # 地板生效
+    assert prefix_weight(10, Nw, "power", 1.0) == Nw / 10.0  # power
+    assert prefix_weight(10, Nw, "none") == 1.0              # 恒 1
+    assert prefix_weight(0, Nw, "power") == 0.05             # k=0 幂发散→地板
+    wp = [prefix_weight(kk, Nw, "power", 0.5) for kk in range(1, Nw + 1)]
+    assert all(wp[i] >= wp[i + 1] for i in range(Nw - 1)), "power 必须非增"
+    print(f"[ok] prefix_weight: inv 非增(0→1.0, N→1/(N+1)) / power / none / "
+          f"地板 / k=0 边界 正确")
+
+    # ── 9. sample_prefix_k: 边界与分布特性 ──
+    km = 8
+    rng = random.Random(0)
+    for dist in ("uniform", "log_uniform"):
+        ks = [sample_prefix_k(km, Nw, dist, rng) for _ in range(20000)]
+        assert all(km <= k <= Nw for k in ks), (dist, min(ks), max(ks))
+    mu_u = sum(sample_prefix_k(km, Nw, "uniform", rng) for _ in range(20000)) / 20000
+    mu_l = sum(sample_prefix_k(km, Nw, "log_uniform", rng) for _ in range(20000)) / 20000
+    assert abs(mu_u - (km + Nw) / 2) < 5.0, f"uniform 均值 {mu_u:.1f} 偏离理论"
+    assert mu_l < mu_u, f"log_uniform 应偏小 k: {mu_l:.1f} vs {mu_u:.1f}"
+    print(f"[ok] sample_prefix_k: 边界正确, uniform≈{(km + Nw) / 2:.0f}, "
+          f"log_uniform 偏小 k ({mu_l:.0f} < {mu_u:.0f})")
 
     with torch.no_grad():
         gen = tmodel.generate_text(x, torch.randint(0, V, (2, 3)), max_new_tokens=5)

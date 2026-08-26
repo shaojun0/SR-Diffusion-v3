@@ -122,3 +122,30 @@ git 历史中的 SelectHead/边界分布/STE/率惩罚是**学习式门控 + 预
 - final_model: `output/phase1_v2/final_model.pt`（fp32，从 ckpt-16000 重导出）
 - 注意: 训练日志 eval 为 bf16 损失略低估；fp32 全量测试 L1 ≈ 0.00114
 - 数学分析: `MATH_mask_analysis.md`（掩码必要不充分论证、恒等式修正、梯度压力机制）
+
+## 10. 实施记录（2026-08-26，已实现，待用户审核）
+
+> 按本设计落地（见本 commit；涉及 `model_v2.py` / `train_v2.py` / `infer_k_sweep.py`，
+> 全部自检通过: `python model_v2.py` + `python train_v2.py`）。
+
+- **`model_v2.py`**:
+  - `forward(pixel_values, text_ids, z_keep=k)` 的 `z_keep` 现在**统一**作用于
+    重建+文字两分支（原仅文字）——前缀课程一步前向同时给出前缀重建与
+    前缀文字条件；`None` = 全量（默认路径不变）。
+  - 新增 `prefix_weight(k, N, w_shape, w_p, w_floor)` 纯函数: `w_shape` ∈
+    `inv`(1/(k+1)) / `power`((N/k)^p) / `none`(恒 1)，地板 `max(w, w_floor)`。
+  - 新增 `sample_prefix_k(k_min, N, dist, rng)`: `dist` ∈ `uniform` / `log_uniform`。
+- **`train_v2.py`**: 新增 `--prefix_curriculum` 及参数 `--prefix_k_min=8`、
+  `--prefix_p_full=0.5`、`--prefix_dist=uniform`、`--prefix_w=inv`、
+  `--prefix_w_p=1.0`、`--prefix_w_floor=0.05`。训练循环: 每步以 `p_full`
+  概率全量 k=N 保底，否则从 [k_min, N] 按 `dist` 采样 k；调
+  `model(x, text_ids, z_keep=k)`，loss = w(k)·L1_k + text_weight·L_text
+  （文字不额外按 k 加权——其 z_s 梯度压力来自采样频率 N−i+1，且与重建
+  共享同一前缀 k）。transformers/accelerate 重依赖延迟到 `main()` 导入，
+  `python train_v2.py` 自检（采样器分布 + 前缀课程损失构成）不依赖重依赖。
+- **`infer_k_sweep.py`**: 新增滑窗探针模式 `--window N`（滑窗合并进 batch
+  一次 decoder 前向，分块控显存）——训练后验证"信息前置"（§7.2 判据:
+  前段窗口应明显好于后段；训练前实测任意 32-token 窗口 ≈0.0033 无差异）。
+
+**未实现的待拍板项**（§4）: 调度退火（前期全量为主、后期加大前缀比例）——
+YAGNI 暂缓；若训练后全量精度退化或 k=1..32 平台期仍存，再考虑补退火。
