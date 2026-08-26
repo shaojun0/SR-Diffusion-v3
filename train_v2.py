@@ -245,7 +245,8 @@ def main():
     # ── 收尾: 仅主进程导出推理权重 ──
     acc.wait_for_everyone()
     if acc.is_main_process:
-        sd = acc.unwrap_model(model).state_dict()
+        raw = acc.unwrap_model(model)            # DDP 包装下取回裸模型
+        sd = raw.state_dict()
         # 必须 fp32: 本模型重建精度极高(L1~0.001), bf16 导出会因权重量化
         # 使 L1 劣化约 2 倍(实测 0.0011 → 0.0021)。不省这个空间。
         final = os.path.join(args.output_dir, "final_model.pt")
@@ -255,7 +256,7 @@ def main():
                 "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "causal_specials": not args.no_causal_specials,
-                "decoder_steps": model.decoder.steps,
+                "decoder_steps": raw.decoder.steps,
                 "decoder_loss_weight": args.decoder_loss_weight,
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
