@@ -112,7 +112,9 @@ def compute_metrics(eval_pred):
     if isinstance(preds, dict):
         items = preds
     elif isinstance(preds, (tuple, list)):
-        items = dict(zip(("loss", "recon", "F_hat"), preds))
+        # prediction_step 无 labels 路径: logits = 除 loss 外所有输出
+        # (recon, F_hat)（dict 插入序）。loss 单独在 eval_loss 里报告。
+        items = dict(zip(("recon", "F_hat"), preds))
     else:
         items = {}
     metrics = {}
@@ -123,6 +125,19 @@ def compute_metrics(eval_pred):
             if v.size > 0:
                 metrics[k] = float(v.mean())
     return metrics
+
+
+# ═══════════════════════════════════════════════════════════════
+# Trainer 子类（官方扩展点, 不算造轮子）: 本模型无 labels、无 config,
+# Trainer 默认 can_return_loss=False → eval 时 loss_without_labels=False
+# → eval_loss 为 None。置 True 让 eval 也走 compute_loss 路径, 正常报告
+# eval_loss（模型 forward 返回 dict 含 "loss", compute_loss 原生支持）。
+# ═══════════════════════════════════════════════════════════════
+
+class SRPhase1V2Trainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.can_return_loss = True   # 无 labels 模型也允许 eval 算 loss
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -214,7 +229,7 @@ def main():
         # 全 fp32: 不设 bf16/fp16, 不套 autocast
     )
 
-    trainer = Trainer(
+    trainer = SRPhase1V2Trainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
