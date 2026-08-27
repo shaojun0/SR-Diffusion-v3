@@ -6,6 +6,13 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后）
     平方采样计划 + 加权全覆盖损失）→ F_hat = 采样步平均, L1 重建 DINO
     patch 特征。无 TextDecoder（YAGNI: 先不增实体）。
 
+2026-08-27 训练口径调整（用户要求）:
+    · 去掉加权体系: decoder_loss_weight 默认 uniform —— 全部采样步平权
+      （之前 density 密度补偿权重, 对"不公平"有争议）;
+    · 全 fp32 训练: 训练/评估不再用 bf16 autocast —— 重建精度 L1~0.001,
+      bf16 计算 + fp32 导出被质疑不公平（之前 bf16 算 fp32 存）;
+    · batch_size 默认提高到 16/卡（97GB 显存充裕）。
+
 数据（data_v2.py）: 原图 → 旋转(最优角) → 等比缩放 → 居中填充 1600:900
     (16:9) 画布 → 16:9 模型输入 (448×252)。轮廓不变形、内容面积最大化。
 
@@ -14,8 +21,7 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后）
     优化器 → torch AdamW；数据 → datasets + DataLoader + 自定义 collate。
 
 多卡: accelerate launch --multi_gpu --num_processes N
-（bf16 在代码内显式 torch.autocast: 规避 torch 2.13 混合设备 conv
-  dtype bug 与 accelerate prepare 自动包装; 权重保持 fp32）
+（全 fp32: 显式 .to(acc.device) 规避 torch 混合设备 conv dtype bug）
 
 用法:
     accelerate launch --multi_gpu --num_processes 2 \
@@ -55,7 +61,7 @@ def parse_args():
     p.add_argument("--angle_step", type=float, default=0.5, help="最优旋转角网格步长(度)")
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--max_steps", type=int, default=0, help="0 = epochs 决定")
-    p.add_argument("--batch_size", type=int, default=8, help="每卡 batch")
+    p.add_argument("--batch_size", type=int, default=16, help="每卡 batch")
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
@@ -79,9 +85,10 @@ def parse_args():
     # ── 模型（OutputQueryDecoder）──
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(N)")
-    p.add_argument("--decoder_loss_weight", default="density",
+    p.add_argument("--decoder_loss_weight", default="uniform",
                    choices=["density", "uniform", "capability"],
-                   help="每步损失权重: density=密度补偿(默认) / uniform / capability")
+                   help="每步损失权重: uniform=平权(默认, 去掉加权体系) / "
+                        "density=密度补偿 / capability")
     return p.parse_args()
 
 
@@ -96,8 +103,7 @@ def evaluate(acc: Accelerator, model: torch.nn.Module, loader: DataLoader) -> fl
     with torch.no_grad():
         for batch in loader:
             x = batch["pixel_values"].to(acc.device)   # eval loader 未 prepare, 显式搬设备
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = model(x)
+            out = model(x)                             # fp32
             bs = x.shape[0]
             for k in ("loss", "recon"):
                 sums[k] = sums.get(k, 0.0) + out[k].item() * bs
@@ -126,9 +132,8 @@ def main():
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"decoder_steps 越界: {steps} (N={num_patches})"
 
-    # mixed_precision="no" + 显式 torch.autocast(bf16)：本环境（torch 2.13）
-    # 在「输入在 CPU、模型在 CUDA」且开 autocast 时 conv 会报 dtype 错，
-    # 显式 .to(acc.device) + 显式 autocast 规避；权重保持 fp32（bf16 只算不存）。
+    # 全 fp32 训练: 重建精度 L1~0.001, bf16 计算会带来不公平的精度损耗;
+    # 显式 .to(acc.device) 规避 torch 混合设备 conv dtype bug。
     acc = Accelerator(mixed_precision="no", step_scheduler_with_optimizer=False)
 
     # ── 数据（纯重建模式, tokenizer=None）──
@@ -205,8 +210,7 @@ def main():
             x = batch["pixel_values"].to(acc.device)
             ctx = acc.no_sync(model) if micro % args.grad_accum != 0 else nullcontext()
             with ctx:
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    loss = model(x)["loss"] / args.grad_accum
+                loss = model(x)["loss"] / args.grad_accum   # 全 fp32
                 acc.backward(loss)
 
             if micro % args.grad_accum == args.grad_accum - 1:
@@ -242,13 +246,11 @@ def main():
                     break
             micro += 1
 
-    # ── 收尾: 仅主进程导出推理权重 ──
+    # ── 收尾: 仅主进程导出推理权重（全 fp32 训练, 权重天然 fp32）──
     acc.wait_for_everyone()
     if acc.is_main_process:
         raw = acc.unwrap_model(model)            # DDP 包装下取回裸模型
         sd = raw.state_dict()
-        # 必须 fp32: 本模型重建精度极高(L1~0.001), bf16 导出会因权重量化
-        # 使 L1 劣化约 2 倍(实测 0.0011 → 0.0021)。不省这个空间。
         final = os.path.join(args.output_dir, "final_model.pt")
         torch.save(sd, final)
         info = {"input_size": [W, H], "canvas": [CW, CH],
