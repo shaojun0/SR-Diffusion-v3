@@ -9,19 +9,30 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后）
 2026-08-27 训练口径调整（用户要求）:
     · 去掉加权体系: decoder_loss_weight 默认 uniform —— 全部采样步平权
       （之前 density 密度补偿权重, 对"不公平"有争议）;
-    · 全 fp32 训练: 训练/评估不再用 bf16 autocast —— 重建精度 L1~0.001,
+    · 全 fp32 训练: 训练/评估不用 bf16/fp16 —— 重建精度 L1~0.001,
       bf16 计算 + fp32 导出被质疑不公平（之前 bf16 算 fp32 存）;
+      TrainingArguments 不设 bf16/fp16, 也不套 torch.autocast;
     · batch_size 默认提高到 16/卡（97GB 显存充裕）。
+
+HF Trainer 风格（消除造轮子）:
+    · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
+      transformers.Trainer + TrainingArguments（lr_scheduler_type="cosine"
+      + warmup_ratio, save_strategy="steps", ddp_find_unused_parameters=
+      False, report_to=[]）; 优化器 → Trainer 默认 AdamW。不再手写
+      acc.no_sync / 手动 grad_accum / get_scheduler / acc.save_state。
+    · 数据 → data_v2.py 的 ParquetImageDataset + V2Collator 直接作为
+      train_dataset / eval_dataset / data_collator 传给 Trainer。
+    · 模型 forward 返回 dict{"loss", ...}: Trainer.compute_loss 原生支持
+      dict 输出取 "loss" 键（transformers 4.x / 5.x 均如此:
+      loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0],
+      dict 缺 "loss" 才报错）——无需子类化 Trainer。
 
 数据（data_v2.py）: 原图 → 旋转(最优角) → 等比缩放 → 居中填充 1600:900
     (16:9) 画布 → 16:9 模型输入 (448×252)。轮廓不变形、内容面积最大化。
 
-解耦 / 不造轮子:
-    分布式/检查点 → accelerate；调度 → transformers get_scheduler；
-    优化器 → torch AdamW；数据 → datasets + DataLoader + 自定义 collate。
-
 多卡: accelerate launch --multi_gpu --num_processes N
-（全 fp32: 显式 .to(acc.device) 规避 torch 混合设备 conv dtype bug）
+（Trainer 在 accelerate launch 下自动接管 DDP, 等价于 Trainer 自管 DDP;
+全 fp32 无 autocast, 无需显式 .to(device)）
 
 用法:
     accelerate launch --multi_gpu --num_processes 2 \
@@ -33,15 +44,11 @@ import argparse
 import glob
 import json
 import os
-import time
-from contextlib import nullcontext
 
+import numpy as np
 import torch
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from transformers import Dinov2Model, get_scheduler
-from accelerate import Accelerator
-from accelerate.utils import set_seed
+from transformers import Dinov2Model, Trainer, TrainingArguments
+from transformers.trainer_utils import set_seed
 
 from data_v2 import ParquetImageDataset, V2Collator
 from model_v2 import SRPhase1V2
@@ -74,8 +81,9 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=2000)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--resume", default=None, help="accelerate checkpoint 目录")
-    p.add_argument("--smoke", action="store_true", help="3 步冒烟, 不存盘")
+    p.add_argument("--resume", default=None, help="Trainer checkpoint 目录(如 output_dir/checkpoint-123)")
+    p.add_argument("--smoke", action="store_true",
+                   help="冒烟: 不存 checkpoint, 但照常导出 final_model.pt")
     # ── 模型（ReEncoder）──
     p.add_argument("--reencoder_depth", type=int, default=4)
     p.add_argument("--heads", type=int, default=8)
@@ -93,24 +101,28 @@ def parse_args():
 
 
 # ═══════════════════════════════════════════════════════════════
-# Eval — 仅主进程, 全量 test 分片
+# Eval 指标 — Trainer 的 prediction_step 对无 labels 模型直接 forward,
+# 把输出 dict 按插入序转成值的元组 (loss, recon, F_hat)（多 batch 后是
+# 拼接数组的元组; 4.x 与 5.x 行为一致）。该路径 loss=None, eval loop 不会
+# 自动算 eval_loss, 所以在这里显式从模型输出里取 loss / recon。
 # ═══════════════════════════════════════════════════════════════
 
-def evaluate(acc: Accelerator, model: torch.nn.Module, loader: DataLoader) -> float:
-    model.eval()
-    sums = {}
-    n = 0
-    with torch.no_grad():
-        for batch in loader:
-            x = batch["pixel_values"].to(acc.device)   # eval loader 未 prepare, 显式搬设备
-            out = model(x)                             # fp32
-            bs = x.shape[0]
-            for k in ("loss", "recon"):
-                sums[k] = sums.get(k, 0.0) + out[k].item() * bs
-            n += bs
-    line = ", ".join(f"{k} {v / max(n, 1):.6f}" for k, v in sums.items())
-    acc.print(f"[eval] {line}  (n={n})")
-    return sums.get("loss", 0.0) / max(n, 1)
+def compute_metrics(eval_pred):
+    preds = eval_pred.predictions
+    if isinstance(preds, dict):
+        items = preds
+    elif isinstance(preds, (tuple, list)):
+        items = dict(zip(("loss", "recon", "F_hat"), preds))
+    else:
+        items = {}
+    metrics = {}
+    for k in ("loss", "recon"):
+        v = items.get(k)
+        if v is not None:
+            v = np.asarray(v)
+            if v.size > 0:
+                metrics[k] = float(v.mean())
+    return metrics
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -132,27 +144,17 @@ def main():
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"decoder_steps 越界: {steps} (N={num_patches})"
 
-    # 全 fp32 训练: 重建精度 L1~0.001, bf16 计算会带来不公平的精度损耗;
-    # 显式 .to(acc.device) 规避 torch 混合设备 conv dtype bug。
-    acc = Accelerator(mixed_precision="no", step_scheduler_with_optimizer=False)
-
-    # ── 数据（纯重建模式, tokenizer=None）──
+    # ── 数据（纯重建模式, tokenizer=None; data_v2.py 已提供）──
     train_files = sorted(glob.glob(os.path.join(args.data_dir, "train-*.parquet")))
     test_files = sorted(glob.glob(os.path.join(args.data_dir, "test-*.parquet")))
     assert train_files, f"无 train-*.parquet in {args.data_dir}"
     coll = V2Collator(model_size=(W, H), canvas=(CW, CH), angle_step=args.angle_step)
     train_ds = ParquetImageDataset(train_files, limit=args.limit)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, collate_fn=coll,
-                              drop_last=True, pin_memory=True)
-    test_loader = None
+    eval_ds = None
     if test_files:
-        test_ds = ParquetImageDataset(test_files, limit=args.eval_limit)
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, collate_fn=coll,
-                                 drop_last=False)
+        eval_ds = ParquetImageDataset(test_files, limit=args.eval_limit)
     else:
-        acc.print("[warn] 无 test-*.parquet, 跳过 eval")
+        print("[warn] 无 test-*.parquet, 跳过 eval")
 
     # ── 模型: DINOv2-large 不冻结 → ReEncoder → OutputQueryDecoder ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
@@ -171,85 +173,70 @@ def main():
                        decoder_loss_weight=args.decoder_loss_weight)
     model.init_reencoder_from_dino(args.reencoder_depth)
 
-    # ── 优化: 只收可训练参数 ──
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    n_train = sum(p.numel() for p in trainable)
-    acc.print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
-              f"输入 {W}x{H}, patches={num_patches}, decoder 采样 "
-              f"{len(model.decoder.steps)} 步 {model.decoder.steps[:6]}...")
-
-    optimizer = AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
-    model, optimizer, train_loader = acc.prepare(model, optimizer, train_loader)
-
-    steps_per_epoch = len(train_loader) // args.grad_accum
-    total_steps = args.max_steps or steps_per_epoch * args.epochs
-    scheduler = get_scheduler("cosine", optimizer=optimizer,
-                              num_warmup_steps=int(total_steps * args.warmup_ratio),
-                              num_training_steps=total_steps)
-    acc.print(f"[train] {len(train_ds)} 样本 | 每卡 bs={args.batch_size} "
-              f"x {acc.num_processes} 卡 | grad_accum={args.grad_accum} | "
-              f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步")
-
-    global_step = 0
-    if args.resume:
-        acc.load_state(args.resume)
-        global_step = int(os.path.basename(args.resume).rsplit("-", 1)[-1])
-        acc.print(f"[resume] 从 {args.resume} 恢复, 续训于 step {global_step}")
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
+          f"输入 {W}x{H}, patches={num_patches}, decoder 采样 "
+          f"{len(model.decoder.steps)} 步 {model.decoder.steps[:6]}...")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-    # ── 训练循环（手动梯度累积: 显式、无插件魔法）──
-    ema_loss, micro, t0 = None, 0, time.time()
-    model.train()
-    for epoch in range(args.epochs):
-        if global_step >= total_steps:
-            break
-        for batch in train_loader:
-            x = batch["pixel_values"].to(acc.device)
-            ctx = acc.no_sync(model) if micro % args.grad_accum != 0 else nullcontext()
-            with ctx:
-                loss = model(x)["loss"] / args.grad_accum   # 全 fp32
-                acc.backward(loss)
+    # ── Trainer: 训练循环/梯度累积/调度/checkpoint/分布式全部交给它 ──
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,   # 0 = epochs 决定
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type="cosine",
+        max_grad_norm=args.grad_clip,
+        dataloader_num_workers=args.num_workers,
+        dataloader_drop_last=True,
+        dataloader_pin_memory=True,
+        logging_steps=args.log_every,
+        logging_dir=os.path.join(args.output_dir, "logs"),
+        eval_strategy="steps" if eval_ds is not None else "no",
+        eval_steps=args.eval_every,
+        save_strategy="no" if args.smoke else "steps",   # 冒烟不存 checkpoint
+        save_steps=args.save_every,
+        seed=args.seed,
+        report_to=[],                  # 不上报 wandb / tensorboard
+        remove_unused_columns=False,   # 原始 dict 样本交给 V2Collator
+        ddp_find_unused_parameters=False,
+        # 全 fp32: 不设 bf16/fp16, 不套 autocast
+    )
 
-            if micro % args.grad_accum == args.grad_accum - 1:
-                acc.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=coll,
+        compute_metrics=compute_metrics if eval_ds is not None else None,
+    )
 
-                lv = loss.item() * args.grad_accum
-                ema_loss = lv if ema_loss is None else 0.98 * ema_loss + 0.02 * lv
+    n_proc = trainer.accelerator.num_processes
+    per_dev = (len(train_ds) + n_proc - 1) // n_proc          # 每卡样本(近似)
+    steps_per_epoch = (per_dev // args.batch_size) // args.grad_accum
+    total_steps = args.max_steps or steps_per_epoch * args.epochs
+    trainer.accelerator.print(
+        f"[train] {len(train_ds)} 样本 | 每卡 bs={args.batch_size} "
+        f"x {n_proc} 卡 | grad_accum={args.grad_accum} | "
+        f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步")
 
-                if global_step % args.log_every == 0:
-                    el = time.time() - t0
-                    sps = global_step * args.batch_size * acc.num_processes / max(el, 1e-9)
-                    acc.print(
-                        f"[step {global_step}/{total_steps}] epoch {epoch + 1} | "
-                        f"loss {ema_loss:.5f} | lr {scheduler.get_last_lr()[0]:.2e} | "
-                        f"{sps:.1f} 样本/s | 已用 {el / 60:.1f}min", flush=True)
-
-                if test_loader is not None and global_step % args.eval_every == 0:
-                    if acc.is_main_process:
-                        evaluate(acc, model, test_loader)
-                    model.train()
-
-                if not args.smoke and global_step % args.save_every == 0:
-                    acc.wait_for_everyone()
-                    ckpt = os.path.join(args.output_dir, f"ckpt-{global_step}")
-                    acc.save_state(ckpt)
-                    acc.print(f"[save] {ckpt}", flush=True)
-
-                if global_step >= total_steps:
-                    break
-            micro += 1
+    if args.resume:
+        trainer.accelerator.print(f"[resume] 从 {args.resume} 恢复 (Trainer checkpoint)")
+    trainer.train(resume_from_checkpoint=args.resume)
 
     # ── 收尾: 仅主进程导出推理权重（全 fp32 训练, 权重天然 fp32）──
-    acc.wait_for_everyone()
-    if acc.is_main_process:
-        raw = acc.unwrap_model(model)            # DDP 包装下取回裸模型
+    trainer.accelerator.wait_for_everyone()
+    if trainer.accelerator.is_main_process:
+        raw = trainer.accelerator.unwrap_model(trainer.model)   # DDP 包装下取回裸模型
         sd = raw.state_dict()
         final = os.path.join(args.output_dir, "final_model.pt")
         torch.save(sd, final)
@@ -263,7 +250,7 @@ def main():
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
             json.dump(info, f, indent=2)
-        acc.print(f"[final] {final} 已保存 (fp32, 含 DINO 权重)")
+        print(f"[final] {final} 已保存 (fp32, 含 DINO 权重)")
 
 
 if __name__ == "__main__":
