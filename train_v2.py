@@ -183,6 +183,10 @@ def main():
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
     # ── Trainer: 训练循环/梯度累积/调度/checkpoint/分布式全部交给它 ──
+    n_proc = int(os.environ.get("WORLD_SIZE", "1"))      # accelerate/DDP 进程数
+    steps_per_epoch = max(1, len(train_ds) // (args.batch_size * n_proc))
+    total_steps = args.max_steps or steps_per_epoch * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -192,14 +196,13 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
         max_grad_norm=args.grad_clip,
         dataloader_num_workers=args.num_workers,
         dataloader_drop_last=True,
         dataloader_pin_memory=True,
         logging_steps=args.log_every,
-        logging_dir=os.path.join(args.output_dir, "logs"),
         eval_strategy="steps" if eval_ds is not None else "no",
         eval_steps=args.eval_every,
         save_strategy="no" if args.smoke else "steps",   # 冒烟不存 checkpoint
@@ -221,13 +224,11 @@ def main():
     )
 
     n_proc = trainer.accelerator.num_processes
-    per_dev = (len(train_ds) + n_proc - 1) // n_proc          # 每卡样本(近似)
-    steps_per_epoch = (per_dev // args.batch_size) // args.grad_accum
-    total_steps = args.max_steps or steps_per_epoch * args.epochs
     trainer.accelerator.print(
         f"[train] {len(train_ds)} 样本 | 每卡 bs={args.batch_size} "
         f"x {n_proc} 卡 | grad_accum={args.grad_accum} | "
-        f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步")
+        f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步 "
+        f"| warmup {warmup_steps} 步")
 
     if args.resume:
         trainer.accelerator.print(f"[resume] 从 {args.resume} 恢复 (Trainer checkpoint)")
