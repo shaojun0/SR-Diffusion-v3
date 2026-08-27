@@ -1,17 +1,22 @@
 """
-SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后）
+SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像素目标）
 =================================================
 架构（model_v2.py, test 分支）: DINOv2-large(参数不冻结) → ReEncoder(因果
     specials 前缀链) → OutputQueryDecoder（输出查询注意力 + KV 因果 +
-    平方采样计划 + 加权全覆盖损失）→ F_hat = 采样步平均, L1 重建 DINO
-    patch 特征。无 TextDecoder（YAGNI: 先不增实体）。
+    平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
+    重建原始像素 pixel_values（非 DINO 特征）。无 TextDecoder。
 
-2026-08-27 训练口径调整（用户要求）:
-    · 去掉加权体系: decoder_loss_weight 默认 uniform —— 全部采样步平权
-      （之前 density 密度补偿权重, 对"不公平"有争议）;
-    · 全 fp32 训练: 训练/评估不用 bf16/fp16 —— 重建精度 L1~0.001,
-      bf16 计算 + fp32 导出被质疑不公平（之前 bf16 算 fp32 存）;
-      TrainingArguments 不设 bf16/fp16, 也不套 torch.autocast;
+2026-08-27 重大修复（用户发现）:
+    监督目标从「DINO patch 特征」改为「原始像素 pixel_values」——
+    之前特征目标退化（工地图特征空间近常数, 学质心即低 L1, 假收敛）;
+    像素目标有真实空间结构, 强制模型保留空间信息。
+    PixelHead: 每 patch 特征 (N,D) → (N, 14*14*3) 像素解码。
+
+2026-08-27 训练口径调整（用户要求, 沿自上轮）:
+    · 去掉加权体系: 全部采样步**平权**（loss = mean_t L1, 无 density/
+      uniform/capability 权重）—— decoder 的 loss_weight 机制已整块删除;
+    · 全 fp32 训练: 训练/评估不用 bf16/fp16 —— 公平性（之前 bf16 算
+      fp32 存被质疑）; TrainingArguments 不设 bf16/fp16, 不套 autocast;
     · batch_size 默认提高到 16/卡（97GB 显存充裕）。
 
 HF Trainer 风格（消除造轮子）:
@@ -38,7 +43,7 @@ HF Trainer 风格（消除造轮子）:
     accelerate launch --multi_gpu --num_processes 2 \
         train_v2.py --data_dir /root/autodl-tmp/construction_site \
         --dino_dir /root/autodl-tmp/models/dinov2-large \
-        --output_dir output/phase1_v2_test
+        --output_dir output/phase1_v2_pixelfp32
 """
 import argparse
 import glob
@@ -93,10 +98,6 @@ def parse_args():
     # ── 模型（OutputQueryDecoder）──
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(N)")
-    p.add_argument("--decoder_loss_weight", default="uniform",
-                   choices=["density", "uniform", "capability"],
-                   help="每步损失权重: uniform=平权(默认, 去掉加权体系) / "
-                        "density=密度补偿 / capability")
     return p.parse_args()
 
 
@@ -184,8 +185,7 @@ def main():
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        causal_specials=not args.no_causal_specials,
-                       decoder_steps=steps,
-                       decoder_loss_weight=args.decoder_loss_weight)
+                       decoder_steps=steps)
     model.init_reencoder_from_dino(args.reencoder_depth)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -262,7 +262,7 @@ def main():
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "causal_specials": not args.no_causal_specials,
                 "decoder_steps": raw.decoder.steps,
-                "decoder_loss_weight": args.decoder_loss_weight,
+                "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
             json.dump(info, f, indent=2)

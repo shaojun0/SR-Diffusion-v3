@@ -213,6 +213,34 @@ def square_step_schedule(num_patches: int) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════
+# PixelHead — 特征 → 像素 patch 解码头（2026-08-27 目标改为像素）
+# ═══════════════════════════════════════════════════════════════
+
+class PixelHead(nn.Module):
+    """把每 patch 特征 (B,N,D) 解码回像素 patch (B,N,14*14*3)。
+
+    背景（重大 bug 修复）: 之前监督目标是 DINO patch 特征 —— 工地图
+    的特征在空间上近常数（每图跨位置 std≈5e-5），模型学"输出质心"即
+    达低 L1，是假收敛（像素解码 L1=64.9≈平均色）。正确目标是**原始
+    像素** pixel_values：有真实空间结构，"输出质心"的损失压力会迫使
+    模型保留空间信息。上一个智能体已实证真实 DINO 特征可线性解码回
+    像素（L1=9.8），信息在编码器里存在，只需可学习解码头。
+
+    输出不加激活: 像素已按 DINO_MEAN/STD 归一化（范围 ≈[-2,2]），
+    L1 直接监督归一化空间，评估时再反归一化。
+    """
+
+    def __init__(self, dim: int, patch_px: int = 14 * 14 * 3):
+        super().__init__()
+        self.patch_px = patch_px
+        self.proj = nn.Linear(dim, patch_px)   # 特征 → 588 维像素 patch
+
+    def forward(self, feat: Tensor) -> Tensor:
+        """feat: (..., N, D) → (..., N, patch_px)"""
+        return self.proj(feat)
+
+
+# ═══════════════════════════════════════════════════════════════
 # OutputQueryDecoder — 输出查询注意力解码器（采样时刻上输出全部 patch）
 # ═══════════════════════════════════════════════════════════════
 
@@ -237,11 +265,9 @@ class OutputQueryDecoder(nn.Module):
         · 传 steps=list(range(N+1)) 即退化为全量不采样。
         注意: 未采样时刻不参与损失, 也不出现在 F_hat 集成里。
 
-    损失权重 loss_weight（配合采样步使用）:
-        "density"     (默认)  w_t ∝ 采样间隔 —— 密度补偿, 对全时刻无偏
-                    （等价于全覆盖损失的蒙特卡洛估计, 前后端公平）
-        "uniform"            w_t = 1 —— 采样步均匀（前面密的弱步主导梯度）
-        "capability"         w_t = t+1 —— 按可见键数加权（强步主导）
+    损失权重（已移除，2026-08-27 用户要求"去掉加权体系"）:
+        density/uniform/capability 加权机制整块删除（YAGNI），全部采样步
+        平权 —— loss = mean_t L1(Y_t, target)。git 历史可找回。
 
     覆盖语义（每步全覆盖）:
         每个采样时刻 t 都预测全部 N 个 patch（查询基 E 的行 k 对应
@@ -263,8 +289,7 @@ class OutputQueryDecoder(nn.Module):
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
                  mlp_ratio: float = 4.0, kv_causal: bool = True,
-                 steps: Optional[Sequence[int]] = None,
-                 loss_weight: str = "density"):
+                 steps: Optional[Sequence[int]] = None):
         super().__init__()
         self.num_patches = num_patches
         self.kv_causal = kv_causal
@@ -274,8 +299,6 @@ class OutputQueryDecoder(nn.Module):
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"steps 越界: {steps} (N={num_patches})"
         self.steps = steps
-        self.loss_weight = loss_weight
-        self.step_weights = self._build_weights(steps)   # (|T|,) CPU
         S = num_patches + 1                                # z_cls + N z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
         self.W_q = nn.Linear(dim, dim, bias=False)         # z_t → 查询偏置
@@ -283,23 +306,6 @@ class OutputQueryDecoder(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)),
                                  nn.GELU(), nn.Linear(int(dim * mlp_ratio), dim))
         self.norm = nn.LayerNorm(dim)
-
-    def _build_weights(self, steps: list) -> Tensor:
-        """按 loss_weight 模式构造每步损失权重（CPU 张量, forward 里移设备）。"""
-        T = len(steps)
-        if T == 1:
-            return torch.ones(1)
-        if self.loss_weight == "uniform":
-            return torch.ones(T)
-        if self.loss_weight == "capability":
-            return torch.tensor([t + 1 for t in steps], dtype=torch.float)
-        # density: w_t = 相邻采样步中点间距（边界取轴端点, 对全时刻无偏）
-        w = torch.zeros(T)
-        for i, t in enumerate(steps):
-            prev = steps[i - 1] if i > 0 else 0
-            nxt = steps[i + 1] if i < T - 1 else steps[-1]
-            w[i] = max((nxt - prev) / 2, 0.5)
-        return w
 
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
         B, N, D = z_s.shape[0], self.num_patches, z_s.shape[-1]
@@ -317,7 +323,6 @@ class OutputQueryDecoder(nn.Module):
         Y = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)  # (B,|T|·N,D)
         Y = self.norm(self.ffn(Y)).reshape(B, len(self.steps), N, D)  # (B,|T|,N,D)
         self.last_Y = Y                                          # 采样步全部 patch 预测
-        self.step_weights = self.step_weights.to(A.device)
         return Y.mean(dim=1)                                     # (B,N,D) 采样步集成
 
 
@@ -337,12 +342,13 @@ class SRPhase1V2(nn.Module):
         mlp_ratio: float = 4.0,
         causal_specials: bool = True,
         decoder_steps: Optional[Sequence[int]] = None,
-        decoder_loss_weight: str = "density",
+        patch_px: int = 14 * 14 * 3,
     ):
         super().__init__()
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
+        self.patch_px = patch_px
 
         self.special_bank = SpecialTokenBank(num_patches=num_patches, dim=dim)
         self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches,
@@ -351,8 +357,8 @@ class SRPhase1V2(nn.Module):
                                     causal_specials=causal_specials)
         self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
                                           mlp_ratio=mlp_ratio,
-                                          steps=decoder_steps,
-                                          loss_weight=decoder_loss_weight)
+                                          steps=decoder_steps)
+        self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     def init_reencoder_from_dino(self, num_layers: int = 4):
         """用 DINO 编码器前 num_layers 层 warm-start ReEncoder（结构对齐
@@ -381,39 +387,54 @@ class SRPhase1V2(nn.Module):
 
     # ── forward（训练/推理同一路径，无分支）──
     def forward(self, pixel_values: Tensor) -> dict:
-        """pixel_values: (B,3,224,224) → dict{loss, recon, F_hat}
+        """pixel_values: (B,3,H,W) 归一化像素 → dict{loss, recon, F_hat}
 
-        损失: 每个采样时刻 t∈T_sub 都监督还原全部 patch——加权全覆盖
-        损失 L = Σ_t w_t·L1(Y_t, patch)/Σ w_t（w_t 由 decoder 的
-        loss_weight 模式决定, 默认密度补偿=对全时刻无偏）。F_hat =
-        采样步平均; recon = L1(F_hat, patch) 仅作监控。
+        目标（2026-08-27 重大修复）: 监督**原始像素**而非 DINO patch 特征。
+        之前监督特征目标退化（工地图特征空间近常数, 学质心即低 L1）;
+        像素目标有真实空间结构, 强制模型保留空间信息。
+        H,W 须为 14 的倍数（DINO patch=14），patch_px = 14*14*3。
+
+        损失: 每个采样时刻 t∈T_sub 都监督还原全部 patch 像素 —— 平权
+        全覆盖损失 L = mean_t L1(Y_t_pix, target_pix)（去掉加权体系）。
+        F_hat = 采样步平均 → PixelHead → 像素; recon 仅作监控。
         """
-        x = pixel_values                                # (B,3,224,224)
-        B = x.shape[0]
+        x = pixel_values                                # (B,3,H,W)
+        B, C, H, W = x.shape
         N = self.num_patches
+        pw, ph = W // (W // 14), H // (H // 14)         # patch 边长 (=14)
+        assert ph * (W // 14) == H and pw * (H // 14) == W, "输入须为 14 的倍数"
 
         out = self.dinov2(x)
         feats = out.last_hidden_state                   # (B,257,D)
         cls = feats[:, 0]                               # (B,D)
-        patch = feats[:, 1:]                            # (B,N,D)
+        patch_feat = feats[:, 1:]                       # (B,N,D) 仅作编码输入, 不作监督目标
 
         # ── ReEncoder: [cls; specials; patches] → z_cls, z_s ──
         specials = self.special_bank(B, x.device)       # (B,N,D)
-        enc_in = torch.cat([cls.unsqueeze(1), specials, patch], dim=1)  # (B,2N+1,D)
+        enc_in = torch.cat([cls.unsqueeze(1), specials, patch_feat], dim=1)  # (B,2N+1,D)
         z = self.re_encoder(enc_in)                     # (B,2N+1,D)
         z_cls = z[:, 0:1]                               # (B,1,D)
         z_s = z[:, 1:1 + N]                             # (B,N,D)
 
         # ── OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖 → F_hat ──
-        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步集成
+        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步平均(特征)
         Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
-        w = self.decoder.step_weights                   # (|T|,)
-        # 加权全覆盖损失: 每个采样时刻都要还原全部 patch
-        per_step = F.l1_loss(Y, patch.unsqueeze(1).expand_as(Y),
+
+        # ── 像素目标: (B,3,H,W) 归一化像素 → (B,N,588) patch ──
+        # 注意布局: DINO 的 patch 顺序是 row-major (先 y 后 x), 这里保持一致
+        target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
+                      .permute(0, 2, 4, 1, 3, 5) \
+                      .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
+
+        # ── PixelHead: 特征 → 像素, 每个采样步全覆盖 ──
+        Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588)
+        F_pix = self.pixel_head(F_hat)                  # (B,N,588) 采样步集成
+        # 平权全覆盖损失: 每个采样时刻都还原全部 patch 像素
+        per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
                              reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
-        loss = (per_step * w).sum() / w.sum()
-        recon = F.l1_loss(F_hat, patch)                 # 集成重建（监控用）
-        return {"loss": loss, "recon": recon, "F_hat": F_hat}
+        loss = per_step.mean()                          # 平权（去掉加权体系）
+        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
+        return {"loss": loss, "recon": recon, "F_hat": F_pix}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -466,13 +487,22 @@ if __name__ == "__main__":
     model = SRPhase1V2(dino, num_patches=N, dim=D,
                        reencoder_depth=2)
     model.init_reencoder_from_dino(2)
-    x = torch.randn(2, 3, 224, 224)
+    # 像素目标绑定输入尺寸: N=16 patches ⇒ 输入须为 4×4 patch = 56×56 (14 的倍数)
+    x = torch.randn(2, 3, 56, 56)
+    B, C, H, W = x.shape
 
-    # ── 1. 形状 ──
+    # ── 1. 形状: 目标=像素, F_hat 是像素 patch (B,N,588) ──
+    PATCH_PX = 14 * 14 * 3
     out = model(x)
-    assert out["F_hat"].shape == (2, N, D), out["F_hat"].shape
+    assert out["F_hat"].shape == (2, N, PATCH_PX), out["F_hat"].shape
     assert out["loss"].shape == () and out["recon"].shape == ()
-    print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} loss={out['loss'].item():.4f}")
+    # 像素目标提取与模型内部一致
+    target = x.reshape(B, C, H // 14, 14, W // 14, 14) \
+               .permute(0, 2, 4, 1, 3, 5).reshape(B, N, PATCH_PX)
+    assert torch.isclose(out["recon"],
+                         F.l1_loss(out["F_hat"], target)), "recon 应为像素 L1"
+    print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} (像素 {PATCH_PX}D) "
+          f"loss={out['loss'].item():.4f}")
 
     # ── 2. 块状注意力掩码结构（ReEncoder: causal specials）──
     am = model.re_encoder.attn_mask                  # (2N+1, 2N+1) bool, True=屏蔽
@@ -491,7 +521,7 @@ if __name__ == "__main__":
     print(f"[ok] ReEncoder block mask: causal_specials=True 结构正确, "
           f"causal_specials=False 全开放回退")
 
-    # ── 3. OutputQueryDecoder: 平方采样计划 + KV 因果掩码 + 全覆盖损失 ──
+    # ── 3. OutputQueryDecoder: 平方采样计划 + KV 因果掩码 + 平权全覆盖损失 ──
     T_steps = model.decoder.steps
     assert T_steps == square_step_schedule(N), T_steps       # N=16 → [0,1,4,9,16]
     am = model.decoder.attn_mask                             # (|T|·N, N+1) float
@@ -500,36 +530,38 @@ if __name__ == "__main__":
         row = am[ti * N]
         assert (row[:t + 1] == 0).all()
         assert (row[t + 1:] == float("-inf")).all()
-    Y = model.decoder.last_Y
-    assert Y.shape == (2, len(T_steps), N, D)                # (B,|T|,N,D)
-    assert out["F_hat"].shape == (2, N, D)                   # 采样步平均
-    w = model.decoder.step_weights
-    per = F.l1_loss(Y, dino._feat[:2, 1:].unsqueeze(1).expand_as(Y),
-                    reduction="none").mean(dim=(0, 2, 3))
-    assert torch.isclose(out["loss"], (per * w).sum() / w.sum())   # 加权全覆盖损失
+    Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
+    assert Y.shape == (2, len(T_steps), N, D)
+    Y_pix = model.pixel_head(Y)                              # (B,|T|,N,588) 像素
+    assert Y_pix.shape == (2, len(T_steps), N, PATCH_PX)
+    per = F.l1_loss(Y_pix, target.unsqueeze(1).expand_as(Y_pix),
+                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步
+    assert torch.isclose(out["loss"], per.mean()), "loss 应为平权全覆盖像素 L1"
     # 计划自动适配任意 N（可扩展性）: 256→17 步, 512→24 步
     assert square_step_schedule(256) == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81,
                                          100, 121, 144, 169, 196, 225, 256]
     assert len(square_step_schedule(512)) == 24
     print(f"[ok] OutputQueryDecoder: 平方采样 {len(T_steps)} 步 + KV 因果掩码 "
-          f"+ 加权全覆盖损失正确")
+          f"+ 平权全覆盖像素损失正确")
 
-    # ── 4. 梯度流向（整模型可训）──
+    # ── 4. 梯度流向（整模型可训, 含 PixelHead）──
     out["loss"].backward()
     for name, p in [("re_encoder.0", model.re_encoder.layers[0].linear1.weight),
                     ("decoder.W_q", model.decoder.W_q.weight),
                     ("decoder.query_base", model.decoder.query_base),
-                    ("special_bank.pos", model.special_bank.pos)]:
+                    ("special_bank.pos", model.special_bank.pos),
+                    ("pixel_head.proj", model.pixel_head.proj.weight)]:
         g = p.grad
         assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
-    print(f"[ok] 梯度: ReEncoder/OutputQueryDecoder(W_q,query_base)/SpecialTokenBank "
-          f"全部可训 (|grad|={model.re_encoder.layers[0].linear1.weight.grad.abs().sum().item():.4f})")
+    print(f"[ok] 梯度: ReEncoder/OutputQueryDecoder(W_q,query_base)/"
+          f"SpecialTokenBank/PixelHead 全部可训 "
+          f"(|grad|={model.re_encoder.layers[0].linear1.weight.grad.abs().sum().item():.4f})")
 
     # ── 5. 推理: 同一 forward（eval + no_grad）──
     model.eval()
     with torch.no_grad():
         out_e = model(x)
-    assert out_e["F_hat"].shape == (2, N, D)
+    assert out_e["F_hat"].shape == (2, N, PATCH_PX)
     print(f"[ok] eval 同路径: loss={out_e['loss'].item():.4f}")
 
     print("\nALL CHECKS PASSED")
