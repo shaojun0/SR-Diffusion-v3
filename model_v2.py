@@ -401,8 +401,9 @@ class SRPhase1V2(nn.Module):
         x = pixel_values                                # (B,3,H,W)
         B, C, H, W = x.shape
         N = self.num_patches
-        pw, ph = W // (W // 14), H // (H // 14)         # patch 边长 (=14)
-        assert ph * (W // 14) == H and pw * (H // 14) == W, "输入须为 14 的倍数"
+        assert W % 14 == 0 and H % 14 == 0, "输入须为 14 的倍数"
+        assert (W // 14) * (H // 14) == N, \
+            f"输入 {W}x{H} 产生 {(W//14)*(H//14)} patches, 但模型 num_patches={N}"
 
         out = self.dinov2(x)
         feats = out.last_hidden_state                   # (B,257,D)
