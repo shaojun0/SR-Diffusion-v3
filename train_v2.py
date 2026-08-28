@@ -221,6 +221,8 @@ def main():
         max_steps=args.max_steps if args.max_steps > 0 else -1,   # 0 = epochs 决定
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        # eval 预测(含 Y_pix B×25×576×588)分批移到 CPU, 避免全量累积 GPU OOM
+        eval_accumulation_steps=2,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
