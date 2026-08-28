@@ -56,7 +56,11 @@ def parse_args():
 
 
 def _patch_to_img(pix_patches, H, W):
-    """(B,N,588) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 图像。"""
+    """(B,N,588) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 图像。
+    布局与 DINO 一致: row-major (先 y 后 x)。支持 torch 张量或 numpy 数组。"""
+    is_np = isinstance(pix_patches, np.ndarray)
+    if is_np:
+        pix_patches = torch.from_numpy(pix_patches)
     B = pix_patches.shape[0]
     img = pix_patches.reshape(B, H // 14, W // 14, 14, 14, 3) \
                      .permute(0, 1, 3, 2, 4, 5) \
