@@ -60,7 +60,10 @@ def parse_args():
 
 def _patch_to_img(pix_patches, H, W):
     """(B,N,588) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 图像。
-    布局与 DINO 一致: row-major (先 y 后 x)。"""
+    布局与 DINO 一致: row-major (先 y 后 x)。支持 torch 张量或 numpy 数组。"""
+    is_np = isinstance(pix_patches, np.ndarray)
+    if is_np:
+        pix_patches = torch.from_numpy(pix_patches)
     B = pix_patches.shape[0]
     img = pix_patches.reshape(B, H // 14, W // 14, 14, 14, 3) \
                      .permute(0, 1, 3, 2, 4, 5) \
@@ -107,7 +110,7 @@ def main():
 
     # ── 前向: 全量像素 L1 ──
     norm_sum, norm_sq, pix_sum, pix_sq, n = 0.0, 0.0, 0.0, 0.0, 0
-    Z_all, pix_all = [], []          # K 压缩探针收集（前 probe_limit 条）
+    Z_all, H_all, pix_all = [], [], []   # K 压缩探针收集（前 probe_limit 条）
     probe_n = 0
     t0 = time.time()
     with torch.no_grad():
@@ -129,6 +132,14 @@ def main():
             if args.probe_limit > 0 and probe_n < args.probe_limit:
                 take = min(B, args.probe_limit - probe_n)
                 Z_all.append(out["z_s"][:take].float().cpu().numpy())
+                # 解码器输出 h: 复刻 model.forward 内部 (无像素头)
+                zs = out["z_s"][:take]
+                q = model.decoder.query_base.expand(zs.shape[0], -1, -1)
+                for layer in model.decoder.layers:
+                    q = q + layer.cross_attn(layer.norm1(q), zs, zs,
+                                             need_weights=False)[0]
+                    q = q + layer.ffn(layer.norm2(q))
+                H_all.append(q.float().cpu().numpy())   # (take,N,D) 解码器输出特征
                 pix_all.append(target[:take].float().cpu().numpy())
                 probe_n += take
             n += B
@@ -144,23 +155,43 @@ def main():
     print(f"       参照: 全图平均色≈61 | v2 像素目标版 23.41 | DINO 线性解码上限≈9.8")
 
     # ── K 压缩探针: z_s → 像素线性解码 L1 ──
+    # 口径: z_s 是 K 个"整图"压缩 token (非逐 patch), 与像素 (M,N,588) 无
+    # 逐行对齐 → 用 z_s 均值向量作为每 patch 的共享特征, 线性解码全部 patch:
+    #   X (M*N, D) ← z_s.mean(dim=1) 复制 N 份; 衡量"压缩表示均值里有多少像素信息"。
+    # 另加: 解码器输出 h (B,N,D) 是逐 patch 的, 可逐行对齐线性解码 —— 衡量
+    # 解码链路输出的特征里有多少像素信息 (对照 z_s 均值探针, 定位信息在哪丢)。
+    # 判读: z_s 均值≈9.8-13 ⇒ 信息在压缩表示里, 差距在解码器; ≈23+ ⇒ QFormer 丢信息。
     probe = None
     if args.probe_limit > 0 and probe_n > 0:
         Z = np.concatenate(Z_all)                        # (M,K,D)
+        Hh = np.concatenate(H_all)                       # (M,N,D)
         pix = np.concatenate(pix_all)                    # (M,N,588)
-        X = Z.reshape(-1, Z.shape[-1])
+        z_mean = Z.mean(axis=1, keepdims=True)           # (M,1,D) 每图均值
+        X = np.repeat(z_mean, num_patches, axis=1).reshape(-1, Z.shape[-1])  # (M*N,D)
         Wm, *_ = np.linalg.lstsq(X, pix.reshape(-1, PATCH_PX), rcond=1e-6)
         recon = (X @ Wm).reshape(probe_n, num_patches, PATCH_PX)
         rimg = _patch_to_img(recon, H, W)
         gimg = _patch_to_img(pix, H, W)
         probe_l1 = float(np.abs(rimg - gimg).mean())
         within_std = float(Z.std(axis=1).mean())         # z_s 跨位置变异性
-        probe = {"n": probe_n, "z_s_linear_l1_255": probe_l1,
-                 "z_s_within_std": within_std}
+        # 解码器输出 h 探针 (逐 patch 对齐)
+        Xh = Hh.reshape(-1, Hh.shape[-1])                # (M*N,D)
+        Wh, *_ = np.linalg.lstsq(Xh, pix.reshape(-1, PATCH_PX), rcond=1e-6)
+        recon_h = (Xh @ Wh).reshape(probe_n, num_patches, PATCH_PX)
+        rimg_h = _patch_to_img(recon_h, H, W)
+        h_l1 = float(np.abs(rimg_h - gimg).mean())
+        h_within_std = float(Hh.std(axis=1).mean())      # h 跨位置变异性
+        probe = {"n": probe_n, "z_s_mean_linear_l1_255": probe_l1,
+                 "z_s_within_std": within_std,
+                 "decoder_h_linear_l1_255": h_l1,
+                 "decoder_h_within_std": h_within_std}
         print(f"[probe] K={model.num_queries} 压缩探针 ({probe_n} 条):")
-        print(f"        z_s → 像素线性解码 L1 = {probe_l1:.2f} "
-              f"(≈9.8-13 ⇒ 信息在压缩表示里, 差距在解码器; ≈23+ ⇒ QFormer 丢信息)")
-        print(f"        z_s within-std = {within_std:.4f} (跨位置变异性)")
+        print(f"        z_s 均值 → 线性解码 L1 = {probe_l1:.2f} "
+              f"(≈9.8-13 ⇒ 信息在压缩表示里; ≈23+ ⇒ QFormer 丢信息)")
+        print(f"        z_s within-std = {within_std:.4f} (K 个 token 间变异性)")
+        print(f"        解码器 h → 线性解码 L1 = {h_l1:.2f} "
+              f"(对照: 信息在解码器输出里 = 解码链路 OK, 瓶颈在像素头/解码器非线性)")
+        print(f"        h within-std = {h_within_std:.4f} (N 个 patch 输出变异性)")
 
     print(f"[time] {(time.time() - t0):.0f}s | {n} 图")
 
