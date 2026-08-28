@@ -50,6 +50,8 @@ def parse_args():
     p.add_argument("--reencoder_depth", type=int, default=4)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
+    p.add_argument("--register_specials", action="store_true",
+                   help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_step_schedule(N)")
     return p.parse_args()
@@ -87,13 +89,15 @@ def main():
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
-                       decoder_steps=steps)
+                       decoder_steps=steps,
+                       register_specials=args.register_specials)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model.eval().cuda()
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
+          f"register_specials={args.register_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── 数据: test 分片, 与训练同预处理（1600:900 画布 → 448x252）──
@@ -115,17 +119,10 @@ def main():
         for bi, batch in enumerate(loader):
             x = batch["pixel_values"].cuda()            # (B,3,H,W) 归一化
             B, C, Hh, Ww = x.shape
-            feats = model.dinov2(x).last_hidden_state
-            cls, patch_feat = feats[:, 0:1], feats[:, 1:]
-            specials = model.special_bank(B, x.device)
-            z = model.re_encoder(torch.cat([cls, specials, patch_feat], dim=1))
-            z_cls, z_s = z[:, 0:1], z[:, 1:1 + num_patches]
-            F_hat = model.decoder(z_cls, z_s)           # (B,N,D) 特征(采样步平均)
-            Y = model.decoder.last_Y                    # (B,|T|,N,D) 特征
-            Y_pix = model.pixel_head(Y)                 # (B,|T|,N,588) 像素(归一化)
-            F_pix = model.pixel_head(F_hat)             # (B,N,588) 采样步平均
-            target = x.reshape(B, C, Hh // 14, 14, Ww // 14, 14) \
-                      .permute(0, 2, 4, 1, 3, 5).reshape(B, num_patches, PATCH_PX)
+            out = model(x)                              # 同一 forward（两种模式通用）
+            F_pix = out["F_hat"]                        # (B,N,588) 采样步平均
+            Y_pix = out["Y_pix"]                        # (B,|T|,N,588) 每采样步
+            target = out["target_pix"]                  # (B,N,588)
             # 归一化空间 L1
             l1_norm = (F_pix - target).abs().mean(dim=(1, 2))          # (B,)
             norm_sum += l1_norm.sum().item()

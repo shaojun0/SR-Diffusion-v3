@@ -101,6 +101,9 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
+    p.add_argument("--register_specials", action="store_true",
+                   help="register 式(修 F1/F2): specials 作为额外 token 直接进 "
+                        "DINOv2 输入序列, 由 DINO 24 层算出 z_s; 无 ReEncoder")
     # ── 模型（OutputQueryDecoder）──
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(N)")
@@ -191,13 +194,17 @@ def main():
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        causal_specials=not args.no_causal_specials,
-                       decoder_steps=steps)
+                       decoder_steps=steps,
+                       register_specials=args.register_specials)
     model.init_reencoder_from_dino(args.reencoder_depth)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
           f"输入 {W}x{H}, patches={num_patches}, decoder 采样 "
           f"{len(model.decoder.steps)} 步 {model.decoder.steps[:6]}...")
+    if args.register_specials:
+        print(f"[model] register_specials: specials 进 DINO 序列({2 * num_patches + 1} "
+              f"token, 全双向) 由 24 层算出 z_s; 无 ReEncoder, 训练时长预计 ~2-3×")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -267,6 +274,7 @@ def main():
                 "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "causal_specials": not args.no_causal_specials,
+                "register_specials": args.register_specials,
                 "decoder_steps": raw.decoder.steps,
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}

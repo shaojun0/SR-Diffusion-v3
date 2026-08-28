@@ -24,12 +24,10 @@ P_all, zs_all, F_all, pix_all = [], [], [], []
 with torch.no_grad():
     for batch in loader:
         x = batch['pixel_values'].cuda()
-        feats = model.dinov2(x).last_hidden_state
-        cls, patch = feats[:,0:1], feats[:,1:]
-        sp = model.special_bank(x.shape[0], x.device)
-        z = model.re_encoder(torch.cat([cls,sp,patch],dim=1))
-        z_cls, z_s = z[:,0:1], z[:,1:1+N]
+        # register_specials 兼容: encode() 按模式分派（ReEncoder / DINO register）
+        z_cls, z_s = model.encode(x)
         F = model.decoder(z_cls, z_s)
+        P = model.dinov2(x).last_hidden_state[:, 1:]     # 原始 DINO patch 特征(基线)
         x_np = x.cpu().numpy().transpose(0,2,3,1) * DINO_STD + DINO_MEAN
         x_np = np.clip(x_np, 0, 255)
         B = x_np.shape[0]
@@ -39,7 +37,7 @@ with torch.no_grad():
                 for px in range(W//14):
                     blk = x_np[bi, py*14:(py+1)*14, px*14:(px+1)*14]
                     pix[bi, py*(W//14)+px] = blk.reshape(-1)
-        P_all.append(patch.float().cpu().numpy())
+        P_all.append(P.float().cpu().numpy())
         zs_all.append(z_s.float().cpu().numpy())
         F_all.append(F.float().cpu().numpy())
         pix_all.append(pix)

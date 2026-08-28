@@ -34,6 +34,20 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
     L = Σ_t w_t·L1(Y_t, patch) / Σ w_t   ← 全覆盖损失（默认密度补偿权重,
         即对全时刻无偏; w_t 可换 uniform / capability）
 
+register_specials=True（2026-08-28 新增, 修 F1/F2）:
+    specials 不再由 ReEncoder 算, 而是作为额外 token 直接拼进 DINOv2 的
+    输入序列 [cls; specials; patches] (2N+1 token), 由 DINO 的 24 层直接
+    算出 z_s——register token 式（Darcet et al., "Vision Transformers Need
+    Registers"）。special k 的输入仍共享 token+位置编码（SpecialTokenBank,
+    无 patch 内容）, 但深层网络直接做"内容路由", 不再依赖 4 层 ReEncoder
+    在 1153 长序列上学路由——修 DIAGNOSIS_clarity.md 的 F1（special 无内容
+    输入）与 F2（z_s 冗余全局摘要）。该模式下无 ReEncoder（省 51.6M 参数）。
+    HF Dinov2Model 无 token 级注意力 mask API（见踩坑记录）, 故 DINO 内用
+    全双向注意力（无掩码）——重建任务无时序因果需求, register 惯例亦然;
+    解码器的 KV 因果仍提供渐进前缀语义。注意: 该模式让 z_s[k] 依赖全部
+    patch（含 j>k）, "前缀稳定性"约束不再成立——渐进曲线语义由解码器
+    kv_causal 提供, 与编码器无关。
+
 块状注意力掩码:
     ReEncoder（causal_specials=True 默认）: [cls; specials; patches]
         cls 全局；specials 因果链（special i 只见 specials≤i + 全部
@@ -57,12 +71,16 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
 用法
 ----
     model = SRPhase1V2(dinov2=dinov2_model, num_patches=256, dim=768)
-    out = model(pixel_values)                 # {"loss","recon","F_hat"}
+    out = model(pixel_values)                 # {"loss","recon","F_hat","Y_pix","target_pix"}
     loss = out["loss"]; loss.backward()
     model.eval()                              # 推理同路径
 
+    # register 式（specials 合并进 DINO, 修 F1/F2）:
+    model = SRPhase1V2(dinov2=dinov2_model, num_patches=256, dim=768,
+                       register_specials=True)   # 无 ReEncoder
+
     自检: python model_v2.py（形状 / 两处块掩码结构 / 梯度 /
-          init_reencoder_from_dino / eval 同路径）
+          init_reencoder_from_dino / eval 同路径 / register 模式形状与梯度）
 
 参考资料（防止遗忘参考来源）:
     [1] Hawthorne, C., Jaegle, A., Cangea, C., Borgeaud, S., Nash, C.,
@@ -355,18 +373,24 @@ class SRPhase1V2(nn.Module):
         causal_specials: bool = True,
         decoder_steps: Optional[Sequence[int]] = None,
         patch_px: int = 14 * 14 * 3,
+        register_specials: bool = False,
     ):
         super().__init__()
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
         self.patch_px = patch_px
+        self.register_specials = register_specials
 
         self.special_bank = SpecialTokenBank(num_patches=num_patches, dim=dim)
-        self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches,
-                                    depth=reencoder_depth, heads=heads,
-                                    mlp_ratio=mlp_ratio,
-                                    causal_specials=causal_specials)
+        # register 式: specials 直接进 DINO 由深层网络算, 无 ReEncoder
+        # （条件初始化, 避免 DDP find_unused_parameters=False 报未用参数）
+        self.re_encoder = None
+        if not register_specials:
+            self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches,
+                                        depth=reencoder_depth, heads=heads,
+                                        mlp_ratio=mlp_ratio,
+                                        causal_specials=causal_specials)
         self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
                                           mlp_ratio=mlp_ratio,
                                           steps=decoder_steps)
@@ -374,9 +398,13 @@ class SRPhase1V2(nn.Module):
 
     def init_reencoder_from_dino(self, num_layers: int = 4):
         """用 DINO 编码器前 num_layers 层 warm-start ReEncoder（结构对齐
-        nn.TransformerEncoderLayer ↔ HF DINO layer）。"""
+        nn.TransformerEncoderLayer ↔ HF DINO layer）。register 模式下无
+        ReEncoder, 直接跳过。"""
+        if self.register_specials:
+            print("[init] register_specials 模式: 无 ReEncoder, 跳过 warm-start")
+            return
+        depth = min(num_layers, len(self.re_encoder.layers), len(self.dinov2.encoder.layer))
         dino_layers = self.dinov2.encoder.layer
-        depth = min(num_layers, len(self.re_encoder.layers), len(dino_layers))
         for i in range(depth):
             src, dst = dino_layers[i], self.re_encoder.layers[i]
             with torch.no_grad():
@@ -397,9 +425,86 @@ class SRPhase1V2(nn.Module):
                 dst.linear2.load_state_dict(src.mlp.fc2.state_dict())
         print(f"[init] ReEncoder layers 0..{depth-1} warm-started from DINO encoder")
 
+    # ── encode: 输入 → 解码器输入 z_cls, z_s（按 register_specials 分派）──
+    def encode(self, pixel_values: Tensor):
+        """把输入编码成解码器输入 (z_cls, z_s)，训练/推理同一路径。
+
+        register_specials=False: DINO → [cls; specials; patches] → ReEncoder
+        register_specials=True : specials 作为额外 token 拼进 DINO 输入序列,
+            由 DINO 的 24 层直接算出 z_s（register token 式, Darcet et al.）——
+            修 DIAGNOSIS_clarity.md F1（special 无 patch 内容输入）与 F2
+            （z_s 全是冗余全局摘要）。无 ReEncoder。
+        """
+        if self.register_specials:
+            return self._encode_register(pixel_values)
+        return self._encode_reencoder(pixel_values)
+
+    def _encode_reencoder(self, pixel_values: Tensor):
+        x = pixel_values                                # (B,3,H,W)
+        out = self.dinov2(x)
+        feats = out.last_hidden_state                   # (B,257,D)
+        cls = feats[:, 0]                               # (B,D)
+        patch_feat = feats[:, 1:]                       # (B,N,D) 仅作编码输入, 不作监督目标
+        # ReEncoder: [cls; specials; patches] → z_cls, z_s
+        specials = self.special_bank(x.shape[0], x.device)      # (B,N,D)
+        enc_in = torch.cat([cls.unsqueeze(1), specials, patch_feat], dim=1)  # (B,2N+1,D)
+        z = self.re_encoder(enc_in)                     # (B,2N+1,D)
+        return z[:, 0:1], z[:, 1:1 + self.num_patches]  # (B,1,D), (B,N,D)
+
+    def _encode_register(self, pixel_values: Tensor):
+        """register 式: specials 直接进 DINO 输入序列, 由 DINO 深层算 z_s。
+
+        HF Dinov2Model 无 token 级注意力 mask API（见文件头踩坑记录）, 故
+        DINO 内用**全双向注意力**（无掩码）——重建任务无时序因果需求,
+        register token 惯例亦然; 解码器的 KV 因果仍提供渐进前缀语义。
+        embeddings(pixel_values) 复用 HF 的 cls/patch 嵌入 + 位置编码
+        （含其自动插值逻辑）, 与训练现状一致; specials 用 SpecialTokenBank
+        （共享 token + 逐位置可学习 pos）。
+        """
+        x = pixel_values                                # (B,3,H,W)
+        emb = self.dinov2.embeddings(x)                 # (B,1+N,D) [cls; patches] + PE
+        specials = self.special_bank(x.shape[0], x.device)   # (B,N,D) token+pos
+        seq = torch.cat([emb[:, :1], specials, emb[:, 1:]], dim=1)   # (B,2N+1,D)
+        for layer in self.dinov2.encoder.layer:         # DINO 24 层（全双向）
+            out = layer(seq)
+            seq = out[0] if isinstance(out, (tuple, list)) else out
+        seq = self.dinov2.layernorm(seq)                # (B,2N+1,D)
+        return seq[:, :1], seq[:, 1:1 + self.num_patches]
+
+    # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
+    def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
+        """解码器 + 像素头 + 平权全覆盖像素 L1（两种模式共用）。
+
+        dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步像素
+        B,|T|,N,588), "target_pix"(B,N,588)} —— 训练取 loss; 推理取 F_hat /
+        Y_pix / target_pix（全量 L1、渐进曲线、可视化同一路径）。
+        """
+        x = pixel_values
+        B, C, H, W = x.shape
+        N = self.num_patches
+        # OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖 → F_hat
+        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步平均(特征)
+        Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
+        # 像素目标: (B,3,H,W) 归一化像素 → (B,N,588) patch
+        # 注意布局: DINO 的 patch 顺序是 row-major (先 y 后 x), 这里保持一致
+        target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
+                      .permute(0, 2, 4, 1, 3, 5) \
+                      .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
+        # PixelHead: 特征 → 像素, 每个采样步全覆盖
+        Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588)
+        F_pix = self.pixel_head(F_hat)                  # (B,N,588) 采样步集成
+        # 平权全覆盖损失: 每个采样时刻都还原全部 patch 像素
+        per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
+                             reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
+        loss = per_step.mean()                          # 平权（去掉加权体系）
+        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
+        return {"loss": loss, "recon": recon, "F_hat": F_pix,
+                "Y_pix": Y_pix, "target_pix": target_pix}
+
     # ── forward（训练/推理同一路径，无分支）──
     def forward(self, pixel_values: Tensor) -> dict:
-        """pixel_values: (B,3,H,W) 归一化像素 → dict{loss, recon, F_hat}
+        """pixel_values: (B,3,H,W) 归一化像素 → dict{loss, recon, F_hat,
+        Y_pix, target_pix}
 
         目标（2026-08-27 重大修复）: 监督**原始像素**而非 DINO patch 特征。
         之前监督特征目标退化（工地图特征空间近常数, 学质心即低 L1）;
@@ -416,38 +521,8 @@ class SRPhase1V2(nn.Module):
         assert W % 14 == 0 and H % 14 == 0, "输入须为 14 的倍数"
         assert (W // 14) * (H // 14) == N, \
             f"输入 {W}x{H} 产生 {(W//14)*(H//14)} patches, 但模型 num_patches={N}"
-
-        out = self.dinov2(x)
-        feats = out.last_hidden_state                   # (B,257,D)
-        cls = feats[:, 0]                               # (B,D)
-        patch_feat = feats[:, 1:]                       # (B,N,D) 仅作编码输入, 不作监督目标
-
-        # ── ReEncoder: [cls; specials; patches] → z_cls, z_s ──
-        specials = self.special_bank(B, x.device)       # (B,N,D)
-        enc_in = torch.cat([cls.unsqueeze(1), specials, patch_feat], dim=1)  # (B,2N+1,D)
-        z = self.re_encoder(enc_in)                     # (B,2N+1,D)
-        z_cls = z[:, 0:1]                               # (B,1,D)
-        z_s = z[:, 1:1 + N]                             # (B,N,D)
-
-        # ── OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖 → F_hat ──
-        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步平均(特征)
-        Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
-
-        # ── 像素目标: (B,3,H,W) 归一化像素 → (B,N,588) patch ──
-        # 注意布局: DINO 的 patch 顺序是 row-major (先 y 后 x), 这里保持一致
-        target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
-                      .permute(0, 2, 4, 1, 3, 5) \
-                      .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
-
-        # ── PixelHead: 特征 → 像素, 每个采样步全覆盖 ──
-        Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588)
-        F_pix = self.pixel_head(F_hat)                  # (B,N,588) 采样步集成
-        # 平权全覆盖损失: 每个采样时刻都还原全部 patch 像素
-        per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
-                             reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
-        loss = per_step.mean()                          # 平权（去掉加权体系）
-        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
-        return {"loss": loss, "recon": recon, "F_hat": F_pix}
+        z_cls, z_s = self.encode(x)
+        return self.decode(z_cls, z_s, x)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -464,29 +539,70 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     # ── 假的 DINOv2：结构对齐 HF Dinov2Model（供 init_reencoder_from_dino）──
-    def _mk_dino_layer(dim: int, mlp_ratio: float = 4.0) -> nn.Module:
-        att = nn.Module()
-        att.attention = nn.Module()
-        att.attention.query = nn.Linear(dim, dim)
-        att.attention.key = nn.Linear(dim, dim)
-        att.attention.value = nn.Linear(dim, dim)
-        att.output = nn.Module()
-        att.output.dense = nn.Linear(dim, dim)
-        mlp = nn.Module()
-        mlp.fc1 = nn.Linear(dim, int(dim * mlp_ratio))
-        mlp.fc2 = nn.Linear(int(dim * mlp_ratio), dim)
-        layer = nn.Module()
-        layer.norm1 = nn.LayerNorm(dim)
-        layer.norm2 = nn.LayerNorm(dim)
-        layer.attention = att
-        layer.mlp = mlp
-        return layer
+    class _FakeDinoLayer(nn.Module):
+        """HF Dinov2EncoderLayer 属性布局（供 init_reencoder_from_dino 拷贝）
+        + 真实单头自注意力 forward（供 register 模式直接调用）。"""
+        def __init__(self, dim: int, mlp_ratio: float = 4.0):
+            super().__init__()
+            self.norm1 = nn.LayerNorm(dim)
+            self.norm2 = nn.LayerNorm(dim)
+            att = nn.Module()
+            att.attention = nn.Module()
+            att.attention.query = nn.Linear(dim, dim)
+            att.attention.key = nn.Linear(dim, dim)
+            att.attention.value = nn.Linear(dim, dim)
+            att.output = nn.Module()
+            att.output.dense = nn.Linear(dim, dim)
+            self.attention = att
+            mlp = nn.Module()
+            mlp.fc1 = nn.Linear(dim, int(dim * mlp_ratio))
+            mlp.fc2 = nn.Linear(int(dim * mlp_ratio), dim)
+            self.mlp = mlp
+
+        def forward(self, hidden_states: Tensor, head_mask=None,
+                    output_attentions=False):
+            n = self.norm1(hidden_states)
+            q = self.attention.attention.query(n)
+            k = self.attention.attention.key(n)
+            v = self.attention.attention.value(n)
+            scores = (q @ k.transpose(-2, -1)) / (q.shape[-1] ** 0.5)
+            attn = F.softmax(scores, dim=-1)
+            h = hidden_states + self.attention.output.dense(attn @ v)
+            h = h + self.mlp.fc2(F.gelu(self.mlp.fc1(self.norm2(h))))
+            return (h, None)
+
+    class _FakeEmbeddings(nn.Module):
+        """对齐 HF Dinov2Embeddings 的最小结构: conv patch + cls + PE(+插值)。"""
+        def __init__(self, dim: int, num_patches: int):
+            super().__init__()
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+            self.patch_embeddings = nn.Conv2d(3, dim, kernel_size=14, stride=14)
+            self.position_embeddings = nn.Parameter(
+                torch.randn(1, num_patches + 1, dim) * 0.02)
+            self.dropout = nn.Identity()
+
+        def forward(self, pixel_values: Tensor, bool_masked_pos=None,
+                    interpolate_pos_encoding=None) -> Tensor:
+            B = pixel_values.shape[0]
+            patch = self.patch_embeddings(pixel_values)      # (B,D,h,w)
+            patch = patch.flatten(2).transpose(1, 2)         # (B,N,D)
+            cls = self.cls_token.expand(B, -1, -1)
+            emb = torch.cat([cls, patch], dim=1)             # (B,1+N,D)
+            pe = self.position_embeddings
+            if emb.shape[1] != pe.shape[1]:                  # 对齐 HF 自动插值
+                pe = F.interpolate(pe.transpose(1, 2).unsqueeze(0),
+                                   size=(emb.shape[1],), mode="linear",
+                                   align_corners=False).squeeze(0).transpose(1, 2)
+            return self.dropout(emb + pe)
 
     class FakeDino(nn.Module):
         def __init__(self, dim: int = 64, n_layers: int = 4, num_patches: int = 16):
             super().__init__()
+            self.embeddings = _FakeEmbeddings(dim, num_patches)
             self.encoder = nn.Module()
-            self.encoder.layer = nn.ModuleList([_mk_dino_layer(dim) for _ in range(n_layers)])
+            self.encoder.layer = nn.ModuleList(
+                [_FakeDinoLayer(dim) for _ in range(n_layers)])
+            self.layernorm = nn.LayerNorm(dim)
             self._np, self._dim = num_patches, dim
             self._feat = torch.randn(4, num_patches + 1, dim)   # 固定特征（B≤4）
 
@@ -576,5 +692,34 @@ if __name__ == "__main__":
         out_e = model(x)
     assert out_e["F_hat"].shape == (2, N, PATCH_PX)
     print(f"[ok] eval 同路径: loss={out_e['loss'].item():.4f}")
+
+    # ── 6. register 模式: specials 合并进 DINO（修 F1/F2, 2026-08-28）──
+    dino_r = FakeDino(dim=D, num_patches=N)
+    m_reg = SRPhase1V2(dino_r, num_patches=N, dim=D, register_specials=True)
+    assert m_reg.re_encoder is None, "register 模式不应有 ReEncoder"
+    out_r = m_reg(x)
+    assert out_r["F_hat"].shape == (2, N, PATCH_PX)
+    assert out_r["Y_pix"].shape == (2, len(m_reg.decoder.steps), N, PATCH_PX)
+    z_cls, z_s = m_reg.encode(x)
+    assert z_cls.shape == (2, 1, D) and z_s.shape == (2, N, D)
+    # 梯度: DINO 嵌入(conv+PE+cls) / DINO 层 / special_bank / decoder / pixel_head
+    out_r["loss"].backward()
+    for name, p in [("dino.embeddings.patch_embeddings.weight",
+                     dino_r.embeddings.patch_embeddings.weight),
+                    ("dino.embeddings.position_embeddings",
+                     dino_r.embeddings.position_embeddings),
+                    ("dino.encoder.layer.0.mlp.fc1.weight",
+                     dino_r.encoder.layer[0].mlp.fc1.weight),
+                    ("special_bank.token", m_reg.special_bank.token),
+                    ("decoder.query_base", m_reg.decoder.query_base),
+                    ("pixel_head.proj", m_reg.pixel_head.proj.weight)]:
+        g = p.grad
+        assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
+    m_reg.eval()
+    with torch.no_grad():
+        out_re = m_reg(x)
+    assert out_re["F_hat"].shape == (2, N, PATCH_PX)
+    print(f"[ok] register_specials: specials 进 DINO 序列(2N+1 token, 全双向) "
+          f"无 ReEncoder; 形状/梯度(eval 同路径)正确")
 
     print("\nALL CHECKS PASSED")

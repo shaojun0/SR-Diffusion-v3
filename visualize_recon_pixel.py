@@ -29,6 +29,8 @@ def parse_args():
     p.add_argument("--dino_dir", default="models/dinov2-large")
     p.add_argument("--final_model", required=True)
     p.add_argument("--model_input", default="448x252")
+    p.add_argument("--register_specials", action="store_true",
+                   help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
@@ -60,13 +62,15 @@ def main():
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       dim=dino.config.hidden_size, reencoder_depth=4)
+                       dim=dino.config.hidden_size, reencoder_depth=4,
+                       register_specials=args.register_specials)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model.eval().cuda()
     T_steps = model.decoder.steps
-    print(f"[model] N={num_patches}, {len(T_steps)} 采样步")
+    print(f"[model] N={num_patches}, register_specials={args.register_specials}, "
+          f"{len(T_steps)} 采样步")
 
     # 自动选展示步: 前/中/后均匀取 (含 t=0 与 t=N)
     if args.steps.strip():
@@ -91,16 +95,9 @@ def main():
         for batch in loader:
             x = batch["pixel_values"].cuda()
             B, C, Hh, Ww = x.shape
-            feats = model.dinov2(x).last_hidden_state
-            cls, patch_feat = feats[:, 0:1], feats[:, 1:]
-            specials = model.special_bank(B, x.device)
-            z = model.re_encoder(torch.cat([cls, specials, patch_feat], dim=1))
-            z_cls, z_s = z[:, 0:1], z[:, 1:1 + num_patches]
-            F_hat = model.decoder(z_cls, z_s)
-            Y = model.decoder.last_Y                        # (B,|T|,N,D)
-            Y_pix = model.pixel_head(Y)                     # (B,|T|,N,588)
-            target = x.reshape(B, C, Hh // 14, 14, Ww // 14, 14) \
-                      .permute(0, 2, 4, 1, 3, 5).reshape(B, num_patches, 14 * 14 * 3)
+            out = model(x)                              # 同一 forward（两种模式通用）
+            Y_pix = out["Y_pix"]                        # (B,|T|,N,588)
+            target = out["target_pix"]                  # (B,N,588)
             # 原图 (反归一化)
             img0 = patch_to_img(target, Hh, Ww)             # (B,H,W,3) uint8
             # 各展示步重建
