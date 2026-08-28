@@ -1,6 +1,10 @@
 """
 SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像素目标）
 =================================================
+⚠️ 项目目标（权威版 2026-08-28, 见 doc/2026-08-28/GOAL_compression_for_nlp.md）:
+    本训练是 Phase 1 的**脚手架**——用像素重建代理任务练编码器的
+    "token 压缩 + 联想"能力; 完成后冻结编码器接 Qwen 做 NLP 解码。
+    **验收标准是 Phase 2 文字生成质量, 不是像素 L1**（重建"糊"不追）。
 架构（model_v2.py, test 分支）: DINOv2-large(参数不冻结) → ReEncoder(因果
     specials 前缀链) → OutputQueryDecoder（输出查询注意力 + KV 因果 +
     平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
