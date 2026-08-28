@@ -149,6 +149,18 @@ class SRPhase1V2Trainer(Trainer):
         super().__init__(*args, **kwargs)
         self.can_return_loss = True   # 无 labels 模型也允许 eval 算 loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """eval 时忽略巨型逐采样步输出（Y_pix B×25×576×588 累积即 OOM）。
+
+        渐进曲线由 infer_v2_test.py 单独测（fp32, 逐步度量）; 训练/eval 只
+        需要 loss/recon/F_hat —— ignore Y_pix/target_pix 后每个预测只有
+        recon+F_hat(~22MB/batch), 全量 3004 张累积 ≈4GB, 无 OOM 风险。
+        """
+        if ignore_keys is None:
+            ignore_keys = ["Y_pix", "target_pix"]
+        return super().prediction_step(model, inputs, prediction_loss_only,
+                                       ignore_keys=ignore_keys)
+
 
 # ═══════════════════════════════════════════════════════════════
 # Main
