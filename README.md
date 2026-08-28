@@ -1,90 +1,78 @@
-# SR-Qwen-VL v10
+# SR-Diffusion-v3
 
-**SVD(1024×1024) → (2n,1024) matrix → DINO Encoder → MLP → Qwen3.5-4B → Text**
+**像素级重建模型**：DINOv2-large(不冻结) → ReEncoder(因果 specials 前缀链) → OutputQueryDecoder(输出查询注意力 + KV 因果 + 平方采样) → PixelHead → **重建原始像素**。
 
-PreTrainedModel 兼容 — save_pretrained / from_pretrained / HF Trainer.
+当前为最小可运行主干：工地图像素重建（448×252 → 576 patches）。实验文档与历史脚本按日期归档在 `doc/`。
 
 ## 架构
 
 ```
-1024×1024 原图
+448×252 原图 (1600:900 画布预处理)
     │
-    ▼  [离线预处理]
-SVD on 32×32 patches → (2n, 1024) matrix
-  · n = 能量截断(99%) ∩ [32, 128]
-  · 前 n 行: U[:,:n]^T  (行空间本征向量)
-  · 后 n 行: V[:,:n]^T  (列空间本征向量)
+    ▼  [DINOv2-large, 不冻结]  (304M)
+patch 特征 (B, 577, 1024)
     │
-    ▼  [训练]
-SVD Proj: 1024 → 1536 + CLS + pos
+    ▼  [ReEncoder 4层]  [cls; specials; patches] 因果 specials 块掩码
+z_cls, z_s (B, 577, 1024)
     │
-DINOv2-giant Encoder 40层 Transformer ❄️
+    ▼  [OutputQueryDecoder]  平方采样 25 步, KV 因果前缀
+F_hat (B, 576, 1024) 特征
     │
-MLP: 1536 → 5120 → 2560
-    │
-Qwen3.5-4B → 中文描述
+    ▼  [PixelHead]  Linear 1024→588
+像素 patch (B, 576, 588) → 重建 448×252
 ```
 
-**无图片输入** — DINO 直接消费 SVD 结构 token，不经过 patch embedding。
+**目标 = 原始像素 pixel_values**（L1 平权全覆盖，所有采样步 mean）。2026-08-27 重大修复：此前监督 DINO patch 特征会退化（工地图特征空间近常数，学质心即低 L1，假收敛）；像素目标有真实空间结构，强制模型保留空间信息。
 
 ## 快速开始
 
 ```bash
-# 1. 预计算 SVD 矩阵
-python preprocess_svd.py
-
-# 2. 训练
-python train.py
-```
-
-## 推理
-
-```python
-from model import SRQwenVLConfig, SRQwenVLv10
-model = SRQwenVLv10.from_pretrained("./output/final")
-model.cuda()
-text = model.generate(svd_matrix, prompt="描述这张图片：")
-```
-
----
-
-## Phase 1 v2 — 特征压缩自监督训练（DINOv2-large 不冻结）
-
-架构（model_v2.py）: DINOv2-large(可训练) → ReEncoder → FeatureDecoder,
-唯一损失 = L1 重建 DINO patch 特征。
-
-数据管线（data_v2.py）: 原图 → **旋转到最优角度 → 等比缩放 → 居中填充
-到 1600×900（16:9）画布**。轮廓不变形（只做刚体旋转 + 均匀缩放），
-信息量最大化（最优角使画布内内容面积最大）→ 16:9 模型输入 (448×252)。
-
-多卡训练（train_v2.py + run_v2_train.sh）:
-
-```bash
-# 双卡（纯重建: L = L1 重建 DINO patch 特征）
+# 1. 训练（2 GPU DDP, 全 fp32, 平权, bs16/卡）
 NUM_GPUS=2 ./run_v2_train.sh \
     --data_dir /root/autodl-tmp/construction_site \
     --dino_dir /root/autodl-tmp/models/dinov2-large \
-    --output_dir output/phase1_v2
+    --output_dir output/phase1_v2_pixel_fp32 --epochs 40
 
-# 双卡（多任务: + 文字自回归, L = L1 + CE, 中文 caption 为目标）
-NUM_GPUS=2 ./run_v2_train.sh \
+# 2. 推理测试（全量 test, fp32, 像素 L1 + 渐进曲线）
+python infer_v2_test.py \
     --data_dir /root/autodl-tmp/construction_site \
     --dino_dir /root/autodl-tmp/models/dinov2-large \
-    --qwen_dir /root/autodl-tmp/models/Qwen3.8-27B --text_decoder \
-    --output_dir output/phase1_v2_text
+    --final_model output/phase1_v2_pixel_fp32/final_model.pt \
+    --output output/phase1_v2_pixel_fp32/infer_test.json
+
+# 3. 重建可视化（原图 vs 各采样步）
+python visualize_recon_pixel.py \
+    --data_dir /root/autodl-tmp/construction_site \
+    --dino_dir /root/autodl-tmp/models/dinov2-large \
+    --final_model output/phase1_v2_pixel_fp32/final_model.pt \
+    --out output/phase1_v2_pixel_fp32/recon_visual.png
 ```
 
-要点:
-- DINOv2-large 权重来自 ModelScope `facebook/dinov2-large`（HF 官方站不可达）。
-- bf16 用显式 `torch.autocast`（规避 accelerate prepare 自动包装 +
-  torch 2.13 混合设备 conv dtype 报错）；权重保持 fp32。
-- 加载后移除 DINO `mask_token`（本任务不传 bool_masked_pos, 该参数不参与
-  前向, DDP 会报未用参数）。
-- 文字模式: Qwen 词表 embedding 从 safetensors 分片直接读取（不加载全
-  模型），默认冻结（--unfreeze_text_embed 解冻）; 优化器只收可训练参数。
-- 检查点: `accelerate.save_state` → `output_dir/ckpt-<step>`；续训
-  `--resume output_dir/ckpt-<step>`。最终推理权重: `output_dir/final_model.pt`
-  （**fp32** state_dict, 含 DINO + 可选 TextDecoder —— 勿用 bf16 导出,
-  实测权重量化会使重建 L1 劣化约 2 倍）。
-- 还原精度 vs z_s 前缀扫描: `python infer_k_sweep.py --final_model ...`
+自检: `python model_v2.py`（形状 / 块掩码 / 梯度 / PixelHead / eval 同路径）。
 
+## 目录结构
+
+```
+├── model_v2.py               # 核心模型（像素目标, 平权损失）
+├── data_v2.py                # 数据管线（1600:900 画布 → 448×252）
+├── train_v2.py               # 训练（HF Trainer, fp32, 平权, bs16）
+├── run_v2_train.sh           # 训练入口（NUM_GPUS=n）
+├── infer_v2_test.py          # 推理测试（像素 L1 + 渐进曲线）
+├── visualize_recon_pixel.py  # 重建可视化
+├── model.py / train.py       # v1 模型（SVD 思路, 存档）
+└── doc/                      # 实验文档与历史脚本（按日期归档）
+    ├── 2026-08-26/           # 第一轮: 特征目标 + 泄露排查
+    └── 2026-08-27/           # 像素目标训练 + 清晰度诊断
+```
+
+## 已知结果（2026-08-27 像素目标版）
+
+- 全量重建像素 L1 (0-255) = **23.41**（全图平均色参照 ≈61，改善 2.6×）
+- 渐进曲线: t=0（仅 1 键）L1=60（粗糙）→ t≥1 L1=22.7（精细）
+- 已知限制: 重建偏平滑（边缘 ≈ 原图 1/3）；诊断见 `doc/2026-08-27/DIAGNOSIS_clarity.md`（主因: OutputQueryDecoder 逐 patch 信息路由缺陷，改进方向: 逐 patch 内容查询 / PixelHead 升级 / LPIPS）
+
+## 环境
+
+- torch ≥ 2.12, transformers 5.x, accelerate, datasets, safetensors（`requirements.txt`）
+- 数据: parquet（image 列），预处理确定性（最优角旋转 + 等比缩放 + 1600:900 填充）
+- 模型: DINOv2-large（ModelScope 下载, `/root/autodl-tmp/models/dinov2-large`）

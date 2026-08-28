@@ -40,6 +40,13 @@
    `forward_prefix_set`（**多 k 并行**：一步同时监督多个前缀，覆盖全量/大/中/小所有尺度）；
    `infer_k_sweep.py` 新增 `--window` 滑窗探针。全部自检通过（`python model_v2.py` /
    `python train_v2.py`）。详见 `DESIGN_prefix_weighting.md` §10 实施记录。
+7. **全家桶（三维方案 C）已实现（2026-08-26，待用户审核）**：用户拍板"k 轴并入
+   输出位置"（`FeatureDecoderAllK`）——一次前向输出 (B,N,K,D) 全部前缀重建，
+   k 是显式结构维度（非循环展开）。`--prefix_all_k --prefix_k_list`（与
+   --prefix_curriculum 互斥）；eval 显示平均 + 全量块 L1；无泄漏已数值验证
+   （扰动 z_s[>k] 差 <1e-6）。**推理 k 受限 k_list（最近邻）**——若需任意 k
+   精确推理请用方案 A/B。⚠️ 实现踩坑已记录在 DESIGN §10b（LayerNorm 对均匀
+   扰动不变 + reshape 块序 permute），勿重蹈。
 
 ## 下一步（用户计划，待用户拍板后执行）
 1. **先确认服务器状态**（实例/端口/数据/产物）；不可达则向用户说明并讨论恢复方案。
@@ -54,7 +61,15 @@
        --prefix_k_count 3 \
        --output_dir output/phase1_v2_prefix
    # 文字模式同加 --prefix_curriculum（文字条件与重建共享同一前缀 k）
+
+   # 全家桶（三维方案 C，用户拍板方向）: 一次前向监督所有 k_list 前缀
+   accelerate launch --multi_gpu --num_processes 2 \
+       train_v2.py --data_dir /root/autodl-tmp/construction_site \
+       --dino_dir /root/autodl-tmp/models/dinov2-large \
+       --prefix_all_k --prefix_k_list "1,2,4,8,16,32,64,128,256,576" \
+       --output_dir output/phase1_v2_allk
    ```
+   ⚠️ 全家桶推理 k 受限 k_list（最近邻）——先和用户确认接受此限制再开训。
 3. 训练后重跑 `infer_k_sweep.py`（k 扫描 + `--window 32` 滑窗探针）验证：预期 k=1..32 平台消失、前段窗口信息量>后段、全量 L1 退化 ≤1.5×（当前 0.00114）。
 4. 验证成功后并入正式版（改进 v2），届时再打版本 tag。
 
