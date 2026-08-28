@@ -80,3 +80,10 @@ python visualize_v3.py --data_dir ... --dino_dir ... \
 ```
 
 产物在服务器 `/root/autodl-tmp/sr-diffusion-v3-main/output/phase1_v3_blip2/`。
+
+## 8. 重建可视化
+
+![v3 重建可视化](recon_visual_v3.png)
+
+（原图 vs 重建蒙太奇，4 张 test 样本；单次前向无采样步。）
+
