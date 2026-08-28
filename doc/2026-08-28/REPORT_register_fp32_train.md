@@ -59,3 +59,11 @@ register 版起步慢（DINO 24 层直接吃 1153 token, 热身期长）但收�
   （渐进曲线由 infer_v2_test 单独测）——eval 预测从 ~100GB 降到 ~4GB, eval 从 30 分钟
   崩溃 → 90 秒完成。
 - 产物: `output/phase1_v2_reg/final_model.pt`（1.26GB fp32）+ infer_test.json + recon_visual.png
+
+## 7. 重建可视化
+
+![recon_visual_register](recon_visual_register.png)
+
+3 张 test 图 × 6 面板（原图 / t=0 / t=36 / t=144 / t=324 / t=576）: 整体色调与大块结构
+保留（t≥1 即有清晰轮廓）, 但细节偏平滑（边缘约原图 1/5）——与 §4 数值一致; register 版
+与旧版视觉上无显著差异。
