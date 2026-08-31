@@ -618,6 +618,8 @@ class SRPhase1V2(nn.Module):
 #   6. 梯度流向（整模型可训: ReEncoder / Decoder / SpecialTokenBank）
 #   7. eval 同路径
 #   8. register 模式（K≠N 形状与梯度）; 9. register 默认 K=128 快速形状
+#   10. 边界实验配置（K=64, decoder_steps=[32,64], register_specials）:
+#       z_s 形状 / Y 两时刻 / loss 只在这两步平均（含小配置 K=8 验证）
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -865,5 +867,48 @@ if __name__ == "__main__":
     assert out_r2["Y_pix"].shape == (2, len(m_reg2.decoder.steps), N, PATCH_PX)
     print(f"[ok] register_specials 默认 K=128: z_s(2,128,D), "
           f"Y_pix{tuple(out_r2['Y_pix'].shape)}")
+
+    # ── 10. 边界实验配置（K=64, decoder_steps=[32,64], register_specials）──
+    # 用户实验（2026-08-31）: 最大特殊 token 数 K=64, 只监督"前 32 / 前 64"
+    # 两个前缀序列——decoder_steps=[32,64] 即 KV 前缀长度 32 和 64 两个
+    # 采样时刻。压缩边界探索: 32-token 前缀 vs 64-token 全量前缀重建对比。
+    dino_b = FakeDino(dim=D, num_patches=N)
+    m_b = SRPhase1V2(dino_b, num_patches=N, dim=D, num_specials=64,
+                     decoder_steps=[32, 64], register_specials=True,
+                     loss_min_t=5)
+    assert m_b.decoder.steps == [32, 64], m_b.decoder.steps
+    z_cls_b, z_s_b = m_b.encode(x)
+    assert z_cls_b.shape == (2, 1, D) and z_s_b.shape == (2, 64, D), \
+        (z_cls_b.shape, z_s_b.shape)                # z_s (B,64,D): K=64
+    out_b = m_b(x)
+    assert out_b["Y_pix"].shape == (2, 2, N, PATCH_PX), out_b["Y_pix"].shape
+    # loss 只在这两步算: per_step 只有 2 项, t=32/64 均 >= loss_min_t=5,
+    # keep 全 True, 无退化警告
+    perb = F.l1_loss(out_b["Y_pix"],
+                     out_b["target_pix"].unsqueeze(1).expand_as(out_b["Y_pix"]),
+                     reduction="none").mean(dim=(0, 2, 3))   # (2,)
+    assert perb.shape == (2,), perb.shape
+    keepb = torch.tensor([t >= m_b.loss_min_t for t in m_b.decoder.steps],
+                         dtype=torch.bool)
+    assert keepb.tolist() == [True, True], "K=64 边界配置两步都应满足 t>=5"
+    assert torch.isclose(out_b["loss"], perb[keepb].mean()), \
+        "边界配置 loss 应为 per_step 两步的平均（平权）"
+    # 小配置 K=8, steps=[2,4]（非 register, 小步快验）: 同样两步采样,
+    # loss_min_t=1 时两步均保留, 语义与 K=64 一致
+    m_c = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                     num_specials=8, decoder_steps=[2, 4], loss_min_t=1,
+                     reencoder_depth=2)
+    assert m_c.decoder.steps == [2, 4], m_c.decoder.steps
+    out_c = m_c(x)
+    per_c = F.l1_loss(out_c["Y_pix"],
+                      out_c["target_pix"].unsqueeze(1).expand_as(out_c["Y_pix"]),
+                      reduction="none").mean(dim=(0, 2, 3))   # (2,)
+    keep_c = torch.tensor([t >= m_c.loss_min_t for t in m_c.decoder.steps],
+                          dtype=torch.bool)
+    assert keep_c.tolist() == [True, True]
+    assert torch.isclose(out_c["loss"], per_c[keep_c].mean())
+    print(f"[ok] 边界实验配置 K=64 steps=[32,64] (register): "
+          f"z_s(2,64,D), Y_pix(2,2,{N},{PATCH_PX}), "
+          f"loss=per_step 两步平均(无退化); 小配置 K=8 steps=[2,4] 同语义")
 
     print("\nALL CHECKS PASSED")

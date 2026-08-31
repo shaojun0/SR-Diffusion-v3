@@ -14,6 +14,15 @@ SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-2
        t 只见前缀 s≤t。对每步 t∈T_sub 度量像素 L1(Y_t_pix, target_pix),
        得到"前缀越长重建越精"的渐进曲线。
 
+2026-08-31（边界实验对齐, K=64 + decoder_steps=[32,64]）:
+    · 新增 --num_specials / --loss_min_t 透传 SRPhase1V2, 与训练一致
+      （推理 forward 也走 decode(), 需保持 loss_min_t 语义; 全量重建 L1
+      与渐进曲线测量不受影响——decoder steps 始终全量输出）;
+    · --decoder_steps 增加越界校验: 0 <= s <= num_specials（采样步 t 是
+      KV 前缀长度, 上界 = K）;
+    · final_model 同目录存在 model_info.json 时打印参数对齐提示（不强制,
+      以权重 strict load 为准）。
+
 用法:
     python infer_v2_test.py \
         --data_dir /root/autodl-tmp/construction_site \
@@ -52,8 +61,13 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--register_specials", action="store_true",
                    help="register 式模型(与训练 --register_specials 一致)")
+    p.add_argument("--num_specials", type=int, default=128,
+                   help="特殊 token 数 K(与训练 --num_specials 一致, 默认 128)")
+    p.add_argument("--loss_min_t", type=int, default=5,
+                   help="损失过滤阈值(与训练一致, 默认 5; 推理 forward 走 "
+                        "decode(), 需保持该语义)")
     p.add_argument("--decoder_steps", default=None,
-                   help="必须与训练一致(逗号分隔); 默认 square_step_schedule(N)")
+                   help="必须与训练一致(逗号分隔); 默认 square_step_schedule(K=num_specials)")
     return p.parse_args()
 
 
@@ -79,6 +93,33 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
+        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = K=num_specials
+        # （与 train_v2.py 相同的解析/校验逻辑）
+        assert steps and all(0 <= s <= args.num_specials for s in steps), \
+            f"decoder_steps 越界: {steps} (K={args.num_specials}, KV 长度 1+K)"
+
+    # ── model_info.json 提前读取（加载前提示, 不强制）──
+    # 训练侧把 num_specials / loss_min_t / decoder_steps / register_specials
+    # 写在 output_dir/model_info.json。若 final_model 是 K=64 边界模型而
+    # --num_specials 漏传（默认 128）, strict load 会因形状不匹配直接崩溃,
+    # 所以**构造模型前**先按训练侧配置给友好提示。
+    info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
+    train_info = None
+    if os.path.exists(info_path):
+        with open(info_path) as f:
+            train_info = json.load(f)
+        if ("num_specials" in train_info
+                and train_info["num_specials"] != args.num_specials):
+            print(f"[warn] model_info.json 记录 num_specials="
+                  f"{train_info['num_specials']}, 但 --num_specials="
+                  f"{args.num_specials}: strict load 将因形状不匹配失败, "
+                  f"请按训练配置传参 (边界实验: --num_specials 64)")
+        if ("register_specials" in train_info
+                and bool(train_info["register_specials"]) != args.register_specials):
+            print(f"[warn] model_info.json 记录 register_specials="
+                  f"{train_info['register_specials']}, 与推理 "
+                  f"register_specials={args.register_specials} 不一致: "
+                  f"模型结构可能不匹配")
 
     # ── 模型: 训练好的重建权重 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
@@ -86,6 +127,8 @@ def main():
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
+                       num_specials=args.num_specials,
+                       loss_min_t=args.loss_min_t,
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
@@ -97,8 +140,30 @@ def main():
     model.eval().cuda()
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
+          f"K={args.num_specials}, loss_min_t={args.loss_min_t}, "
           f"register_specials={args.register_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
+
+    # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
+    # 早期检查只覆盖会崩的项（num_specials/register_specials）; 这里补全
+    # loss_min_t / decoder_steps 对比, 并给出最终对齐/不一致结论。
+    if train_info is not None:
+        mism = []
+        for k, v in [("num_specials", args.num_specials),
+                     ("loss_min_t", args.loss_min_t),
+                     ("register_specials", args.register_specials)]:
+            if k in train_info and train_info[k] != v:
+                mism.append(f"{k}: 训练 {train_info[k]} != 推理 {v}")
+        if ("decoder_steps" in train_info
+                and list(train_info["decoder_steps"]) != T_steps):
+            mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
+                        f"!= 推理 {T_steps}")
+        if mism:
+            print(f"[warn] 推理参数与训练侧 model_info.json 不一致 ({info_path}):")
+            for m in mism:
+                print(f"    - {m}")
+        else:
+            print(f"[ok] 推理参数与训练侧 model_info.json 对齐 ({info_path})")
 
     # ── 数据: test 分片, 与训练同预处理（1600:900 画布 → 448x252）──
     test_files = sorted(glob.glob(os.path.join(args.data_dir, "test-*.parquet")))
