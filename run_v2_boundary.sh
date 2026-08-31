@@ -42,7 +42,10 @@ ARGS=(
 )
 
 if [ "${NUM_GPUS}" -eq 1 ]; then
-  exec python train_v2.py "${ARGS[@]}" "$@" 2>&1 | tee -a "${LOG}"
+  # 注意: exec + 管道 不会替换当前 shell（管道需 fork），会导致脚本
+  # 继续执行下面的 accelerate 分支 → 用普通执行 + 显式 exit 传播退出码。
+  python train_v2.py "${ARGS[@]}" "$@" 2>&1 | tee -a "${LOG}"
+  exit "${PIPESTATUS[0]}"
 fi
 
 exec accelerate launch --multi_gpu --num_processes "${NUM_GPUS}" \
