@@ -140,7 +140,6 @@ def main():
     model.eval().cuda()
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
-          f"K={args.num_specials}, loss_min_t={args.loss_min_t}, "
           f"register_specials={args.register_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
@@ -149,9 +148,7 @@ def main():
     # loss_min_t / decoder_steps 对比, 并给出最终对齐/不一致结论。
     if train_info is not None:
         mism = []
-        for k, v in [("num_specials", args.num_specials),
-                     ("loss_min_t", args.loss_min_t),
-                     ("register_specials", args.register_specials)]:
+        for k, v in [("register_specials", args.register_specials)]:
             if k in train_info and train_info[k] != v:
                 mism.append(f"{k}: 训练 {train_info[k]} != 推理 {v}")
         if ("decoder_steps" in train_info
