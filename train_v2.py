@@ -111,10 +111,10 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
-    p.add_argument("--skip_steps", type=int, default=4,
-                   help="采样计划切片起点: 跳过前 skip_steps 个粗步(不监督)")
-    p.add_argument("--max_steps", type=int, default=9,
-                   help="采样计划切片终点: 只取前 max_steps 个采样步(不含冗余长前缀)")
+    p.add_argument("--slice_start", type=int, default=4,
+                   help="采样计划切片起点索引: 跳过前 slice_start 个粗步(不监督)")
+    p.add_argument("--slice_end", type=int, default=9,
+                   help="采样计划切片终点索引: 只取前 slice_end 个采样步(不含冗余长前缀)")
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
     p.add_argument("--register_specials", action="store_true",
@@ -226,8 +226,8 @@ def main():
                        decoder_steps=steps,
                        register_specials=args.register_specials,
                        decoder_depth=args.decoder_depth,
-                       skip_steps=args.skip_steps,
-                       max_steps=args.max_steps)
+                       skip_steps=args.slice_start,
+                       max_steps=args.slice_end)
     model.init_reencoder_from_dino(args.reencoder_depth)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -235,8 +235,8 @@ def main():
           f"输入 {W}x{H}, patches={num_patches}, specials={num_patches} "
           f"(序列 {1 + 2 * num_patches} token), decoder 采样 "
           f"{len(model.decoder.steps)} 步 {model.decoder.steps}")
-    print(f"[model] 采样计划切片: skip_steps={args.skip_steps} "
-          f"max_steps={args.max_steps}（只监督切片内中段采样步）")
+    print(f"[model] 采样计划切片: slice_start={args.slice_start} "
+          f"slice_end={args.slice_end}（只监督切片内中段采样步）")
     if args.register_specials:
         print(f"[model] register_specials: specials 进 DINO 序列("
               f"{1 + 2 * num_patches} token, 全双向) 由 24 层"
@@ -313,7 +313,7 @@ def main():
                 "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "decoder_depth": args.decoder_depth,
-                "skip_steps": args.skip_steps, "max_steps": args.max_steps,
+                "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "causal_specials": not args.no_causal_specials,
                 "register_specials": args.register_specials,
                 "decoder_steps": raw.decoder.steps,
