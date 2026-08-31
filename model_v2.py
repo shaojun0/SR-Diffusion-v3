@@ -336,7 +336,7 @@ class OutputQueryDecoder(nn.Module):
     def __init__(self, dim: int = 768, num_patches: int = 256,
                  mlp_ratio: float = 4.0, kv_causal: bool = True,
                  steps: Optional[Sequence[int]] = None, heads: int = 8,
-                 depth: int = 2,skip_steps: int = 4,):
+                 depth: int = 2,skip_steps: int = 4,max_steps: int = 9,):
         super().__init__()
         self.num_patches = num_patches
         self.kv_causal = kv_causal
@@ -345,7 +345,8 @@ class OutputQueryDecoder(nn.Module):
         steps = sorted(set(int(s) for s in steps))
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"steps 越界: {steps} (N={num_patches})"
-        self.steps = steps[skip_steps:]
+        # 这里要加assert，看到就帮忙加一下
+        self.steps = steps[skip_steps:max_steps]
         S = num_patches + 1                                # z_cls + N z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
         # 标准解码器堆叠（不造轮子）: torch.nn.TransformerDecoder 内部按
