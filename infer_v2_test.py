@@ -61,13 +61,14 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--register_specials", action="store_true",
                    help="register 式模型(与训练 --register_specials 一致)")
-    p.add_argument("--num_specials", type=int, default=128,
-                   help="特殊 token 数 K(与训练 --num_specials 一致, 默认 128)")
-    p.add_argument("--loss_min_t", type=int, default=5,
-                   help="损失过滤阈值(与训练一致, 默认 5; 推理 forward 走 "
-                        "decode(), 需保持该语义)")
+    p.add_argument("--decoder_depth", type=int, default=2,
+                   help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
+    p.add_argument("--skip_steps", type=int, default=4,
+                   help="采样计划切片起点(与训练 --skip_steps 一致)")
+    p.add_argument("--max_steps", type=int, default=9,
+                   help="采样计划切片终点(与训练 --max_steps 一致)")
     p.add_argument("--decoder_steps", default=None,
-                   help="必须与训练一致(逗号分隔); 默认 square_step_schedule(K=num_specials)")
+                   help="必须与训练一致(逗号分隔); 默认 square_step_schedule(N) 切片")
     return p.parse_args()
 
 
@@ -93,27 +94,25 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
-        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = K=num_specials
+        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = N=num_patches
         # （与 train_v2.py 相同的解析/校验逻辑）
-        assert steps and all(0 <= s <= args.num_specials for s in steps), \
-            f"decoder_steps 越界: {steps} (K={args.num_specials}, KV 长度 1+K)"
+        assert steps and all(0 <= s <= num_patches for s in steps), \
+            f"decoder_steps 越界: {steps} (N={num_patches}, KV 长度 1+N)"
 
     # ── model_info.json 提前读取（加载前提示, 不强制）──
-    # 训练侧把 num_specials / loss_min_t / decoder_steps / register_specials
-    # 写在 output_dir/model_info.json。若 final_model 是 K=64 边界模型而
-    # --num_specials 漏传（默认 128）, strict load 会因形状不匹配直接崩溃,
-    # 所以**构造模型前**先按训练侧配置给友好提示。
+    # 训练侧把 decoder_depth / skip_steps / max_steps / decoder_steps /
+    # register_specials 写在 output_dir/model_info.json。若漏传会导致
+    # strict load 形状不匹配崩溃, 所以**构造模型前**先按训练侧配置对齐提示。
     info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
     train_info = None
     if os.path.exists(info_path):
         with open(info_path) as f:
             train_info = json.load(f)
-        if ("num_specials" in train_info
-                and train_info["num_specials"] != args.num_specials):
-            print(f"[warn] model_info.json 记录 num_specials="
-                  f"{train_info['num_specials']}, 但 --num_specials="
-                  f"{args.num_specials}: strict load 将因形状不匹配失败, "
-                  f"请按训练配置传参 (边界实验: --num_specials 64)")
+        for k in ("skip_steps", "max_steps", "decoder_depth"):
+            if k in train_info and train_info[k] != args.__dict__[k]:
+                print(f"[warn] model_info.json 记录 {k}={train_info[k]}, "
+                      f"但 --{k}={args.__dict__[k]}: 与训练配置不一致, "
+                      f"请按训练配置传参")
         if ("register_specials" in train_info
                 and bool(train_info["register_specials"]) != args.register_specials):
             print(f"[warn] model_info.json 记录 register_specials="
@@ -127,13 +126,14 @@ def main():
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       num_specials=args.num_specials,
-                       loss_min_t=args.loss_min_t,
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        decoder_steps=steps,
-                       register_specials=args.register_specials)
+                       register_specials=args.register_specials,
+                       decoder_depth=args.decoder_depth,
+                       skip_steps=args.skip_steps,
+                       max_steps=args.max_steps)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)

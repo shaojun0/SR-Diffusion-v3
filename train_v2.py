@@ -109,11 +109,12 @@ def parse_args():
     p.add_argument("--reencoder_depth", type=int, default=4)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
-    p.add_argument("--num_specials", type=int, default=128,
-                   help="特殊 token 数 K（与 patch 数 N 解耦; 默认 128 = 2.6% 键压缩）")
-    p.add_argument("--loss_min_t", type=int, default=5,
-                   help="损失只对 t>=loss_min_t 的采样步求平均（排除 t<5 的"
-                        "\"几乎无键\"早期步 {0,1,4}; 0 = 不过滤）")
+    p.add_argument("--decoder_depth", type=int, default=2,
+                   help="OutputQueryDecoder 的 TransformerDecoder 层数")
+    p.add_argument("--skip_steps", type=int, default=4,
+                   help="采样计划切片起点: 跳过前 skip_steps 个粗步(不监督)")
+    p.add_argument("--max_steps", type=int, default=9,
+                   help="采样计划切片终点: 只取前 max_steps 个采样步(不含冗余长前缀)")
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
     p.add_argument("--register_specials", action="store_true",
@@ -193,9 +194,9 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
-        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = K=num_specials
-        assert steps and all(0 <= s <= args.num_specials for s in steps), \
-            f"decoder_steps 越界: {steps} (K={args.num_specials}, KV 长度 1+K)"
+        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = N=num_patches
+        assert steps and all(0 <= s <= num_patches for s in steps), \
+            f"decoder_steps 越界: {steps} (N={num_patches}, KV 长度 1+N)"
 
     # ── 数据（纯重建模式, tokenizer=None; data_v2.py 已提供）──
     train_files = sorted(glob.glob(os.path.join(args.data_dir, "train-*.parquet")))
@@ -218,27 +219,28 @@ def main():
         del dino.embeddings.mask_token
 
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       num_specials=args.num_specials,
-                       loss_min_t=args.loss_min_t,
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        causal_specials=not args.no_causal_specials,
                        decoder_steps=steps,
-                       register_specials=args.register_specials)
+                       register_specials=args.register_specials,
+                       decoder_depth=args.decoder_depth,
+                       skip_steps=args.skip_steps,
+                       max_steps=args.max_steps)
     model.init_reencoder_from_dino(args.reencoder_depth)
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
-          f"输入 {W}x{H}, patches={num_patches}, specials={args.num_specials} "
-          f"(序列 {1 + args.num_specials + num_patches} token), decoder 采样 "
-          f"{len(model.decoder.steps)} 步 {model.decoder.steps[:6]}...")
-    print(f"[model] loss_min_t={args.loss_min_t}: 损失只对 t>=loss_min_t 的采样步"
-          f"求平均（decoder 的 steps 仍全量输出, 推理渐进曲线不变）")
+          f"输入 {W}x{H}, patches={num_patches}, specials={num_patches} "
+          f"(序列 {1 + 2 * num_patches} token), decoder 采样 "
+          f"{len(model.decoder.steps)} 步 {model.decoder.steps}")
+    print(f"[model] 采样计划切片: skip_steps={args.skip_steps} "
+          f"max_steps={args.max_steps}（只监督切片内中段采样步）")
     if args.register_specials:
         print(f"[model] register_specials: specials 进 DINO 序列("
-              f"{1 + args.num_specials + num_patches} token, 全双向) 由 24 层"
-              f"算出 z_s (K={args.num_specials}); 无 ReEncoder, 训练时长预计 ~2-3×")
+              f"{1 + 2 * num_patches} token, 全双向) 由 24 层"
+              f"算出 z_s; 无 ReEncoder, 训练时长预计 ~2-3×")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -306,11 +308,12 @@ def main():
         final = os.path.join(args.output_dir, "final_model.pt")
         torch.save(sd, final)
         info = {"input_size": [W, H], "canvas": [CW, CH],
-                "num_patches": num_patches, "num_specials": args.num_specials,
-                "loss_min_t": args.loss_min_t,
+                "num_patches": num_patches,
                 "dim": dino.config.hidden_size,
                 "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
+                "decoder_depth": args.decoder_depth,
+                "skip_steps": args.skip_steps, "max_steps": args.max_steps,
                 "causal_specials": not args.no_causal_specials,
                 "register_specials": args.register_specials,
                 "decoder_steps": raw.decoder.steps,

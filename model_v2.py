@@ -340,13 +340,24 @@ class OutputQueryDecoder(nn.Module):
         super().__init__()
         self.num_patches = num_patches
         self.kv_causal = kv_causal
+        # 采样计划: 显式 steps（如边界实验 [32,64]）原样使用, 不切片;
+        # 默认 square_step_schedule(N) 生成的步过多, 按 skip/max 切片取中段
+        # （跳过最前面几个"几乎无键"的粗步, 也截掉长前缀冗余步）。
+        explicit = steps is not None
         if steps is None:
             steps = square_step_schedule(num_patches)
         steps = sorted(set(int(s) for s in steps))
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"steps 越界: {steps} (N={num_patches})"
-        # 这里要加assert，看到就帮忙加一下
-        self.steps = steps[skip_steps:max_steps]
+        if explicit:
+            self.steps = steps                 # 显式列表原样（调用方负责）
+        else:
+            assert 0 <= skip_steps < max_steps <= len(steps), \
+                f"skip_steps/max_steps 越界: skip={skip_steps} max={max_steps} " \
+                f"(计划共 {len(steps)} 步 {steps})"
+            self.steps = steps[skip_steps:max_steps]
+            assert self.steps, \
+                f"切片后无采样步: steps[{skip_steps}:{max_steps}] of {steps} 为空"
         S = num_patches + 1                                # z_cls + N z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
         # 标准解码器堆叠（不造轮子）: torch.nn.TransformerDecoder 内部按
@@ -402,6 +413,8 @@ class SRPhase1V2(nn.Module):
         patch_px: int = 14 * 14 * 3,
         register_specials: bool = False,
         decoder_depth: int = 2,
+        skip_steps: int = 4,
+        max_steps: int = 9,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -422,7 +435,9 @@ class SRPhase1V2(nn.Module):
         self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
                                           mlp_ratio=mlp_ratio, heads=heads,
                                           steps=decoder_steps,
-                                          depth=decoder_depth)
+                                          depth=decoder_depth,
+                                          skip_steps=skip_steps,
+                                          max_steps=max_steps)
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     def init_reencoder_from_dino(self, num_layers: int = 4):
@@ -643,7 +658,8 @@ if __name__ == "__main__":
     N, D = 16, 64
     dino = FakeDino(dim=D, num_patches=N)
     model = SRPhase1V2(dino, num_patches=N, dim=D,
-                       reencoder_depth=2)
+                       reencoder_depth=2,
+                       decoder_steps=square_step_schedule(N))  # 显式传完整计划(不切片)
     model.init_reencoder_from_dino(2)
     # 像素目标绑定输入尺寸: N=16 patches ⇒ 输入须为 4×4 patch = 56×56 (14 的倍数)
     x = torch.randn(2, 3, 56, 56)
@@ -673,7 +689,8 @@ if __name__ == "__main__":
         assert not am[i, N + 1:].any()               # special i 可见全部 patches
     # 关掉 causal 时掩码全 False（回退全双向；掩码 forward 内现算，先跑一次）
     m_free = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                        causal_specials=False, reencoder_depth=2)
+                        causal_specials=False, reencoder_depth=2,
+                        decoder_steps=square_step_schedule(N))
     _ = m_free.re_encoder(torch.randn(2, 2 * N + 1, D))
     assert not m_free.re_encoder.attn_mask.any()
     print(f"[ok] ReEncoder block mask: causal_specials=True 结构正确, "
@@ -700,9 +717,15 @@ if __name__ == "__main__":
     assert square_step_schedule(256) == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81,
                                          100, 121, 144, 169, 196, 225, 256]
     assert len(square_step_schedule(512)) == 24
+    # 默认切片（skip_steps=4/max_steps=9）: 只取中段采样步——跳过最前面
+    # 的粗步（0,1,4,9,16 里 skip 前 4 个 → 剩 16...），截掉长前缀冗余步。
+    # 256 计划 [0,1,4,9,16,25,36,49,64,81,100,121,144,169,196,225,256]:
+    # [4:9] = [16,25,36,49,64]（中段 5 步）。
+    _full = square_step_schedule(256)
+    assert _full[4:9] == [16, 25, 36, 49, 64], _full[4:9]
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
           f"TransformerDecoder, 平方采样 {len(T_steps)} 步 + KV 因果掩码 "
-          f"+ 平权全覆盖像素损失正确")
+          f"+ 平权全覆盖像素损失正确; 默认切片 [4:9]={_full[4:9]}")
 
     # ── 4. 梯度流向（整模型可训, 含 PixelHead; 首层自注意力 + 末层交叉/FFN）──
     out["loss"].backward()
@@ -732,7 +755,8 @@ if __name__ == "__main__":
 
     # ── 6. register 模式: specials 合并进 DINO（修 F1/F2, 2026-08-28）──
     dino_r = FakeDino(dim=D, num_patches=N)
-    m_reg = SRPhase1V2(dino_r, num_patches=N, dim=D, register_specials=True)
+    m_reg = SRPhase1V2(dino_r, num_patches=N, dim=D, register_specials=True,
+                       decoder_steps=square_step_schedule(N))
     assert m_reg.re_encoder is None, "register 模式不应有 ReEncoder"
     out_r = m_reg(x)
     assert out_r["F_hat"].shape == (2, N, PATCH_PX)
