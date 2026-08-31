@@ -249,14 +249,14 @@ class SRPhase1V5(nn.Module):
         return torch.cat([z_cls, z_s[:, :m]], dim=1)
 
     # ── 训练步: 采样一个 t, 加噪, 去噪, L2+L1 ──
-    def forward(self, x: Tensor) -> dict:
-        """x: (B,3,H,W) → {"loss","recon","x0_hat","target","z_s","t","m"}。
+    def forward(self, pixel_values: Tensor) -> dict:
+        """pixel_values: (B,3,H,W) → {"loss","recon","x0_hat","target","z_s","t","m"}。
 
         t 采样: 训练随机 1..T; eval 用 fixed_eval_t（默认 None→随机）——
         eval 时建议传 fixed_eval_t=T//2 得到确定性的 eval_loss。
         """
-        z_cls, z_s = self.encode(x)                             # (B,1,D),(B,K,D)
-        x0 = self._patches(x)                                   # (B,N,588)
+        z_cls, z_s = self.encode(pixel_values)                  # (B,1,D),(B,K,D)
+        x0 = self._patches(pixel_values)                        # (B,N,588)
         B = x0.shape[0]
         if self.training or self.fixed_eval_t is None:
             t = int(torch.randint(1, self.T + 1, ()).item())
@@ -270,7 +270,7 @@ class SRPhase1V5(nn.Module):
         a = float(self.alphas_cumprod[t])
         eps = torch.randn_like(x0)
         x_t = math.sqrt(a) * x0 + math.sqrt(max(1.0 - a, 0.0)) * eps
-        x_hat = self.decoder(x_t, self._time_embed_full(B, t, x.device), ctx)
+        x_hat = self.decoder(x_t, self._time_embed_full(B, t, pixel_values.device), ctx)
         l2 = F.mse_loss(x_hat, x0)
         l1 = F.l1_loss(x_hat, x0)
         loss = l2 + self.l1_weight * l1

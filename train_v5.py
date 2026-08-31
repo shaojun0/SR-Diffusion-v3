@@ -114,6 +114,24 @@ class SRPhase1V5Trainer(Trainer):
         super().__init__(*args, **kwargs)
         self.can_return_loss = True   # 无 labels 模型也允许 eval 算 loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """eval 只返回确定性 loss（fixed_eval_t=T//2）—— 设计意图。
+
+        不返回模型输出 dict: 其中 t/m 是 int、recon 是 0-d 张量, transformers
+        5.15 的 pad_across_processes 只接受张量, 会抛 TypeError。eval 指标
+        用固定 t 的 eval_loss 即可（compute_metrics 收不到 predictions）。
+        """
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                num_items_in_batch = self._get_num_items_in_batch(
+                    [inputs], self.args.device)
+                loss, _outputs = self.compute_loss(
+                    model, inputs, return_outputs=True,
+                    num_items_in_batch=num_items_in_batch)
+            loss = loss.detach().mean()
+        return (loss, None, None)
+
 
 def main():
     args = parse_args()
