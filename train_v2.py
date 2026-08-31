@@ -25,6 +25,16 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
       fp32 存被质疑）; TrainingArguments 不设 bf16/fp16, 不套 autocast;
     · batch_size 默认提高到 16/卡（97GB 显存充裕）。
 
+2026-08-31（用户需求, 两个修改, 与 model_v2.py 配套）:
+    · --num_specials（默认 128）: specials 数 K 与 patch 数 N 解耦——K 只管
+      "压缩键数"（decoder 的 KV 长度 1+K, 序列 = [cls; specials(K); patches(N)]
+      = 1+K+N token, 采样计划按 K 推导）, N 只管查询基行数/输出 patch 数。
+      K=128/N=576 即 2.6% 键还原全部 patch 的真压缩。
+    · --loss_min_t（默认 5）: 损失只对 t>=loss_min_t 的采样步求平均——排除
+      {0,1,4} 这些"几乎无键"的粗重建步（退化监督）; decoder 的 steps 不变
+      （推理渐进曲线仍要全部步的 Y_pix）, 只是损失侧过滤; 传 0 即不过滤。
+    · model_info.json 记录 num_specials / loss_min_t, 供推理/可视化脚本对齐。
+
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
       transformers.Trainer + TrainingArguments（lr_scheduler_type="cosine"
@@ -99,6 +109,11 @@ def parse_args():
     p.add_argument("--reencoder_depth", type=int, default=4)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
+    p.add_argument("--num_specials", type=int, default=128,
+                   help="特殊 token 数 K（与 patch 数 N 解耦; 默认 128 = 2.6% 键压缩）")
+    p.add_argument("--loss_min_t", type=int, default=5,
+                   help="损失只对 t>=loss_min_t 的采样步求平均（排除 t<5 的"
+                        "\"几乎无键\"早期步 {0,1,4}; 0 = 不过滤）")
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
     p.add_argument("--register_specials", action="store_true",
@@ -106,7 +121,7 @@ def parse_args():
                         "DINOv2 输入序列, 由 DINO 24 层算出 z_s; 无 ReEncoder")
     # ── 模型（OutputQueryDecoder）──
     p.add_argument("--decoder_steps", default=None,
-                   help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(N)")
+                   help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(K)")
     return p.parse_args()
 
 
@@ -178,8 +193,9 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
-        assert steps and all(0 <= s <= num_patches for s in steps), \
-            f"decoder_steps 越界: {steps} (N={num_patches})"
+        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = K=num_specials
+        assert steps and all(0 <= s <= args.num_specials for s in steps), \
+            f"decoder_steps 越界: {steps} (K={args.num_specials}, KV 长度 1+K)"
 
     # ── 数据（纯重建模式, tokenizer=None; data_v2.py 已提供）──
     train_files = sorted(glob.glob(os.path.join(args.data_dir, "train-*.parquet")))
@@ -202,6 +218,8 @@ def main():
         del dino.embeddings.mask_token
 
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
+                       num_specials=args.num_specials,
+                       loss_min_t=args.loss_min_t,
                        dim=dino.config.hidden_size,
                        reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
@@ -212,11 +230,15 @@ def main():
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
-          f"输入 {W}x{H}, patches={num_patches}, decoder 采样 "
+          f"输入 {W}x{H}, patches={num_patches}, specials={args.num_specials} "
+          f"(序列 {1 + args.num_specials + num_patches} token), decoder 采样 "
           f"{len(model.decoder.steps)} 步 {model.decoder.steps[:6]}...")
+    print(f"[model] loss_min_t={args.loss_min_t}: 损失只对 t>=loss_min_t 的采样步"
+          f"求平均（decoder 的 steps 仍全量输出, 推理渐进曲线不变）")
     if args.register_specials:
-        print(f"[model] register_specials: specials 进 DINO 序列({2 * num_patches + 1} "
-              f"token, 全双向) 由 24 层算出 z_s; 无 ReEncoder, 训练时长预计 ~2-3×")
+        print(f"[model] register_specials: specials 进 DINO 序列("
+              f"{1 + args.num_specials + num_patches} token, 全双向) 由 24 层"
+              f"算出 z_s (K={args.num_specials}); 无 ReEncoder, 训练时长预计 ~2-3×")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -284,7 +306,9 @@ def main():
         final = os.path.join(args.output_dir, "final_model.pt")
         torch.save(sd, final)
         info = {"input_size": [W, H], "canvas": [CW, CH],
-                "num_patches": num_patches, "dim": dino.config.hidden_size,
+                "num_patches": num_patches, "num_specials": args.num_specials,
+                "loss_min_t": args.loss_min_t,
+                "dim": dino.config.hidden_size,
                 "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "causal_specials": not args.no_causal_specials,
