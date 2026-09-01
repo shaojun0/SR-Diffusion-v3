@@ -35,6 +35,9 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
                     → F_hat = Σ_t Y_t (B,N,D)（第 n 步结果 = 前 n 步之和）
     L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
         （去掉加权体系; 每个采样步的累积重建都监督还原全部 patch）
+        （2026-09-03 梯度按步解耦: 数值累加不变, 但 Y_cum = [0,cumsum(Y)[:-1]]
+        detach + Y——每个 Y_t 只从自己那一步的损失收 1 份梯度, 平权,
+        不再有"t=0 收 |T| 份梯度动力"的三角失衡; 见 SRPhase1V2.decode）
 
 register_specials=True（2026-08-28 新增, 修 F1/F2）:
     specials 不再由 ReEncoder 算, 而是作为额外 token 直接拼进 DINOv2 的
@@ -404,6 +407,9 @@ class OutputQueryDecoder(nn.Module):
         t=1 亦如此（可见位置 0/1, 自检验收）。
         结果**沿采样步累加**: 第 n 步预测的结果 = 第 n-1 步的结果 +
         第 n 步的预测 ⇒ F_hat = Σ_t Y_t（替代旧 mean 集成）。
+        **梯度按步解耦（2026-09-03 用户需求）**: 数值累加不变, 但 Y_cum
+        实现为 [0, cumsum(Y)[:-1]]（carry, detach）+ Y——每步只用自己的
+        预测收梯度（恰 1 份, 平权）, 见 SRPhase1V2.decode。
 
     时刻采样（显存优化, 默认开启）:
         查询只对 T_sub 构造——Q 从 (S·N,D) 降到 (|T|·N,D)，显存与算力
@@ -630,6 +636,10 @@ class SRPhase1V2(nn.Module):
         预测全部 patch; **结果沿采样步累加**——第 n 步预测的结果 = 第 n-1 步
         的结果 + 第 n 步的预测, 即 Y_cum[:, n] = Σ_{t≤n} Y_t（特征空间累加,
         再统一过 PixelHead——PixelHead 含 bias, 先投影再累加会重复加 bias）。
+        **梯度按步解耦（2026-09-03 用户需求）**: 数值上 Y_cum = Σ_{t≤n} Y_t
+        不变, 但实现为 carry[n] = [0, cumsum(Y)[:-1]][n] = Σ_{t<n} Y_t（detach）
+        + Y[n]——每个 Y_t 只从**自己那一步的损失**收 1 份梯度（平权 1/|T|）,
+        不再从所有 ≥t 的累加位置收梯度（否则 t=0 有 |T| 份梯度动力, 学乱）。
 
         dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步**累加**
         像素 B,|T|,N,588: Y_pix[:,n] = 前 n 步预测之和的像素), "target_pix"(B,N,588)}
@@ -648,8 +658,15 @@ class SRPhase1V2(nn.Module):
         target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
                       .permute(0, 2, 4, 1, 3, 5) \
                       .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
-        # 特征空间累加 → 统一过 PixelHead（bias 只加一次）
-        Y_cum = Y.cumsum(dim=1)                         # (B,|T|,N,D) 第 n 步结果
+        # 特征空间累加 → 统一过 PixelHead（bias 只加一次）。
+        # 梯度按步解耦（2026-09-03 用户需求）: 数值上仍 Y_cum[n] = Σ_{t≤n} Y_t
+        # （最终 F_hat = Σ_t Y_t 不变）, 但梯度只让每步**自己的预测**通过——
+        # 前面步的累加 carry 整体 detach。否则 Y_t 会从所有 ≥t 的累加位置收
+        # 梯度（t=0 有 |T| 份梯度动力, 各步梯度动力三角失衡, 学乱）。
+        # 实现（用户给定式）: [0, cumsum(last_Y)[:-1]] 无梯度 + last_Y(整张 Y):
+        #   carry[n] = Σ_{t<n} Y_t（detach）; + Y[n] ⇒ 每步恰收 1 份梯度。
+        Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
+                           Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y   # (B,|T|,N,D)
         Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
         F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
         # 平权全覆盖损失: 每个采样步的**累加结果**都还原全部 patch 像素
@@ -689,7 +706,8 @@ class SRPhase1V2(nn.Module):
 # 自检（python model_v2.py）
 #   1. 形状正确性
 #   2. 两处块掩码结构（ReEncoder 前缀 / OutputQueryDecoder 分块掩码）
-#   3. 梯度流向（整模型可训: ReEncoder / Decoder / SpecialTokenBank）
+#   3. 梯度流向（整模型可训: ReEncoder / Decoder / SpecialTokenBank）+
+#      梯度按步解耦（Y_cum 数值==cumsum, 每步 Y_t 只收自己那一步的梯度）
 #   4. eval 同路径
 # ═══════════════════════════════════════════════════════════════
 
@@ -835,9 +853,15 @@ if __name__ == "__main__":
             assert (row[hi + 1:] == float("-inf")).all()     # 块后屏蔽
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
-    Y_cum = Y.cumsum(dim=1)                                  # 特征空间累加
+    # 与模型 decode 相同的梯度解耦构造（2026-09-03）: carry 无梯度 + 自己的预测
+    Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
+                       Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y
     Y_pix = model.pixel_head(Y_cum)                          # (B,|T|,N,588) 累加像素
     assert Y_pix.shape == (2, len(T_steps), N, PATCH_PX)
+    # 数值不变性: 与朴素 cumsum 只差 float32 求和顺序噪声（<1e-4 级）;
+    # 最终 F_hat 仍是全步之和 Σ_t Y_t
+    assert torch.allclose(Y_cum, Y.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
+        "梯度解耦构造数值上应≈原 cumsum（float32 求和顺序噪声内）"
     assert torch.isclose(out["F_hat"], Y_pix[:, -1]).all(), "F_hat 应为各步像素累加和"
     per = F.l1_loss(Y_pix, target.unsqueeze(1).expand_as(Y_pix),
                     reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步累加结果
@@ -900,6 +924,35 @@ if __name__ == "__main__":
           f"TransformerDecoderLayer,query_base)/"
           f"SpecialTokenBank/PixelHead 全部可训 "
           f"(|grad|={model.re_encoder.layers[0].linear1.weight.grad.abs().sum().item():.4f})")
+
+    # ── 4b. 梯度按步解耦（2026-09-03 用户需求）──
+    # 数值上 Y_cum == cumsum(Y)（F_hat/损失语义不变）; 但 dL/dY_t 只来自
+    # 第 t 步自己的损失项——每步平权 1 份梯度, 不再有"t=0 收 |T| 份"的
+    # 三角失衡。校验: (a) 数值恒等; (b) 全量梯度在位置 n == 仅第 n 步损失
+    # 的梯度(÷|T|); (c) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）。
+    out_b = model(x)
+    Y_b = model.decoder.last_Y                              # (B,|T|,N,D)
+    Tb = Y_b.shape[1]
+    Y_cum_b = torch.cat([torch.zeros_like(Y_b[:, :1]),
+                         Y_b.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y_b
+    assert torch.allclose(Y_cum_b, Y_b.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
+        "梯度解耦后 Y_cum 数值上应≈原 cumsum（float32 求和顺序噪声内）"
+    assert torch.isclose(out_b["F_hat"], out_b["Y_pix"][:, -1]).all()
+    per_b = F.l1_loss(out_b["Y_pix"],
+                      out_b["target_pix"].unsqueeze(1).expand_as(out_b["Y_pix"]),
+                      reduction="none").mean(dim=(0, 2, 3))     # (|T|,) 每步损失
+    g_total = torch.autograd.grad(out_b["loss"], Y_b, retain_graph=True)[0]
+    for n in range(Tb):
+        g_n = torch.autograd.grad(per_b[n] / Tb, Y_b,
+                                  retain_graph=True)[0]          # 仅第 n 步损失
+        others = [m for m in range(Tb) if m != n]
+        assert torch.allclose(g_n[:, others],
+                              torch.zeros_like(g_n[:, others]), atol=1e-5), \
+            f"step {n} 的损失不应给其他步的预测梯度"
+        assert torch.allclose(g_total[:, n], g_n[:, n], atol=1e-5), \
+            f"step {n} 的 Y 梯度应只来自自己那一步的损失（平权 1/{Tb}）"
+    print(f"[ok] 梯度按步解耦: Y_cum 数值==cumsum(F_hat 不变), "
+          f"每步 Y_t 恰收 1/{Tb} 份梯度（不再三角失衡）")
 
     # ── 5. 推理: 同一 forward（eval + no_grad）──
     model.eval()
