@@ -115,6 +115,16 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
         efficient vision-language models (SVD-Prune). arXiv:2604.11530.
         视觉 token 剪枝——与已移除的"可学习前缀预算"机制相关的文献。
         https://arxiv.org/abs/2604.11530
+    [5] Vahdat, A., & Kautz, J. (2020).
+        NVAE: A deep hierarchical variational autoencoder. NeurIPS 2020,
+        33, 1966-1979.
+        "死信息"取舍的对照引用: NVAE 是概率生成模型, 顶层隐变量只承担
+        全局信息, 剩余高频细节用**顶层自回归先验**捕获; 本文按 [3] 把
+        纹理级高频视为"死信息"故意不追——方向相反, 但处理同一观察
+        （隐变量容量该装哪类信息）。注意: NVAE 的"层级"是尺度层级
+        （不同分辨率）, 与本文分块掩码（同一序列内平方数前缀切块）
+        结构不同, 仅思想同源。
+        https://proceedings.neurips.cc/paper/2020/hash/e3b21256183cf7c2c7a66be163579d37-Abstract.html
 """
 
 import math
