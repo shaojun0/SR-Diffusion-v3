@@ -128,6 +128,17 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
         （不同分辨率）, 与本文分块掩码（同一序列内平方数前缀切块）
         结构不同, 仅思想同源。
         https://proceedings.neurips.cc/paper/2020/hash/e3b21256183cf7c2c7a66be163579d37-Abstract.html
+    [6] Gao, Z., & Shou, M. Z. (2025).
+        D-AR: Diffusion via Autoregressive Models. arXiv:2505.23660（ICLR 2026）.
+        "扩散条件 token 调度"参考: D-AR 的顺序扩散 tokenizer 把图像编码成
+        256 个离散 token（编码时不排序），解码器在扩散时间步 t 只见 c(t)
+        指定的那组 token——token 序列位置 ↔ 扩散时间步, 由扩散过程本身
+        定义"粗→细"顺序。与 v2 分块掩码（采样步 ↔ z_s 块）及 v5 渐进解锁
+        m(t)（噪声层级 ↔ token 解锁层级）同属"token 顺序定义渐进细化"的
+        设计空间; 区别在于 D-AR 另训练 vanilla Llama 对该 token 序列做
+        next-token prediction（本项目未采用 AR 生成环）。
+        https://arxiv.org/abs/2505.23660
+        https://github.com/showlab/D-AR
 """
 
 import math
