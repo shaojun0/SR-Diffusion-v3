@@ -27,12 +27,14 @@ SR-Diffusion Phase 1 v2 — 无预算简化版（YAGNI: 先不增实体）
     DINOv2 → cls + patch 特征 (B,257,D)
     ReEncoder:    [cls; specials; patches] 因果 specials 块掩码 → z_cls, z_s
     OutputQueryDecoder: [z_cls; z_s] = 时序序列 A(S,H)；在采样时刻
-                    T_sub（自然数平方计划: 前面密后面疏, 自动适配任意 N）
+                    T_sub = 各 z_s 分块起点（平方数 1,4,9,…,⌊√N⌋², 自动
+                    适配任意 N; 每个分块一个采样步）
                     上输出 (N,D) 矩阵 = 全部 patch 的预测（输出查询注意力,
-                    查询基行 k 对应 patch k）；KV 因果（前缀）
-                    → F_hat = 采样步平均 (B,N,D)
-    L = Σ_t w_t·L1(Y_t, patch) / Σ w_t   ← 全覆盖损失（默认密度补偿权重,
-        即对全时刻无偏; w_t 可换 uniform / capability）
+                    查询基行 k 对应 patch k）；**分块掩码**: 每步只 attend
+                    自己的 z_s 块（块 k = [k², min((k+1)²-1, N)]）
+                    → F_hat = Σ_t Y_t (B,N,D)（第 n 步结果 = 前 n 步之和）
+    L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
+        （去掉加权体系; 每个采样步的累积重建都监督还原全部 patch）
 
 register_specials=True（2026-08-28 新增, 修 F1/F2）:
     specials 不再由 ReEncoder 算, 而是作为额外 token 直接拼进 DINOv2 的
@@ -44,20 +46,23 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
     输入）与 F2（z_s 冗余全局摘要）。该模式下无 ReEncoder（省 51.6M 参数）。
     HF Dinov2Model 无 token 级注意力 mask API（见踩坑记录）, 故 DINO 内用
     全双向注意力（无掩码）——重建任务无时序因果需求, register 惯例亦然;
-    解码器的 KV 因果仍提供渐进前缀语义。注意: 该模式让 z_s[k] 依赖全部
+    解码器的分块掩码仍提供逐步增量语义。注意: 该模式让 z_s[k] 依赖全部
     patch（含 j>k）, "前缀稳定性"约束不再成立——渐进曲线语义由解码器
-    kv_causal 提供, 与编码器无关。
+    分块掩码提供, 与编码器无关。
 
 块状注意力掩码:
     ReEncoder（causal_specials=True 默认）: [cls; specials; patches]
         cls 全局；specials 因果链（special i 只见 specials≤i + 全部
         patches）；patches 全局。掩码（build_prefix_mask）在 forward
         内现算、按实际序列长度构建（牺牲一点速度，换可扩展性）。
-    OutputQueryDecoder: [z_cls; z_s] 为时序序列 A=(S,H)，KV 因果——
-        每步 t 只见前缀 s≤t；每步由输出查询注意力产生 (N,D) 矩阵 =
-        全部 patch 的预测（每步全覆盖, 见类文档）。
-    时刻采样（显存优化）: 查询只对 T_sub 构造（默认自然数平方计划,
-        见 square_step_schedule）——Q 从 (S·N,D) 降到 (|T|·N,D)。
+    OutputQueryDecoder: [z_cls; z_s] 为时序序列 A=(S,H)，分块掩码——
+        每步 t 只 attend 自己的 z_s 分块（块 k = [k², min((k+1)²-1, N)],
+        按平方数边界铺满 1..N; 位置 0 = z_cls 恒屏蔽, 用户需求 2026-08-31）;
+        每步由输出查询注意力产生 (N,D) 矩阵 = 全部 patch 的预测
+        （每步全覆盖, 见类文档）。结果沿采样步累加:
+        F_hat = Σ_t Y_t（第 n 步结果 = 第 n-1 步结果 + 第 n 步预测）。
+    时刻采样（显存优化）: 查询只对 T_sub 构造（默认 = 分块起点,
+        见 square_block_starts）——Q 从 (S·N,D) 降到 (|T|·N,D)。
 
 踩坑记录（重要）:
     torch 2.x 的 bool 注意力掩码约定是 True=屏蔽（_canonical_mask:
@@ -110,6 +115,8 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
         视觉 token 剪枝——与已移除的"可学习前缀预算"机制相关的文献。
         https://arxiv.org/abs/2604.11530
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -233,6 +240,10 @@ def square_step_schedule(num_patches: int) -> list:
 
     例: square_step_schedule(256)
         → [0,1,4,9,16,25,36,49,64,81,100,121,144,169,196,225,256]
+
+    注: 2026-08-31 起 OutputQueryDecoder 改用分块掩码（每步只 attend
+    自己的 z_s 块），采样计划改为 square_block_starts（块起点 = 平方数,
+    不含 0/N）; 本函数保留供参考/兼容。
     """
     steps = {0}
     k = 1
@@ -241,6 +252,62 @@ def square_step_schedule(num_patches: int) -> list:
         k += 1
     steps.add(num_patches)          # 最后一步（全前缀, 能力最强）总是保留
     return sorted(steps)
+
+
+# ═══════════════════════════════════════════════════════════════
+# square_block_starts — 分块采样计划（块起点 = 平方数, 不含 0/N）
+# ═══════════════════════════════════════════════════════════════
+
+def square_block_starts(num_patches: int) -> list:
+    """生成 decoder 的采样时刻 T_sub = {k² | 1 ≤ k² ≤ N}。
+
+    2026-08-31 用户需求: 解码器分块掩码机制下, 每个采样步只 attend
+    自己的 z_s 块, 块 k = [k², min((k+1)²-1, N)]（块起点 = 平方数）。
+    采样步数 = ⌊√N⌋, 自动适配任意 N（N=12→3 步 [1,4,9],
+    N=256→16 步, N=576→24 步, …）。
+
+    例: square_block_starts(12) → [1, 4, 9]
+    """
+    K = math.isqrt(num_patches)
+    return [k * k for k in range(1, K + 1)]
+
+
+# ═══════════════════════════════════════════════════════════════
+# build_block_mask — 分块注意力掩码（每步只见自己的 z_s 块）
+# ═══════════════════════════════════════════════════════════════
+
+def build_block_mask(num_patches: int, steps: Sequence[int],
+                     device: torch.device = None) -> Tensor:
+    """构建分块注意力掩码（torch float, -inf=屏蔽, 0=允许）。
+
+    2026-08-31 用户需求（替代原 KV 因果前缀掩码）: 对采样步序列
+    steps=[s_1,...,s_m], 步 i（1-based, 对应第 i 个采样时刻）只允许
+    attend 自己的 z_s 块 k=i: 块 i = [i², min((i+1)²-1, N)]。
+    例（N=12）:
+        步 1 (块 [1..3])   → [F,T,T,T,F,F,F,F,F,F,F,F,F]
+        步 2 (块 [4..8])   → [F,F,F,F,T,T,T,T,T,F,F,F,F]
+        步 3 (块 [9..12])  → [F,F,F,F,F,F,F,F,F,T,T,T,T]
+    位置 0 (z_cls) 恒屏蔽（用户示例中位置 0 均为 F）。
+
+    返回 (m·N, N+1): 每个采样步的 N 行 patch 查询共享同一掩码行
+    （repeat_interleave, 与旧 KV 因果掩码同构）。True=屏蔽 的 bool
+    约定容易踩坑（见文件头踩坑记录），故统一返回加法浮点掩码。
+    注意: 采样步数 m 不得超过 ⌊√N⌋（每步一个块, 块 k 起点 k² ≤ N）;
+    超出会得到空块（全 -inf → softmax NaN）, 故显式断言拦截。
+    """
+    S = num_patches + 1                     # z_cls + N 个 z_s
+    K = len(steps)                          # 分块数 = 采样步数
+    assert K <= math.isqrt(num_patches), \
+        f"采样步数 {K} 超过分块数 ⌊√{num_patches}⌋={math.isqrt(num_patches)}: " \
+        f"每步一个 z_s 块, 步数须 ≤ ⌊√N⌋（默认计划 square_block_starts 已满足）"
+    rows = []
+    for i, _t in enumerate(steps, start=1):
+        lo = i * i
+        hi = min((i + 1) * (i + 1) - 1, num_patches)
+        row = torch.full((S,), float("-inf"), device=device)
+        row[lo:hi + 1] = 0.0                # 只允许自己块内的 z_s
+        rows.append(row)
+    return torch.stack(rows).repeat_interleave(num_patches, dim=0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -277,7 +344,7 @@ class PixelHead(nn.Module):
 
 class OutputQueryDecoder(nn.Module):
     """把 [z_cls; z_s] 当作时序序列 A=(S,H)，在采样时刻 T_sub 上每个
-    时刻输出一个 (N,D) 矩阵 = 全部 patch 的预测，再沿时刻集成得到
+    时刻输出一个 (N,D) 矩阵 = 全部 patch 的预测，再沿时刻**累加**得到
     F_hat (B,N,D)。
 
     机制（一次前向，采样时刻 × 所有 patch 行完全并行）:
@@ -286,7 +353,7 @@ class OutputQueryDecoder(nn.Module):
         Y = TransformerDecoder(Y, memory=A, memory_mask=掩码)   (B, |T|·N, D)
                                           内部按 num_layers 逐层执行（默认 2）
         Y = Y.reshape(...)                (B, |T|, N, D)  采样时刻 t = 全部 patch
-        F_hat = mean_t(Y)                 (B, N, D)      采样步集成
+        F_hat = Σ_t Y_t                   (B, N, D)      采样步累加集成
 
     解码器堆叠用官方标准模块 torch.nn.TransformerDecoder（num_layers 个
     nn.TransformerDecoderLayer 深拷贝同一规格、顺序执行——堆叠循环在标准
@@ -295,34 +362,40 @@ class OutputQueryDecoder(nn.Module):
     （标准解码器式堆叠）。查询基 E 作为输入偏置进首层 q 投影（含 bias),
     与原 W_q(A_t)+E 表达力等价——两者都是「A_t 的线性函数 + 逐 patch
     可学习向量」。
-    · 交叉注意力 KV 因果掩码走 memory_mask（加法浮点掩码 -inf=屏蔽, 与
+    · 交叉注意力分块掩码走 memory_mask（加法浮点掩码 -inf=屏蔽, 与
       原来直接调 SDPA 语义一致, 规避 bool 约定歧义, 见文件头踩坑记录）。
     · 注意: block 含一层查询间自注意力（tgt 无掩码, 全双向）——这是
       Q-Former / Perceiver 的常规结构（参考 [1][2]）, 与旧版"查询只 attend
       KV 序列"不同, 是有意为之（选官方 block 的固有代价）。
     · 残差 + pre-norm 取代旧版 norm(ffn(Y)) 的 norm-last 无残差结构。
 
+    分块掩码（2026-08-31 用户需求, 替代原 KV 因果前缀掩码）:
+        每个采样步 i 只 attend 自己的 z_s 分块（build_block_mask）:
+        块 i = [i², min((i+1)²-1, N)]（平方数边界, 位置 0 = z_cls 恒屏蔽）。
+        例（N=12）: 步 1 → [F,T,T,T,F,F,F,F,F,F,F,F,F]（块 [1..3]）;
+        步 2 → [F,F,F,F,T,T,T,T,T,F,F,F,F]（块 [4..8]）; 步 3 → 块 [9..12]。
+        即"第 n-1 个 mask 的 T 块结束处, 正是第 n 个 mask 的 T 块起点"。
+        结果**沿采样步累加**: 第 n 步预测的结果 = 第 n-1 步的结果 +
+        第 n 步的预测 ⇒ F_hat = Σ_t Y_t（替代旧 mean 集成）。
+
     时刻采样（显存优化, 默认开启）:
         查询只对 T_sub 构造——Q 从 (S·N,D) 降到 (|T|·N,D)，显存与算力
-        同比例下降（N=256: 全量 257 步 → 平方计划 17 步, 约 15×）。
-        · 默认计划 = square_step_schedule(N)（自然数平方, 前面密后面疏,
-          自动适配任意 N）;
+        同比例下降（N=256: 全量 257 步 → 分块计划 16 步, 约 16×）。
+        · 默认计划 = square_block_starts(N)（块起点 = 平方数, 自动适配
+          任意 N）;
         · 传 steps= 可自定义采样时刻列表（如 [0, 64, 128, 256]）;
-        · 传 steps=list(range(N+1)) 即退化为全量不采样。
-        注意: 未采样时刻不参与损失, 也不出现在 F_hat 集成里。
+        · 注意: 分块掩码下采样步数须 ≤ ⌊√N⌋（每步一个块; 超限会触发
+          build_block_mask 断言）——不再支持全量不采样退化。
+        注意: 未采样时刻不参与损失, 也不出现在 F_hat 累加里。
 
     损失权重（已移除，2026-08-27 用户要求"去掉加权体系"）:
         density/uniform/capability 加权机制整块删除（YAGNI），全部采样步
-        平权 —— loss = mean_t L1(Y_t, target)。git 历史可找回。
+        平权 —— loss = mean_n L1(cumsum_n Y, target)。git 历史可找回。
 
     覆盖语义（每步全覆盖）:
         每个采样时刻 t 都预测全部 N 个 patch（查询基 E 的行 k 对应
-        patch k, 对所有 t 相同）; 每个采样时刻都被监督还原全部 patch。
-
-    KV 因果（kv_causal=True）:
-        每步 t 只见前缀 s≤t。t 越小的键越少（t=0 只有 z_cls 一个键,
-        N 行查询只能输出同一向量）, 重建越粗糙——"前缀越短越粗"是
-        该设计的固有性质（渐进重建）。kv_causal=False 则每步见全部 z。
+        patch k, 对所有 t 相同）; 每个采样时刻的**累加结果**都被监督
+        还原全部 patch。
 
     掩码约定: 统一用加法浮点掩码(-inf=屏蔽)。实测 torch 2.8:
         SDPA 的 bool 掩码 True=允许, 与 TransformerEncoderLayer 的
@@ -334,30 +407,25 @@ class OutputQueryDecoder(nn.Module):
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
-                 mlp_ratio: float = 4.0, kv_causal: bool = True,
+                 mlp_ratio: float = 4.0,
                  steps: Optional[Sequence[int]] = None, heads: int = 8,
-                 depth: int = 2,skip_steps: int = 4,max_steps: int = 9,):
+                 depth: int = 2, skip_steps: int = 4, max_steps: int = 9):
         super().__init__()
         self.num_patches = num_patches
-        self.kv_causal = kv_causal
         # 采样计划: 显式 steps（如边界实验 [32,64]）原样使用, 不切片;
-        # 默认 square_step_schedule(N) 生成的步过多, 按 skip/max 切片取中段
-        # （跳过最前面几个"几乎无键"的粗步, 也截掉长前缀冗余步）。
-        explicit = steps is not None
+        # 默认 square_block_starts(N) = 全部 z_s 块（每块一个采样步）。
+        # 注意: 分块掩码下每个 z_s 块恰好被一个步 attend, 块间无冗余——
+        # 旧 skip_steps/max_steps 中段切片（为前缀计划省显存而设）不再适用,
+        # 切片会丢块（该块 z_s 永不 attend, 信息丢失）; 参数保留仅 API 兼容。
         if steps is None:
-            steps = square_step_schedule(num_patches)
+            steps = square_block_starts(num_patches)
         steps = sorted(set(int(s) for s in steps))
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"steps 越界: {steps} (N={num_patches})"
-        if explicit:
-            self.steps = steps                 # 显式列表原样（调用方负责）
-        else:
-            assert 0 <= skip_steps < max_steps <= len(steps), \
-                f"skip_steps/max_steps 越界: skip={skip_steps} max={max_steps} " \
-                f"(计划共 {len(steps)} 步 {steps})"
-            self.steps = steps[skip_steps:max_steps]
-            assert self.steps, \
-                f"切片后无采样步: steps[{skip_steps}:{max_steps}] of {steps} 为空"
+        self.steps = steps
+        assert len(self.steps) <= math.isqrt(num_patches), \
+            f"分块采样步数 {len(self.steps)} 超过分块数 ⌊√{num_patches}⌋: " \
+            f"每步一个 z_s 块, 步数须 ≤ ⌊√N⌋（build_block_mask 也会拦截）"
         S = num_patches + 1                                # z_cls + N z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
         # 标准解码器堆叠（不造轮子）: torch.nn.TransformerDecoder 内部按
@@ -379,19 +447,17 @@ class OutputQueryDecoder(nn.Module):
         A_t = A[:, self.steps]                                   # (B,|T|,D) 采样时刻
         Y = (A_t.unsqueeze(2) + self.query_base) \
             .reshape(B, len(self.steps) * N, D)                  # 展平 (t,k), t∈T_sub
-        mask = None
-        if self.kv_causal:   # 交叉注意力: 行(t,k) 只允许 s≤t（前缀因果; -inf=屏蔽）
-            tril = torch.tril(torch.ones(N + 1, N + 1, device=A.device)).bool()
-            mask = torch.where(tril[self.steps], 0.0, float("-inf")) \
-                .repeat_interleave(N, dim=0)                     # (|T|·N, S)
+        # 分块掩码: 每步只见自己的 z_s 块（-inf=屏蔽, 0=允许）; 用户需求
+        # 2026-08-31 替代原 KV 因果前缀掩码。
+        mask = build_block_mask(N, self.steps, device=A.device)  # (|T|·N, S)
         self.attn_mask = mask                                    # 供自检
         # 标准解码器堆叠（nn.TransformerDecoder 内部逐层执行, 不手写循环）:
-        # tgt=查询, memory=A(键值), KV 因果掩码走 memory_mask; 每层:
+        # tgt=查询, memory=A(键值), 分块掩码走 memory_mask; 每层:
         # 自注意力 → 交叉注意力 → FFN（pre-norm + 残差）
         Y = self.stack(Y, A, memory_mask=mask)                   # (B,|T|·N,D)
         Y = Y.reshape(B, len(self.steps), N, D)                  # (B,|T|,N,D)
         self.last_Y = Y                                          # 采样步全部 patch 预测
-        return Y.mean(dim=1)                                     # (B,N,D) 采样步集成
+        return Y.sum(dim=1)                                      # (B,N,D) Σ_t Y_t 累加
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -500,7 +566,7 @@ class SRPhase1V2(nn.Module):
 
         HF Dinov2Model 无 token 级注意力 mask API（见文件头踩坑记录）, 故
         DINO 内用**全双向注意力**（无掩码）——重建任务无时序因果需求,
-        register token 惯例亦然; 解码器的 KV 因果仍提供渐进前缀语义。
+        register token 惯例亦然; 解码器的分块掩码仍提供逐步增量语义。
         embeddings(pixel_values) 复用 HF 的 cls/patch 嵌入 + 位置编码
         （含其自动插值逻辑）, 与训练现状一致; specials 用 SpecialTokenBank
         （共享 token + 逐位置可学习 pos）。
@@ -519,25 +585,33 @@ class SRPhase1V2(nn.Module):
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
         """解码器 + 像素头 + 平权全覆盖像素 L1（两种模式共用）。
 
-        dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步像素
-        B,|T|,N,588), "target_pix"(B,N,588)} —— 训练取 loss; 推理取 F_hat /
-        Y_pix / target_pix（全量 L1、渐进曲线、可视化同一路径）。
+        累加语义（2026-08-31 用户需求）: 分块掩码下每步只用自己的 z_s 块
+        预测全部 patch; **结果沿采样步累加**——第 n 步预测的结果 = 第 n-1 步
+        的结果 + 第 n 步的预测, 即 Y_cum[:, n] = Σ_{t≤n} Y_t（特征空间累加,
+        再统一过 PixelHead——PixelHead 含 bias, 先投影再累加会重复加 bias）。
+
+        dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步**累加**
+        像素 B,|T|,N,588: Y_pix[:,n] = 前 n 步预测之和的像素), "target_pix"(B,N,588)}
+        —— 训练取 loss; 推理取 F_hat / Y_pix / target_pix（全量 L1、渐进曲线、
+        可视化同一路径）。
         """
         x = pixel_values
         B, C, H, W = x.shape
         N = self.num_patches
-        # OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖 → F_hat
-        F_hat = self.decoder(z_cls, z_s)                # (B,N,D) 采样步平均(特征)
+        # OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖（返回值=特征累加,
+        # 此处只用其 last_Y 副作用; 最终像素累加在下方由 Y_cum 给出）
+        self.decoder(z_cls, z_s)                        # 前向, 填充 last_Y
         Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
         # 像素目标: (B,3,H,W) 归一化像素 → (B,N,588) patch
         # 注意布局: DINO 的 patch 顺序是 row-major (先 y 后 x), 这里保持一致
         target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
                       .permute(0, 2, 4, 1, 3, 5) \
                       .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
-        # PixelHead: 特征 → 像素, 每个采样步全覆盖
-        Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588)
-        F_pix = self.pixel_head(F_hat)                  # (B,N,588) 采样步集成
-        # 平权全覆盖损失: 每个采样时刻都还原全部 patch 像素
+        # 特征空间累加 → 统一过 PixelHead（bias 只加一次）
+        Y_cum = Y.cumsum(dim=1)                         # (B,|T|,N,D) 第 n 步结果
+        Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
+        F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
+        # 平权全覆盖损失: 每个采样步的**累加结果**都还原全部 patch 像素
         per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
                              reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
         loss = per_step.mean()                          # 平权（去掉加权体系）
@@ -555,9 +629,10 @@ class SRPhase1V2(nn.Module):
         像素目标有真实空间结构, 强制模型保留空间信息。
         H,W 须为 14 的倍数（DINO patch=14），patch_px = 14*14*3。
 
-        损失: 每个采样时刻 t∈T_sub 都监督还原全部 patch 像素 —— 平权
-        全覆盖损失 L = mean_t L1(Y_t_pix, target_pix)（去掉加权体系）。
-        F_hat = 采样步平均 → PixelHead → 像素; recon 仅作监控。
+        损失: 每个采样步的**累加结果**（第 n 步结果 = 前 n 步预测之和,
+        2026-08-31 用户需求）都监督还原全部 patch 像素 —— 平权全覆盖
+        损失 L = mean_n L1(cumsum_n Y_pix, target_pix)（去掉加权体系）。
+        F_hat = Σ_t Y_t → PixelHead → 像素; recon 仅作监控。
         """
         x = pixel_values                                # (B,3,H,W)
         B, C, H, W = x.shape
@@ -572,7 +647,7 @@ class SRPhase1V2(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 # 自检（python model_v2.py）
 #   1. 形状正确性
-#   2. 两处块掩码结构（ReEncoder / OutputQueryDecoder KV 因果掩码）
+#   2. 两处块掩码结构（ReEncoder 前缀 / OutputQueryDecoder 分块掩码）
 #   3. 梯度流向（整模型可训: ReEncoder / Decoder / SpecialTokenBank）
 #   4. eval 同路径
 # ═══════════════════════════════════════════════════════════════
@@ -659,7 +734,7 @@ if __name__ == "__main__":
     dino = FakeDino(dim=D, num_patches=N)
     model = SRPhase1V2(dino, num_patches=N, dim=D,
                        reencoder_depth=2,
-                       decoder_steps=square_step_schedule(N))  # 显式传完整计划(不切片)
+                       decoder_steps=square_block_starts(N))  # 显式传完整分块计划(不切片)
     model.init_reencoder_from_dino(2)
     # 像素目标绑定输入尺寸: N=16 patches ⇒ 输入须为 4×4 patch = 56×56 (14 的倍数)
     x = torch.randn(2, 3, 56, 56)
@@ -690,42 +765,51 @@ if __name__ == "__main__":
     # 关掉 causal 时掩码全 False（回退全双向；掩码 forward 内现算，先跑一次）
     m_free = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
                         causal_specials=False, reencoder_depth=2,
-                        decoder_steps=square_step_schedule(N))
+                        decoder_steps=square_block_starts(N))
     _ = m_free.re_encoder(torch.randn(2, 2 * N + 1, D))
     assert not m_free.re_encoder.attn_mask.any()
     print(f"[ok] ReEncoder block mask: causal_specials=True 结构正确, "
           f"causal_specials=False 全开放回退")
 
-    # ── 3. OutputQueryDecoder: 平方采样计划 + KV 因果掩码 + 平权全覆盖损失 ──
+    # ── 3. OutputQueryDecoder: 分块采样计划 + 分块掩码 + 累加结果损失 ──
     T_steps = model.decoder.steps
-    assert T_steps == square_step_schedule(N), T_steps       # N=16 → [0,1,4,9,16]
+    assert T_steps == square_block_starts(N), T_steps       # N=16 → [1,4,9,16]
     assert len(model.decoder.stack.layers) == 2, "默认 decoder_depth=2"
     am = model.decoder.attn_mask                             # (|T|·N, N+1) float
     assert am is not None and am.shape == (len(T_steps) * N, N + 1), am.shape
-    for ti, t in enumerate(T_steps):                         # 行(t,k): 只允许 s≤t
+    # 分块掩码: 步 i（1-based）只允许自己的块 [i², min((i+1)²-1, N)]; 位置 0 恒屏蔽
+    for ti, _t in enumerate(T_steps):
+        i = ti + 1
+        lo, hi = i * i, min((i + 1) * (i + 1) - 1, N)
         row = am[ti * N]
-        assert (row[:t + 1] == 0).all()
-        assert (row[t + 1:] == float("-inf")).all()
+        assert row[0] == float("-inf")                       # z_cls 恒屏蔽
+        assert (row[:lo] == float("-inf")).all()             # 块前屏蔽
+        assert (row[lo:hi + 1] == 0).all()                   # 块内允许
+        assert (row[hi + 1:] == float("-inf")).all()         # 块后屏蔽
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
-    Y_pix = model.pixel_head(Y)                              # (B,|T|,N,588) 像素
+    Y_cum = Y.cumsum(dim=1)                                  # 特征空间累加
+    Y_pix = model.pixel_head(Y_cum)                          # (B,|T|,N,588) 累加像素
     assert Y_pix.shape == (2, len(T_steps), N, PATCH_PX)
+    assert torch.isclose(out["F_hat"], Y_pix[:, -1]).all(), "F_hat 应为各步像素累加和"
     per = F.l1_loss(Y_pix, target.unsqueeze(1).expand_as(Y_pix),
-                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步
-    assert torch.isclose(out["loss"], per.mean()), "loss 应为平权全覆盖像素 L1"
-    # 计划自动适配任意 N（可扩展性）: 256→17 步, 512→24 步
-    assert square_step_schedule(256) == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81,
-                                         100, 121, 144, 169, 196, 225, 256]
-    assert len(square_step_schedule(512)) == 24
-    # 默认切片（skip_steps=4/max_steps=9）: 只取中段采样步——跳过最前面
-    # 的粗步（0,1,4,9,16 里 skip 前 4 个 → 剩 16...），截掉长前缀冗余步。
-    # 256 计划 [0,1,4,9,16,25,36,49,64,81,100,121,144,169,196,225,256]:
-    # [4:9] = [16,25,36,49,64]（中段 5 步）。
-    _full = square_step_schedule(256)
-    assert _full[4:9] == [16, 25, 36, 49, 64], _full[4:9]
+                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步累加结果
+    assert torch.isclose(out["loss"], per.mean()), "loss 应为累加结果平权 L1"
+    # 计划自动适配任意 N（可扩展性）: 12→3 块, 256→16 块, 512→22 块
+    assert square_block_starts(12) == [1, 4, 9], square_block_starts(12)
+    assert len(square_block_starts(256)) == 16
+    assert len(square_block_starts(512)) == 22
+    # 用户给定示例核对（N=12）: 步 1 → [F,T,T,T,F,F,F,F,F,F,F,F,F]
+    # (块 [1..3]); 步 2 → [F,F,F,F,T,T,T,T,T,F,F,F,F] (块 [4..8])
+    m12 = build_block_mask(12, [1, 4, 9])
+    assert m12.shape == (3 * 12, 13), m12.shape
+    r1, r2 = m12[0], m12[12]                                 # 步 1 / 步 2 首查询行
+    assert (r1[1:4] == 0).all() and (r1[[0] + list(range(4, 13))] == float("-inf")).all()
+    assert (r2[4:9] == 0).all() and (r2[:4] == float("-inf")).all() \
+        and (r2[9:] == float("-inf")).all()
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
-          f"TransformerDecoder, 平方采样 {len(T_steps)} 步 + KV 因果掩码 "
-          f"+ 平权全覆盖像素损失正确; 默认切片 [4:9]={_full[4:9]}")
+          f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
+          f"+ 分块掩码(示例核对) + 累加结果像素损失正确")
 
     # ── 4. 梯度流向（整模型可训, 含 PixelHead; 首层自注意力 + 末层交叉/FFN）──
     out["loss"].backward()
@@ -756,7 +840,7 @@ if __name__ == "__main__":
     # ── 6. register 模式: specials 合并进 DINO（修 F1/F2, 2026-08-28）──
     dino_r = FakeDino(dim=D, num_patches=N)
     m_reg = SRPhase1V2(dino_r, num_patches=N, dim=D, register_specials=True,
-                       decoder_steps=square_step_schedule(N))
+                       decoder_steps=square_block_starts(N))
     assert m_reg.re_encoder is None, "register 模式不应有 ReEncoder"
     out_r = m_reg(x)
     assert out_r["F_hat"].shape == (2, N, PATCH_PX)

@@ -2,24 +2,24 @@
 SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-27）
 =================================================
 架构（model_v2.py, test 分支）: DINOv2-large → ReEncoder → OutputQueryDecoder
-    （输出查询注意力, KV 因果: 每采样步 t 只见前缀 s≤t）→ PixelHead →
-    像素 patch 预测。
+    （输出查询注意力, 分块掩码: 每采样步只 attend 自己的 z_s 块）→
+    PixelHead → 像素 patch 预测。
 
 测试项（像素目标 = 最终判据）:
     1) 全量重建像素 L1（归一化空间 + 反归一化 0-255 空间双口径）——
        对照: 全图平均色 baseline / 每 patch 平均色 baseline。
        像素 L1 必须显著优于"平均色"才有还原意义（特征空间 L1 是假象,
        已证实特征目标退化）。
-    2) 渐进重建曲线（前缀扫描的新架构等价物）—— 解码器 KV 因果: 采样步
-       t 只见前缀 s≤t。对每步 t∈T_sub 度量像素 L1(Y_t_pix, target_pix),
-       得到"前缀越长重建越精"的渐进曲线。
+    2) 渐进重建曲线（2026-08-31 用户需求: 结果沿采样步累加）——
+       第 n 步预测的结果 = 第 n-1 步的结果 + 第 n 步的预测, 即
+       Y_pix[:, n] = Σ_{t≤n} Y_t。对每步 n 度量像素 L1(Y_pix[:, n],
+       target_pix), 得到"累积步数越多重建越精"的渐进曲线。
 
-2026-08-31（边界实验对齐, K=64 + decoder_steps=[32,64]）:
-    · 新增 --num_specials / --loss_min_t 透传 SRPhase1V2, 与训练一致
-      （推理 forward 也走 decode(), 需保持 loss_min_t 语义; 全量重建 L1
-      与渐进曲线测量不受影响——decoder steps 始终全量输出）;
-    · --decoder_steps 增加越界校验: 0 <= s <= num_specials（采样步 t 是
-      KV 前缀长度, 上界 = K）;
+2026-08-31（分块掩码改造 + 边界实验对齐）:
+    · decoder 掩码从 KV 因果前缀改为**分块掩码**: 步 i 只 attend 自己的
+      z_s 块 [i², min((i+1)²-1, N)]; 默认采样计划 = square_block_starts
+      （块起点 = 平方数, 每块一步, 步数 = ⌊√N⌋）;
+    · --decoder_steps 越界校验: 0 <= s <= num_specials, 且步数 ≤ ⌊√N⌋;
     · final_model 同目录存在 model_info.json 时打印参数对齐提示（不强制,
       以权重 strict load 为准）。
 
@@ -64,11 +64,11 @@ def parse_args():
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
     p.add_argument("--slice_start", type=int, default=4,
-                   help="采样计划切片起点(与训练 --slice_start 一致)")
+                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
     p.add_argument("--slice_end", type=int, default=9,
-                   help="采样计划切片终点(与训练 --slice_end 一致)")
+                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
     p.add_argument("--decoder_steps", default=None,
-                   help="必须与训练一致(逗号分隔); 默认 square_step_schedule(N) 切片")
+                   help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
     return p.parse_args()
 
 
@@ -217,13 +217,13 @@ def main():
     print(f"\n[full] 全量重建像素 L1 (归一化空间) = {norm_mean:.6f}")
     print(f"[full] 全量重建像素 L1 (0-255 空间) = {pix_mean:.2f} ± {pix_std:.2f}")
     print(f"       参照(旧实验): 全图平均色≈61, 每patch平均色≈?, 质心基线见 pixel_recon_check")
-    print(f"[steps] 渐进曲线 ({len(T_steps)} 步, 0-255 像素 L1):")
+    print(f"[steps] 渐进曲线 ({len(T_steps)} 步, 0-255 像素 L1, 累积结果):")
     for i, t in enumerate(T_steps):
-        print(f"    t={t:4d} (前缀 {t + 1:4d} 键) L1 = {step_pix_mean[i]:.2f} ± {step_pix_std[i]:.2f}")
+        print(f"    步 {i + 1:2d} (块起点 {t:4d}, 前 {i + 1:3d} 步累积) L1 = {step_pix_mean[i]:.2f} ± {step_pix_std[i]:.2f}")
     head = step_pix_mean[:min(4, len(step_pix_mean))]
     tail = step_pix_mean[max(0, len(step_pix_mean) - 4):]
-    print(f"[steps] 前段(短前缀) {head.mean():.2f} | 后段(长前缀) {tail.mean():.2f} | "
-          f"最短/最长 = {step_pix_mean[0]:.2f}/{step_pix_mean[-1]:.2f}")
+    print(f"[steps] 前段(少步累积) {head.mean():.2f} | 后段(多步累积) {tail.mean():.2f} | "
+          f"最少/最多步累积 = {step_pix_mean[0]:.2f}/{step_pix_mean[-1]:.2f}")
     print(f"[time] {(time.time() - t0):.0f}s | {n} 图")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

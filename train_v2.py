@@ -112,9 +112,9 @@ def parse_args():
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
     p.add_argument("--slice_start", type=int, default=4,
-                   help="采样计划切片起点索引: 跳过前 slice_start 个粗步(不监督)")
+                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
     p.add_argument("--slice_end", type=int, default=9,
-                   help="采样计划切片终点索引: 只取前 slice_end 个采样步(不含冗余长前缀)")
+                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
     p.add_argument("--register_specials", action="store_true",
@@ -122,7 +122,8 @@ def parse_args():
                         "DINOv2 输入序列, 由 DINO 24 层算出 z_s; 无 ReEncoder")
     # ── 模型（OutputQueryDecoder）──
     p.add_argument("--decoder_steps", default=None,
-                   help="解码器采样时刻列表(逗号分隔), 默认 square_step_schedule(K)")
+                   help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(K) "
+                        "(分块起点=平方数; 步数须 ≤ ⌊√K⌋)")
     return p.parse_args()
 
 
