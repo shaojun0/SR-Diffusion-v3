@@ -1,14 +1,16 @@
 """
-可视化（像素目标版, 2026-08-27）: 原图 vs 各采样步 t 的像素重建。
+可视化（像素目标版, 2026-08-27）: 原图 vs 各采样步的像素重建。
 重建目标 = 原始像素 patch (B,576,588) → 反归一化回 0-255 → 直接显示。
-每行一张 test 图, 列 = 原图 + 各采样步 t 的重建（t 越大前缀越长, 应越精细）。
+每行一张 test 图, 列 = 原图 + 各采样步的重建（2026-08-31 起为**累加**
+语义: 第 n 步 = 前 n 步预测之和, 累积步数越多重建越完整）。
 
 用法:
     python visualize_recon_pixel.py \
         --data_dir /root/autodl-tmp/construction_site \
         --dino_dir /root/autodl-tmp/models/dinov2-large \
-        --final_model output/phase1_v2_pixel_fp32/final_model.pt \
-        --out output/phase1_v2_pixel_fp32/recon_visual.png
+        --final_model output/phase1_v2_block/final_model.pt \
+        --register_specials --slice_start 4 --slice_end 9 \
+        --out output/phase1_v2_block/recon_visual.png
 """
 import argparse
 import os
@@ -31,10 +33,16 @@ def parse_args():
     p.add_argument("--model_input", default="448x252")
     p.add_argument("--register_specials", action="store_true",
                    help="register 式模型(与训练 --register_specials 一致)")
+    p.add_argument("--decoder_depth", type=int, default=2,
+                   help="OutputQueryDecoder 层数(与训练 --decoder_depth 一致)")
+    p.add_argument("--slice_start", type=int, default=None,
+                   help="分块切片起点(与训练 --slice_start 一致); 默认 None = 全部分块")
+    p.add_argument("--slice_end", type=int, default=None,
+                   help="分块切片终点(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", default="output/phase1_v2_pixel_fp32/recon_visual.png")
+    p.add_argument("--out", default="output/phase1_v2_block/recon_visual.png")
     return p.parse_args()
 
 
@@ -63,16 +71,20 @@ def main():
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size, reencoder_depth=4,
-                       register_specials=args.register_specials)
+                       register_specials=args.register_specials,
+                       decoder_depth=args.decoder_depth,
+                       skip_steps=args.slice_start,
+                       max_steps=args.slice_end)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model.eval().cuda()
     T_steps = model.decoder.steps
     print(f"[model] N={num_patches}, register_specials={args.register_specials}, "
-          f"{len(T_steps)} 采样步")
+          f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
+          f"{len(T_steps)} 采样步 {T_steps}")
 
-    # 自动选展示步: 前/中/后均匀取 (含 t=0 与 t=N)
+    # 自动选展示步: 前/中/后均匀取 (含最后一步 = 全量累加结果)
     if args.steps.strip():
         show_steps = [int(s) for s in args.steps.split(",") if s.strip()]
     else:
@@ -126,7 +138,7 @@ def main():
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 3.0 * n_rows))
     if n_rows == 1:
         axes = axes[None, :]
-    titles = ["原图"] + [f"重建 t={t}" for t in show_steps]
+    titles = ["原图"] + [f"累积 {i + 1} 步 (t={t})" for i, t in enumerate(show_steps)]
     for b in range(n_rows):
         for c in range(n_cols):
             ax = axes[b, c]
@@ -135,10 +147,10 @@ def main():
             else:
                 ax.imshow(recons[c - 1][b])
             if b == 0:
-                ax.set_title(titles[c], fontsize=13, fontweight="bold")
+                ax.set_title(titles[c], fontsize=12, fontweight="bold")
             ax.set_xticks([]); ax.set_yticks([])
-    plt.suptitle("像素级重建可视化 — 原图 vs 各采样步 t (前缀越长应越精细)\n"
-                 "目标 = 原始像素 (PixelHead), fp32 平权训练",
+    plt.suptitle("像素级重建可视化 — 原图 vs 各采样步累积重建 (分块掩码, 累加集成)\n"
+                 "目标 = 原始像素 (PixelHead), fp32 平权训练, register_specials",
                  fontsize=15, fontweight="bold")
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
