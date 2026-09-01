@@ -139,6 +139,7 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
         next-token prediction（本项目未采用 AR 生成环）。
         https://arxiv.org/abs/2505.23660
         https://github.com/showlab/D-AR
+        t步采样思想来源
 """
 
 import math
