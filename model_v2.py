@@ -57,7 +57,8 @@ register_specials=True（2026-08-28 新增, 修 F1/F2）:
         内现算、按实际序列长度构建（牺牲一点速度，换可扩展性）。
     OutputQueryDecoder: [z_cls; z_s] 为时序序列 A=(S,H)，分块掩码——
         每步 t 只 attend 自己的 z_s 分块（块 k = [k², min((k+1)²-1, N)],
-        按平方数边界铺满 1..N; 位置 0 = z_cls 恒屏蔽, 用户需求 2026-08-31）;
+        按平方数边界铺满 1..N）; 第一个步可见自己块之前的所有元素
+        （含位置 0 = z_cls, 用户需求 2026-08-31）;
         每步由输出查询注意力产生 (N,D) 矩阵 = 全部 patch 的预测
         （每步全覆盖, 见类文档）。结果沿采样步累加:
         F_hat = Σ_t Y_t（第 n 步结果 = 第 n-1 步结果 + 第 n 步预测）。
@@ -280,32 +281,42 @@ def build_block_mask(num_patches: int, steps: Sequence[int],
                      device: torch.device = None) -> Tensor:
     """构建分块注意力掩码（torch float, -inf=屏蔽, 0=允许）。
 
-    2026-08-31 用户需求（替代原 KV 因果前缀掩码）: 对采样步序列
-    steps=[s_1,...,s_m], 步 i（1-based, 对应第 i 个采样时刻）只允许
-    attend 自己的 z_s 块 k=i: 块 i = [i², min((i+1)²-1, N)]。
-    例（N=12）:
-        步 1 (块 [1..3])   → [F,T,T,T,F,F,F,F,F,F,F,F,F]
-        步 2 (块 [4..8])   → [F,F,F,F,T,T,T,T,T,F,F,F,F]
-        步 3 (块 [9..12])  → [F,F,F,F,F,F,F,F,F,T,T,T,T]
-    位置 0 (z_cls) 恒屏蔽（用户示例中位置 0 均为 F）。
+    2026-08-31 用户需求（替代原 KV 因果前缀掩码）: 每个采样步 t 只允许
+    attend **自己所在的 z_s 块**——块号 k = ⌊√t⌋, 块 k = [k², min((k+1)²-1, N)]
+    （按平方数边界铺满 1..N）。例（N=12, steps=[1,4,9]）:
+        步 2 (t=4, 块 [4..8])   → [F,F,F,F,T,T,T,T,T,F,F,F,F]
+        步 3 (t=9, 块 [9..12])  → [F,F,F,F,F,F,F,F,F,T,T,T,T]
+    即"第 n-1 个 mask 的 T 块结束处, 正是第 n 个 mask 的 T 块起点"。
+
+    **第一个步特殊处理（2026-08-31 用户补充）**:
+        · 第一个步（步值最小/切片后第一个）能看到**自己块之前的所有元素,
+          含位置 0 (z_cls)**——即 row[:hi+1] 全允许（hi = 自己块终点）;
+        · 其余步只允许自己的块 [k², min((k+1)²-1, N)], 位置 0 屏蔽。
+      理由: 用 skip_steps/max_steps 挑选子区间（如 [4:9]）时, 第一个步
+      若只看自己的块, 被切片丢弃的前段 z_s 与 z_cls 信息就完全不被使用;
+      让第一个步看到前面所有元素可避免信息丢失。默认全计划（steps=None）
+      时第一个步 t=1 同样能看到位置 0/1——用户验收: 第一个步可见 [0,1]。
 
     返回 (m·N, N+1): 每个采样步的 N 行 patch 查询共享同一掩码行
     （repeat_interleave, 与旧 KV 因果掩码同构）。True=屏蔽 的 bool
     约定容易踩坑（见文件头踩坑记录），故统一返回加法浮点掩码。
-    注意: 采样步数 m 不得超过 ⌊√N⌋（每步一个块, 块 k 起点 k² ≤ N）;
-    超出会得到空块（全 -inf → softmax NaN）, 故显式断言拦截。
+    注意: 步值须 ∈ [0, N]（__init__ 已断言）; t=0 无块（空行全 -inf,
+    仅当显式传 0 时出现, 默认计划不含 0）。
     """
     S = num_patches + 1                     # z_cls + N 个 z_s
-    K = len(steps)                          # 分块数 = 采样步数
-    assert K <= math.isqrt(num_patches), \
-        f"采样步数 {K} 超过分块数 ⌊√{num_patches}⌋={math.isqrt(num_patches)}: " \
-        f"每步一个 z_s 块, 步数须 ≤ ⌊√N⌋（默认计划 square_block_starts 已满足）"
     rows = []
-    for i, _t in enumerate(steps, start=1):
-        lo = i * i
-        hi = min((i + 1) * (i + 1) - 1, num_patches)
+    for i, t in enumerate(steps):
+        k = math.isqrt(int(t))              # 块号 = 步值所在的平方块
+        hi = min((k + 1) * (k + 1) - 1, num_patches)
         row = torch.full((S,), float("-inf"), device=device)
-        row[lo:hi + 1] = 0.0                # 只允许自己块内的 z_s
+        if i == 0:
+            # 第一个（挑选出的）步: 看到自己块之前的所有元素（含位置 0
+            # z_cls）直到块终点 hi——避免切片丢弃的前段信息完全不被使用
+            row[:hi + 1] = 0.0
+        else:
+            lo = max(k * k, 1)              # 位置 0 (z_cls) 屏蔽
+            if lo <= hi:
+                row[lo:hi + 1] = 0.0        # 只允许自己块内的 z_s
         rows.append(row)
     return torch.stack(rows).repeat_interleave(num_patches, dim=0)
 
@@ -370,11 +381,17 @@ class OutputQueryDecoder(nn.Module):
     · 残差 + pre-norm 取代旧版 norm(ffn(Y)) 的 norm-last 无残差结构。
 
     分块掩码（2026-08-31 用户需求, 替代原 KV 因果前缀掩码）:
-        每个采样步 i 只 attend 自己的 z_s 分块（build_block_mask）:
-        块 i = [i², min((i+1)²-1, N)]（平方数边界, 位置 0 = z_cls 恒屏蔽）。
-        例（N=12）: 步 1 → [F,T,T,T,F,F,F,F,F,F,F,F,F]（块 [1..3]）;
-        步 2 → [F,F,F,F,T,T,T,T,T,F,F,F,F]（块 [4..8]）; 步 3 → 块 [9..12]。
+        每个采样步 t 只 attend **自己所在的 z_s 分块**（build_block_mask）:
+        块号 k = ⌊√t⌋, 块 k = [k², min((k+1)²-1, N)]（平方数边界）。
+        例（N=12, 默认计划 [1,4,9]）:
+        步 2 (t=4, 块 [4..8])  → [F,F,F,F,T,T,T,T,T,F,F,F,F];
+        步 3 (t=9, 块 [9..12]) → [F,F,F,F,F,F,F,F,F,T,T,T,T]。
         即"第 n-1 个 mask 的 T 块结束处, 正是第 n 个 mask 的 T 块起点"。
+        **第一个步特殊（2026-08-31 用户补充）**: 第一个步能看到自己块
+        **之前的所有元素（含位置 0 = z_cls）**——row[:hi+1] 全允许;
+        其余步只允许自己的块。理由: 挑选切片后若第一个步只看自己的块,
+        被切掉的前段 z_s 与 z_cls 信息完全不被使用; 默认计划第一个步
+        t=1 亦如此（可见位置 0/1, 自检验收）。
         结果**沿采样步累加**: 第 n 步预测的结果 = 第 n-1 步的结果 +
         第 n 步的预测 ⇒ F_hat = Σ_t Y_t（替代旧 mean 集成）。
 
@@ -382,10 +399,13 @@ class OutputQueryDecoder(nn.Module):
         查询只对 T_sub 构造——Q 从 (S·N,D) 降到 (|T|·N,D)，显存与算力
         同比例下降（N=256: 全量 257 步 → 分块计划 16 步, 约 16×）。
         · 默认计划 = square_block_starts(N)（块起点 = 平方数, 自动适配
-          任意 N）;
+          任意 N, 全部块都用）;
+        · skip_steps/max_steps（默认 None）可选挑选: 填了即按 Python
+          切片取计划子区间（如 skip_steps=4, max_steps=9 ⇔ [4:9]）——
+          只保留中段若干块, 其余 z_s 块不 attend（信息不进重建）;
         · 传 steps= 可自定义采样时刻列表（如 [0, 64, 128, 256]）;
-        · 注意: 分块掩码下采样步数须 ≤ ⌊√N⌋（每步一个块; 超限会触发
-          build_block_mask 断言）——不再支持全量不采样退化。
+        · 注意: 分块掩码下步值须 ∈ [0, N]（超限断言拦截）; 默认计划
+          不含 0, 也不支持"全量不采样"退化。
         注意: 未采样时刻不参与损失, 也不出现在 F_hat 累加里。
 
     损失权重（已移除，2026-08-27 用户要求"去掉加权体系"）:
@@ -409,23 +429,34 @@ class OutputQueryDecoder(nn.Module):
     def __init__(self, dim: int = 768, num_patches: int = 256,
                  mlp_ratio: float = 4.0,
                  steps: Optional[Sequence[int]] = None, heads: int = 8,
-                 depth: int = 2, skip_steps: int = 4, max_steps: int = 9):
+                 depth: int = 2, skip_steps: Optional[int] = None,
+                 max_steps: Optional[int] = None):
         super().__init__()
         self.num_patches = num_patches
         # 采样计划: 显式 steps（如边界实验 [32,64]）原样使用, 不切片;
         # 默认 square_block_starts(N) = 全部 z_s 块（每块一个采样步）。
-        # 注意: 分块掩码下每个 z_s 块恰好被一个步 attend, 块间无冗余——
-        # 旧 skip_steps/max_steps 中段切片（为前缀计划省显存而设）不再适用,
-        # 切片会丢块（该块 z_s 永不 attend, 信息丢失）; 参数保留仅 API 兼容。
+        # skip_steps/max_steps（默认 None）可挑选子区间: 填 [4:9] 语义即
+        # square_block_starts(N)[4:9]（Python 切片, 步值取中段）——挑选后
+        # 每个保留步仍按自身步值归属分块（build_block_mask 按 ⌊√t⌋ 定块）。
+        explicit = steps is not None
         if steps is None:
             steps = square_block_starts(num_patches)
         steps = sorted(set(int(s) for s in steps))
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"steps 越界: {steps} (N={num_patches})"
-        self.steps = steps
-        assert len(self.steps) <= math.isqrt(num_patches), \
-            f"分块采样步数 {len(self.steps)} 超过分块数 ⌊√{num_patches}⌋: " \
-            f"每步一个 z_s 块, 步数须 ≤ ⌊√N⌋（build_block_mask 也会拦截）"
+        if explicit:
+            self.steps = steps                 # 显式列表原样（调用方负责）
+        else:
+            # 可选挑选: None=None 表示不切片（全部分块）; 填了就在
+            # 默认分块计划上做 Python 切片（如 [4:9] → 取计划第 4..8 个块）。
+            lo = 0 if skip_steps is None else int(skip_steps)
+            hi = len(steps) if max_steps is None else int(max_steps)
+            assert 0 <= lo < hi <= len(steps), \
+                f"skip_steps/max_steps 越界: skip={lo} max={hi} " \
+                f"(计划共 {len(steps)} 步 {steps})"
+            self.steps = steps[lo:hi]
+            assert self.steps, \
+                f"切片后无采样步: steps[{lo}:{hi}] of {steps} 为空"
         S = num_patches + 1                                # z_cls + N z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
         # 标准解码器堆叠（不造轮子）: torch.nn.TransformerDecoder 内部按
@@ -479,8 +510,8 @@ class SRPhase1V2(nn.Module):
         patch_px: int = 14 * 14 * 3,
         register_specials: bool = False,
         decoder_depth: int = 2,
-        skip_steps: int = 4,
-        max_steps: int = 9,
+        skip_steps: Optional[int] = None,
+        max_steps: Optional[int] = None,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -777,15 +808,21 @@ if __name__ == "__main__":
     assert len(model.decoder.stack.layers) == 2, "默认 decoder_depth=2"
     am = model.decoder.attn_mask                             # (|T|·N, N+1) float
     assert am is not None and am.shape == (len(T_steps) * N, N + 1), am.shape
-    # 分块掩码: 步 i（1-based）只允许自己的块 [i², min((i+1)²-1, N)]; 位置 0 恒屏蔽
-    for ti, _t in enumerate(T_steps):
-        i = ti + 1
-        lo, hi = i * i, min((i + 1) * (i + 1) - 1, N)
+    # 分块掩码: 第一个步可见 0..hi（自己块 + 前面所有元素, 含位置 0 z_cls）;
+    # 其余步只允许自己的块 [⌊√t⌋², min((⌊√t⌋+1)²-1, N)], 位置 0 屏蔽
+    for ti, t in enumerate(T_steps):
+        k = math.isqrt(t)
+        hi = min((k + 1) * (k + 1) - 1, N)
         row = am[ti * N]
-        assert row[0] == float("-inf")                       # z_cls 恒屏蔽
-        assert (row[:lo] == float("-inf")).all()             # 块前屏蔽
-        assert (row[lo:hi + 1] == 0).all()                   # 块内允许
-        assert (row[hi + 1:] == float("-inf")).all()         # 块后屏蔽
+        if ti == 0:
+            assert (row[:hi + 1] == 0).all()                 # 前面所有 + 自己块
+            assert (row[hi + 1:] == float("-inf")).all()
+        else:
+            lo = max(k * k, 1)
+            assert row[0] == float("-inf")                   # 其余步 z_cls 屏蔽
+            assert (row[:lo] == float("-inf")).all()         # 块前屏蔽
+            assert (row[lo:hi + 1] == 0).all()               # 块内允许
+            assert (row[hi + 1:] == float("-inf")).all()     # 块后屏蔽
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
     Y_cum = Y.cumsum(dim=1)                                  # 特征空间累加
@@ -799,17 +836,41 @@ if __name__ == "__main__":
     assert square_block_starts(12) == [1, 4, 9], square_block_starts(12)
     assert len(square_block_starts(256)) == 16
     assert len(square_block_starts(512)) == 22
-    # 用户给定示例核对（N=12）: 步 1 → [F,T,T,T,F,F,F,F,F,F,F,F,F]
-    # (块 [1..3]); 步 2 → [F,F,F,F,T,T,T,T,T,F,F,F,F] (块 [4..8])
+    # 用户给定示例核对（N=12）: 第一个步 t=1 可见前面所有元素（含位置 0
+    # z_cls）→ [T,T,T,T,F,F,F,F,F,F,F,F,F] (0..3); 步 2 (t=4) 只看块
+    # [4..8] → [F,F,F,F,T,T,T,T,T,F,F,F,F]
     m12 = build_block_mask(12, [1, 4, 9])
     assert m12.shape == (3 * 12, 13), m12.shape
     r1, r2 = m12[0], m12[12]                                 # 步 1 / 步 2 首查询行
-    assert (r1[1:4] == 0).all() and (r1[[0] + list(range(4, 13))] == float("-inf")).all()
+    assert (r1[0:4] == 0).all() and (r1[4:] == float("-inf")).all()
     assert (r2[4:9] == 0).all() and (r2[:4] == float("-inf")).all() \
         and (r2[9:] == float("-inf")).all()
+    # 可选挑选（skip_steps/max_steps, 默认 None = 全部分块）: [4:9] 切片取中段
+    d_slice = OutputQueryDecoder(num_patches=256, dim=D, skip_steps=4, max_steps=9)
+    assert d_slice.steps == square_block_starts(256)[4:9], d_slice.steps
+    assert d_slice.steps == [25, 36, 49, 64, 81], d_slice.steps
+    # 切片后: 第一个步 t=25 可见 0..35（前面所有元素 + 自己块 25..35）;
+    # 其余步只允许自己的块（t=81 → [81..99]）
+    sm = d_slice.attn_mask if hasattr(d_slice, "attn_mask") else None
+    d_slice(torch.randn(1, 1, D), torch.randn(1, 256, D))
+    sm = d_slice.attn_mask                                  # (5·256, 257)
+    assert sm.shape == (5 * 256, 257), sm.shape
+    r_s1, r_s5 = sm[0], sm[4 * 256]                         # t=25 (第一个) / t=81 首查询行
+    assert (r_s1[0:36] == 0).all() and (r_s1[36:] == float("-inf")).all()
+    assert (r_s5[81:100] == 0).all() and (r_s5[:81] == float("-inf")).all() \
+        and (r_s5[100:] == float("-inf")).all()
+    # 默认 None = 全部分块（等价不切片）; 验收: 第一个步 t=1 能看到 [0,1]
+    d_full = OutputQueryDecoder(num_patches=256, dim=D)
+    assert d_full.steps == square_block_starts(256), "默认 None 应为全部分块"
+    assert d_full.steps[0] == 1, "默认计划第一个步应为 t=1"
+    d_full(torch.randn(1, 1, D), torch.randn(1, 256, D))
+    r_def1 = d_full.attn_mask[0]                            # 默认计划第一个步 (t=1)
+    assert (r_def1[0:4] == 0).all(), "第一个步应可见位置 0 (z_cls)"
+    assert (r_def1[1] == 0).all(), "第一个步应可见位置 1"
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
           f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
-          f"+ 分块掩码(示例核对) + 累加结果像素损失正确")
+          f"+ 分块掩码(示例核对, 第一个步可见[0,1]) + 可选挑选 [4:9]={d_slice.steps} "
+          f"+ 累加结果像素损失正确")
 
     # ── 4. 梯度流向（整模型可训, 含 PixelHead; 首层自注意力 + 末层交叉/FFN）──
     out["loss"].backward()

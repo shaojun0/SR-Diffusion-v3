@@ -16,10 +16,11 @@ SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-2
        target_pix), 得到"累积步数越多重建越精"的渐进曲线。
 
 2026-08-31（分块掩码改造 + 边界实验对齐）:
-    · decoder 掩码从 KV 因果前缀改为**分块掩码**: 步 i 只 attend 自己的
-      z_s 块 [i², min((i+1)²-1, N)]; 默认采样计划 = square_block_starts
+    · decoder 掩码从 KV 因果前缀改为**分块掩码**: 步 t 只 attend 自己所在的
+      z_s 块（块号 ⌊√t⌋）; 默认采样计划 = square_block_starts
       （块起点 = 平方数, 每块一步, 步数 = ⌊√N⌋）;
-    · --decoder_steps 越界校验: 0 <= s <= num_specials, 且步数 ≤ ⌊√N⌋;
+    · --slice_start/--slice_end 可选挑选分块子区间（默认 None = 全部分块）;
+    · --decoder_steps 越界校验: 0 <= s <= num_specials;
     · final_model 同目录存在 model_info.json 时打印参数对齐提示（不强制,
       以权重 strict load 为准）。
 
@@ -63,10 +64,10 @@ def parse_args():
                    help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
-    p.add_argument("--slice_start", type=int, default=4,
-                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
-    p.add_argument("--slice_end", type=int, default=9,
-                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
+    p.add_argument("--slice_start", type=int, default=None,
+                   help="可选挑选分块起点索引(与训练 --slice_start 一致); 默认 None = 全部分块")
+    p.add_argument("--slice_end", type=int, default=None,
+                   help="可选挑选分块终点索引(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
     return p.parse_args()

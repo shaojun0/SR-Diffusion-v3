@@ -111,10 +111,10 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
-    p.add_argument("--slice_start", type=int, default=4,
-                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
-    p.add_argument("--slice_end", type=int, default=9,
-                   help="[已废弃] 分块掩码下每块一个采样步, 切片会丢 z_s 块; 保留仅向后兼容, 模型忽略")
+    p.add_argument("--slice_start", type=int, default=None,
+                   help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
+    p.add_argument("--slice_end", type=int, default=None,
+                   help="可选挑选分块终点索引(如 9 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--no_causal_specials", action="store_true",
                    help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
     p.add_argument("--register_specials", action="store_true",
