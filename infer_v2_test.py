@@ -1,9 +1,9 @@
 """
-SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-27）
+SR-Diffusion Phase 1 v2 — 推理测试（register 式, 像素目标版）
 =================================================
-架构（model_v2.py, test 分支）: DINOv2-large → ReEncoder → OutputQueryDecoder
-    （输出查询注意力, 分块掩码: 每采样步只 attend 自己的 z_s 块）→
-    PixelHead → 像素 patch 预测。
+架构（model_v2.py, register 式唯一路径）: DINOv2-large(specials 拼进输入
+    序列由 24 层直接算 z_s) → OutputQueryDecoder（输出查询注意力, 分块掩码:
+    每采样步只 attend 自己的 z_s 块）→ PixelHead → 像素 patch 预测。
 
 测试项（像素目标 = 最终判据）:
     1) 全量重建像素 L1（归一化空间 + 反归一化 0-255 空间双口径）——
@@ -20,7 +20,7 @@ SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-2
       z_s 块（块号 ⌊√t⌋）; 默认采样计划 = square_block_starts
       （块起点 = 平方数, 每块一步, 步数 = ⌊√N⌋）;
     · --slice_start/--slice_end 可选挑选分块子区间（默认 None = 全部分块）;
-    · --decoder_steps 越界校验: 0 <= s <= num_specials;
+    · --decoder_steps 越界校验: 0 <= s <= num_patches;
     · final_model 同目录存在 model_info.json 时打印参数对齐提示（不强制,
       以权重 strict load 为准）。
 
@@ -57,11 +57,8 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=0, help="只用前 N 条 test(0=全量)")
-    p.add_argument("--reencoder_depth", type=int, default=4)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
-    p.add_argument("--register_specials", action="store_true",
-                   help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
     p.add_argument("--slice_start", type=int, default=None,
@@ -114,12 +111,6 @@ def main():
                 print(f"[warn] model_info.json 记录 {k}={train_info[k]}, "
                       f"但 --{k}={args.__dict__[k]}: 与训练配置不一致, "
                       f"请按训练配置传参")
-        if ("register_specials" in train_info
-                and bool(train_info["register_specials"]) != args.register_specials):
-            print(f"[warn] model_info.json 记录 register_specials="
-                  f"{train_info['register_specials']}, 与推理 "
-                  f"register_specials={args.register_specials} 不一致: "
-                  f"模型结构可能不匹配")
 
     # ── 模型: 训练好的重建权重 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
@@ -128,30 +119,26 @@ def main():
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
-                       reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        decoder_steps=steps,
-                       register_specials=args.register_specials,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
-    model.eval().cuda()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(dev).eval()
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
-          f"register_specials={args.register_specials}, "
-          f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
+          f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}, "
+          f"device={dev}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
-    # 早期检查只覆盖会崩的项（num_specials/register_specials）; 这里补全
-    # loss_min_t / decoder_steps 对比, 并给出最终对齐/不一致结论。
+    # 早期检查只覆盖会崩的项; 这里补全 decoder_steps 对比, 并给出最终
+    # 对齐/不一致结论。
     if train_info is not None:
         mism = []
-        for k, v in [("register_specials", args.register_specials)]:
-            if k in train_info and train_info[k] != v:
-                mism.append(f"{k}: 训练 {train_info[k]} != 推理 {v}")
         if ("decoder_steps" in train_info
                 and list(train_info["decoder_steps"]) != T_steps):
             mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
@@ -180,9 +167,9 @@ def main():
     t0 = time.time()
     with torch.no_grad():
         for bi, batch in enumerate(loader):
-            x = batch["pixel_values"].cuda()            # (B,3,H,W) 归一化
+            x = batch["pixel_values"].to(dev)           # (B,3,H,W) 归一化
             B, C, Hh, Ww = x.shape
-            out = model(x)                              # 同一 forward（两种模式通用）
+            out = model(x)                              # register 式唯一 forward
             F_pix = out["F_hat"]                        # (B,N,588) 采样步平均
             Y_pix = out["Y_pix"]                        # (B,|T|,N,588) 每采样步
             target = out["target_pix"]                  # (B,N,588)

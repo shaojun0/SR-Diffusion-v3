@@ -107,8 +107,16 @@ class ParquetImageDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.ds[idx]
         im = row["image"]
+        if isinstance(im, dict):                    # 旧 datasets: struct{bytes, path}
+            im_bytes = im["bytes"]
+        elif isinstance(im, (bytes, bytearray)):    # 部分版本: 直接 bytes
+            im_bytes = bytes(im)
+        else:                                       # 新 datasets: 已解码为 PIL Image
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG")
+            im_bytes = buf.getvalue()
         return {
-            "image_bytes": im["bytes"] if isinstance(im, dict) else im,
+            "image_bytes": im_bytes,
             "image_caption": row.get("image_caption"),
             "violations": row.get("violations"),
         }

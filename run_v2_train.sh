@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_v2_train.sh — phase1 v2 训练入口（多卡 DDP + bf16, test 分支 OutputQueryDecoder）
+# run_v2_train.sh — phase1 v2 训练入口（多卡 DDP + fp32, register 式 OutputQueryDecoder）
 #
 # 用法:
 #   NUM_GPUS=2 ./run_v2_train.sh \

@@ -1,8 +1,11 @@
-# Checkpoints & outputs
-sr_qwen_vl_v10_output/
+# Outputs & artifacts
 *.pt
 *.bin
 *.safetensors
+output/
+logs/
+sample_data/
+models/
 
 # Python
 __pycache__/
@@ -13,9 +16,3 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
-
-# Logs
-*.log
-
-# SVD cache (large)
-svd_cache/

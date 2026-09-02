@@ -9,7 +9,7 @@
         --data_dir /root/autodl-tmp/construction_site \
         --dino_dir /root/autodl-tmp/models/dinov2-large \
         --final_model output/phase1_v2_block/final_model.pt \
-        --register_specials --slice_start 4 --slice_end 9 \
+        --slice_start 4 --slice_end 9 \
         --out output/phase1_v2_block/recon_visual.png
 """
 import argparse
@@ -31,8 +31,6 @@ def parse_args():
     p.add_argument("--dino_dir", default="models/dinov2-large")
     p.add_argument("--final_model", required=True)
     p.add_argument("--model_input", default="448x252")
-    p.add_argument("--register_specials", action="store_true",
-                   help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 层数(与训练 --decoder_depth 一致)")
     p.add_argument("--slice_start", type=int, default=None,
@@ -70,19 +68,19 @@ def main():
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       dim=dino.config.hidden_size, reencoder_depth=4,
-                       register_specials=args.register_specials,
+                       dim=dino.config.hidden_size,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
-    model.eval().cuda()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(dev).eval()
     T_steps = model.decoder.steps
-    print(f"[model] N={num_patches}, register_specials={args.register_specials}, "
-          f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
-          f"{len(T_steps)} 采样步 {T_steps}")
+    print(f"[model] N={num_patches}, decoder_depth={args.decoder_depth}, "
+          f"slice=[{args.slice_start}:{args.slice_end}], "
+          f"{len(T_steps)} 采样步 {T_steps}, device={dev}")
 
     # 自动选展示步: 前/中/后均匀取 (含最后一步 = 全量累加结果)
     if args.steps.strip():
@@ -105,9 +103,9 @@ def main():
     imgs, recons = [], []
     with torch.no_grad():
         for batch in loader:
-            x = batch["pixel_values"].cuda()
+            x = batch["pixel_values"].to(dev)
             B, C, Hh, Ww = x.shape
-            out = model(x)                              # 同一 forward（两种模式通用）
+            out = model(x)                              # register 式唯一 forward
             Y_pix = out["Y_pix"]                        # (B,|T|,N,588)
             target = out["target_pix"]                  # (B,N,588)
             # 原图 (反归一化)
@@ -150,7 +148,7 @@ def main():
                 ax.set_title(titles[c], fontsize=12, fontweight="bold")
             ax.set_xticks([]); ax.set_yticks([])
     plt.suptitle("像素级重建可视化 — 原图 vs 各采样步累积重建 (分块掩码, 累加集成)\n"
-                 "目标 = 原始像素 (PixelHead), fp32 平权训练, register_specials",
+                 "目标 = 原始像素 (PixelHead), fp32 平权训练, register 式",
                  fontsize=15, fontweight="bold")
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
