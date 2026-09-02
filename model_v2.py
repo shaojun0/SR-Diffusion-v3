@@ -530,10 +530,8 @@ class SRPhase1V2(nn.Module):
         dinov2: nn.Module,
         num_patches: int = 256,
         dim: int = 768,
-        reencoder_depth: int = 4,
         heads: int = 8,
         mlp_ratio: float = 4.0,
-        causal_specials: bool = True,
         decoder_steps: Optional[Sequence[int]] = None,
         patch_px: int = 14 * 14 * 3,
         register_specials: bool = False,
@@ -552,11 +550,6 @@ class SRPhase1V2(nn.Module):
         # register 式: specials 直接进 DINO 由深层网络算, 无 ReEncoder
         # （条件初始化, 避免 DDP find_unused_parameters=False 报未用参数）
         self.re_encoder = None
-        if not register_specials:
-            self.re_encoder = ReEncoder(dim=dim, num_patches=num_patches,
-                                        depth=reencoder_depth, heads=heads,
-                                        mlp_ratio=mlp_ratio,
-                                        causal_specials=causal_specials)
         self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
                                           mlp_ratio=mlp_ratio, heads=heads,
                                           steps=decoder_steps,
@@ -604,21 +597,7 @@ class SRPhase1V2(nn.Module):
             修 DIAGNOSIS_clarity.md F1（special 无 patch 内容输入）与 F2
             （z_s 全是冗余全局摘要）。无 ReEncoder。
         """
-        if self.register_specials:
-            return self._encode_register(pixel_values)
-        return self._encode_reencoder(pixel_values)
-
-    def _encode_reencoder(self, pixel_values: Tensor):
-        x = pixel_values                                # (B,3,H,W)
-        out = self.dinov2(x)
-        feats = out.last_hidden_state                   # (B,257,D)
-        cls = feats[:, 0]                               # (B,D)
-        patch_feat = feats[:, 1:]                       # (B,N,D) 仅作编码输入, 不作监督目标
-        # ReEncoder: [cls; specials; patches] → z_cls, z_s
-        specials = self.special_bank(x.shape[0], x.device)      # (B,N,D)
-        enc_in = torch.cat([cls.unsqueeze(1), specials, patch_feat], dim=1)  # (B,2N+1,D)
-        z = self.re_encoder(enc_in)                     # (B,2N+1,D)
-        return z[:, 0:1], z[:, 1:1 + self.num_patches]  # (B,1,D), (B,N,D)
+        return self._encode_register(pixel_values)
 
     def _encode_register(self, pixel_values: Tensor):
         """register 式: specials 直接进 DINO 输入序列, 由 DINO 深层算 z_s。
