@@ -1,9 +1,11 @@
 """
-SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-27）
+SR-Diffusion Phase 1 v2 — register 式推理测试（像素目标版, 2026-08-27 起）
 =================================================
-架构（model_v2.py, test 分支）: DINOv2-large → ReEncoder → OutputQueryDecoder
-    （输出查询注意力, 分块掩码: 每采样步只 attend 自己的 z_s 块）→
-    PixelHead → 像素 patch 预测。
+架构（model_v2.py, register 式唯一路径）: DINOv2-large + register
+    specials(K) 直接拼进输入序列 → OutputQueryDecoder（输出查询注意力,
+    分块掩码: 每采样步只 attend 自己的 z_s 块）→ PixelHead → 像素 patch
+    预测。K = num_specials 与 N = num_patches 解耦（K 由训练侧最终采样
+    步集推导/显式指定, 见 train_v2.py 与 model_v2.py derive_num_specials）。
 
 测试项（像素目标 = 最终判据）:
     1) 全量重建像素 L1（归一化空间 + 反归一化 0-255 空间双口径）——
@@ -20,9 +22,15 @@ SR-Diffusion Phase 1 v2 — test 分支推理测试（像素目标版, 2026-08-2
       z_s 块（块号 ⌊√t⌋）; 默认采样计划 = square_block_starts
       （块起点 = 平方数, 每块一步, 步数 = ⌊√N⌋）;
     · --slice_start/--slice_end 可选挑选分块子区间（默认 None = 全部分块）;
-    · --decoder_steps 越界校验: 0 <= s <= num_specials;
-    · final_model 同目录存在 model_info.json 时打印参数对齐提示（不强制,
-      以权重 strict load 为准）。
+    · --decoder_steps 越界校验: 0 <= s <= N（K 的最终校验交给模型）。
+
+2026-09-02（num_specials 对齐; 修复与 model_v2.py 接口脱节）:
+    · 删除 --reencoder_depth / --register_specials（register 式唯一路径,
+      model_v2.py 无这些接口）;
+    · K 复现训练值: **优先读 model_info.json 的 num_specials**; 没有则
+      --num_specials CLI（默认 0=auto, 按与训练一致的 slice/decoder_steps
+      自动推导, 公式同 derive_num_specials）; 都没有 = 全量默认 K=N。
+      K 必须与 final_model.pt 权重形状一致, 否则 strict load 直接崩。
 
 用法:
     python infer_v2_test.py \
@@ -57,11 +65,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=0, help="只用前 N 条 test(0=全量)")
-    p.add_argument("--reencoder_depth", type=int, default=4)
+    p.add_argument("--num_specials", type=int, default=0,
+                   help="register/specials 数 K: 0=自动（按训练一致的 "
+                        "slice/decoder_steps 推导, 公式同训练）; >0=显式 K。"
+                        "model_info.json 有 num_specials 字段时以它为准")
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
-    p.add_argument("--register_specials", action="store_true",
-                   help="register 式模型(与训练 --register_specials 一致)")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
     p.add_argument("--slice_start", type=int, default=None,
@@ -95,15 +104,15 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
-        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = N=num_patches
+        # 采样时刻 t ∈ [0, N]; t ≤ K ≤ N 的最终校验由模型构造时完成
         # （与 train_v2.py 相同的解析/校验逻辑）
         assert steps and all(0 <= s <= num_patches for s in steps), \
-            f"decoder_steps 越界: {steps} (N={num_patches}, KV 长度 1+N)"
+            f"decoder_steps 越界: {steps} (N={num_patches})"
 
-    # ── model_info.json 提前读取（加载前提示, 不强制）──
-    # 训练侧把 decoder_depth / slice_start / slice_end / decoder_steps /
-    # register_specials 写在 output_dir/model_info.json。若漏传会导致
-    # strict load 形状不匹配崩溃, 所以**构造模型前**先按训练侧配置对齐提示。
+    # ── model_info.json 提前读取（K/采样对齐提示, 不强制）──
+    # 训练侧把 num_specials / decoder_depth / slice_start / slice_end /
+    # decoder_steps 写在 output_dir/model_info.json。K 错则 strict load 形状
+    # 不匹配直接崩, 所以**构造模型前**先按训练侧配置对齐 num_specials。
     info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
     train_info = None
     if os.path.exists(info_path):
@@ -114,12 +123,22 @@ def main():
                 print(f"[warn] model_info.json 记录 {k}={train_info[k]}, "
                       f"但 --{k}={args.__dict__[k]}: 与训练配置不一致, "
                       f"请按训练配置传参")
-        if ("register_specials" in train_info
-                and bool(train_info["register_specials"]) != args.register_specials):
-            print(f"[warn] model_info.json 记录 register_specials="
-                  f"{train_info['register_specials']}, 与推理 "
-                  f"register_specials={args.register_specials} 不一致: "
-                  f"模型结构可能不匹配")
+    # num_specials(K) 解析: ① model_info.json 优先; ② --num_specials CLI;
+    # ③ 都没有 → None = 全量默认 K=N
+    num_specials = None
+    if train_info is not None and "num_specials" in train_info:
+        num_specials = int(train_info["num_specials"])
+        if args.num_specials and args.num_specials != num_specials:
+            print(f"[warn] model_info.json 记录 num_specials={num_specials}, 与 "
+                  f"--num_specials={args.num_specials} 不一致: 以 model_info 为准")
+    elif args.num_specials:
+        num_specials = args.num_specials
+    if train_info is not None and "num_specials" not in train_info:
+        # 旧 register 训练产物（K=N=num_patches, 无 num_specials 字段）:
+        # 若 slice 非默认, 自动推导的 K 会与旧权重不符 → strict load 崩
+        print(f"[info] model_info.json 无 num_specials 字段（旧 register 产物, "
+              f"K=N={num_patches}）: 若 strict load 形状不符, 请显式 "
+              f"--num_specials {num_patches}")
 
     # ── 模型: 训练好的重建权重 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
@@ -128,30 +147,28 @@ def main():
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
-                       reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
                        decoder_steps=steps,
-                       register_specials=args.register_specials,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
-                       max_steps=args.slice_end)
+                       max_steps=args.slice_end,
+                       num_specials=num_specials)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model.eval().cuda()
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
-          f"register_specials={args.register_specials}, "
+          f"K(num_specials)={model.num_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
-    # 早期检查只覆盖会崩的项（num_specials/register_specials）; 这里补全
-    # loss_min_t / decoder_steps 对比, 并给出最终对齐/不一致结论。
     if train_info is not None:
         mism = []
-        for k, v in [("register_specials", args.register_specials)]:
-            if k in train_info and train_info[k] != v:
-                mism.append(f"{k}: 训练 {train_info[k]} != 推理 {v}")
+        if ("num_specials" in train_info
+                and int(train_info["num_specials"]) != model.num_specials):
+            mism.append(f"num_specials: 训练 {train_info['num_specials']} "
+                        f"!= 推理 {model.num_specials}")
         if ("decoder_steps" in train_info
                 and list(train_info["decoder_steps"]) != T_steps):
             mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
@@ -227,7 +244,8 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({
-            "n": n, "num_patches": num_patches, "input": [W, H],
+            "n": n, "num_patches": num_patches,
+            "num_specials": model.num_specials, "input": [W, H],
             "decoder_steps": T_steps,
             "full_norm_l1": float(norm_mean),
             "full_pixel_l1_255": float(pix_mean), "full_pixel_std_255": float(pix_std),

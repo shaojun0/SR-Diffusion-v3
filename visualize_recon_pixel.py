@@ -1,20 +1,25 @@
 """
 可视化（像素目标版, 2026-08-27）: 原图 vs 各采样步的像素重建。
-重建目标 = 原始像素 patch (B,576,588) → 反归一化回 0-255 → 直接显示。
+重建目标 = 原始像素 patch (B,N,588) → 反归一化回 0-255 → 直接显示。
 每行一张 test 图, 列 = 原图 + 各采样步的重建（2026-08-31 起为**累加**
 语义: 第 n 步 = 前 n 步预测之和, 累积步数越多重建越完整）。
+
+register 式（唯一路径）: specials(K) 进 DINO 输入序列, K = num_specials 由
+model_info.json（训练侧记录）优先对齐; 没有则 --num_specials（0=auto,
+与训练一致的 slice 下自动推导）; K 错则 strict load 形状不符。
 
 用法:
     python visualize_recon_pixel.py \
         --data_dir /root/autodl-tmp/construction_site \
         --dino_dir /root/autodl-tmp/models/dinov2-large \
         --final_model output/phase1_v2_block/final_model.pt \
-        --register_specials --slice_start 4 --slice_end 9 \
+        --slice_start 4 --slice_end 9 \
         --out output/phase1_v2_block/recon_visual.png
 """
 import argparse
 import os
 import glob
+import json
 
 import numpy as np
 import torch
@@ -31,8 +36,9 @@ def parse_args():
     p.add_argument("--dino_dir", default="models/dinov2-large")
     p.add_argument("--final_model", required=True)
     p.add_argument("--model_input", default="448x252")
-    p.add_argument("--register_specials", action="store_true",
-                   help="register 式模型(与训练 --register_specials 一致)")
+    p.add_argument("--num_specials", type=int, default=0,
+                   help="register/specials 数 K: 0=自动（按训练一致的 slice 推导）; "
+                        ">0=显式 K。model_info.json 有 num_specials 字段时以它为准")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 层数(与训练 --decoder_depth 一致)")
     p.add_argument("--slice_start", type=int, default=None,
@@ -65,22 +71,45 @@ def main():
     W, H = (int(v) for v in args.model_input.lower().split("x"))
     num_patches = (W // 14) * (H // 14)
 
+    # num_specials(K) 对齐: model_info.json（训练侧真实 K）优先; 没有则
+    # --num_specials（0=auto, 与训练一致的 slice 下推导结果相同）
+    num_specials = None
+    train_info = None
+    info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
+    if os.path.exists(info_path):
+        with open(info_path) as f:
+            train_info = json.load(f)
+        if "num_specials" in train_info:
+            num_specials = int(train_info["num_specials"])
+            if args.num_specials and args.num_specials != num_specials:
+                print(f"[warn] model_info.json 记录 num_specials={num_specials}, "
+                      f"与 --num_specials={args.num_specials} 不一致: 以 "
+                      f"model_info 为准")
+    elif args.num_specials:
+        num_specials = args.num_specials
+    if train_info is not None and "num_specials" not in train_info:
+        # 旧 register 训练产物（K=N=num_patches, 无 num_specials 字段）:
+        # 自动推导只对默认全量成立; 复现旧切片权重须显式传回旧 K
+        print(f"[info] model_info.json 无 num_specials 字段（旧 register "
+              f"产物, K=N={num_patches}）: 若 strict load 形状不符, 请 "
+              f"显式 --num_specials {num_patches}")
+
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
-                       dim=dino.config.hidden_size, reencoder_depth=4,
-                       register_specials=args.register_specials,
+                       dim=dino.config.hidden_size,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
-                       max_steps=args.slice_end)
+                       max_steps=args.slice_end,
+                       num_specials=num_specials)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model.eval().cuda()
     T_steps = model.decoder.steps
-    print(f"[model] N={num_patches}, register_specials={args.register_specials}, "
+    print(f"[model] N={num_patches}, K(num_specials)={model.num_specials}, "
           f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
           f"{len(T_steps)} 采样步 {T_steps}")
 
@@ -150,7 +179,8 @@ def main():
                 ax.set_title(titles[c], fontsize=12, fontweight="bold")
             ax.set_xticks([]); ax.set_yticks([])
     plt.suptitle("像素级重建可视化 — 原图 vs 各采样步累积重建 (分块掩码, 累加集成)\n"
-                 "目标 = 原始像素 (PixelHead), fp32 平权训练, register_specials",
+                 "目标 = 原始像素 (PixelHead), fp32 平权训练, register 式 "
+                 f"(K={model.num_specials})",
                  fontsize=15, fontweight="bold")
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

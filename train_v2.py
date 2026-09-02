@@ -7,10 +7,18 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     **验收标准是 Phase 2 文字生成质量**; 像素重建 = **信息保持探针**
     （能还原像素 ⇒ z 携带整图信息, 重建质量决定 NLP 天花板）——不是
     "不追", 而是追"K 压缩下活信息保真"（纹理级清晰度属死信息才不追）。
-架构（model_v2.py, test 分支）: DINOv2-large(参数不冻结) → ReEncoder(因果
-    specials 前缀链) → OutputQueryDecoder（输出查询注意力 + KV 因果 +
+架构（model_v2.py, register 式唯一路径）: DINOv2-large(参数不冻结) +
+    register specials(K) 直接拼进输入序列 [cls; specials(K); patches(N)]
+    (1+K+N token, 全双向) → OutputQueryDecoder（输出查询注意力 + 分块掩码 +
     平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
-    重建原始像素 pixel_values（非 DINO 特征）。无 TextDecoder。
+    重建原始像素 pixel_values（非 DINO 特征）。无 TextDecoder、无 ReEncoder。
+    register 数 K = num_specials 与 patch 数 N 解耦: 默认（--num_specials 0）
+    由**最终生效采样步集**自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
+    ——编码器 register 数 = 解码器实际读的范围, 不存在"花瓶 register"
+    （见 model_v2.py derive_num_specials 与 doc/2026-09-02/
+    DESIGN_v2_num_specials_from_max_steps.md）。全量默认（无
+    decoder_steps/slice 切片）→ K=N（向后兼容）; 例: N=576 slice [4:9] →
+    steps=[25,36,49,64,81] → K=99; 显式 steps=[64] → K=80。
 
 2026-08-27 重大修复（用户发现）:
     监督目标从「DINO patch 特征」改为「原始像素 pixel_values」——
@@ -25,15 +33,21 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
       fp32 存被质疑）; TrainingArguments 不设 bf16/fp16, 不套 autocast;
     · batch_size 默认提高到 16/卡（97GB 显存充裕）。
 
-2026-08-31（用户需求, 两个修改, 与 model_v2.py 配套）:
-    · --num_specials（默认 128）: specials 数 K 与 patch 数 N 解耦——K 只管
-      "压缩键数"（decoder 的 KV 长度 1+K, 序列 = [cls; specials(K); patches(N)]
-      = 1+K+N token, 采样计划按 K 推导）, N 只管查询基行数/输出 patch 数。
-      K=128/N=576 即 2.6% 键还原全部 patch 的真压缩。
-    · --loss_min_t（默认 5）: 损失只对 t>=loss_min_t 的采样步求平均——排除
-      {0,1,4} 这些"几乎无键"的粗重建步（退化监督）; decoder 的 steps 不变
-      （推理渐进曲线仍要全部步的 Y_pix）, 只是损失侧过滤; 传 0 即不过滤。
-    · model_info.json 记录 num_specials / loss_min_t, 供推理/可视化脚本对齐。
+2026-09-02（K 与 N 解耦 + 修复 train/infer 与 model_v2.py 的接口脱节）:
+    · 删除 ReEncoder 时代残留的 --reencoder_depth / --no_causal_specials /
+      --register_specials 参数与 model.init_reencoder_from_dino() 调用——
+      register 式是唯一路径, model_v2.py 已无这些接口（旧 train_v2.py 会
+      直接 TypeError/AttributeError）。
+    · --num_specials（默认 0 = 自动）: register/specials 数 K 与 patch 数 N
+      解耦——K = 解码器实际读取的 z_s 范围, 由最终采样步集自动推导
+      K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )（全量默认 → K=N 向后兼容;
+      N=576 slice [4:9] → steps=[25,36,49,64,81] → K=99; 消除"花瓶
+      register", 证据见 DESIGN doc）。显式 K>0 时模型断言 max(采样步) ≤ K
+      （复现旧 checkpoint 权重形状时须显式传回旧 K, 如 K=N）。序列 =
+      [cls; specials(K); patches(N)] = 1+K+N token, N 只管查询基行数/输出
+      patch 数。
+    · model_info.json 记录 num_specials（推理/可视化按它对齐权重形状——
+      K 错了 checkpoint 形状就对不上, strict load 即崩）与 decoder_steps。
 
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
@@ -105,8 +119,11 @@ def parse_args():
     p.add_argument("--resume", default=None, help="Trainer checkpoint 目录(如 output_dir/checkpoint-123)")
     p.add_argument("--smoke", action="store_true",
                    help="冒烟: 不存 checkpoint, 但照常导出 final_model.pt")
-    # ── 模型（ReEncoder）──
-    p.add_argument("--reencoder_depth", type=int, default=4)
+    # ── 模型（register 式: DINOv2 + specials(K) + OutputQueryDecoder）──
+    p.add_argument("--num_specials", type=int, default=0,
+                   help="register/specials 数 K: 0=自动由最终采样步集推导 "
+                        "(K = min(max_t((⌊√t⌋+1)²−1), N); 默认); >0=显式 K "
+                        "(须 ≥ 最大采样步值; 复现旧 checkpoint 时显式传回旧 K)")
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
@@ -115,15 +132,10 @@ def parse_args():
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
                    help="可选挑选分块终点索引(如 9 ⇔ 计划[4:9]); 默认 None = 全部分块")
-    p.add_argument("--no_causal_specials", action="store_true",
-                   help="关闭 ReEncoder 的 causal specials 块掩码(全双向)")
-    p.add_argument("--register_specials", action="store_true",
-                   help="register 式(修 F1/F2): specials 作为额外 token 直接进 "
-                        "DINOv2 输入序列, 由 DINO 24 层算出 z_s; 无 ReEncoder")
-    # ── 模型（OutputQueryDecoder）──
+    # ── 模型（OutputQueryDecoder 采样计划）──
     p.add_argument("--decoder_steps", default=None,
-                   help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(K) "
-                        "(分块起点=平方数; 步数须 ≤ ⌊√K⌋)")
+                   help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(N) "
+                        "(分块起点=平方数) 再按 slice 切片; K 自动由最终步集推导")
     return p.parse_args()
 
 
@@ -195,9 +207,10 @@ def main():
     steps = None
     if args.decoder_steps:
         steps = [int(s) for s in args.decoder_steps.split(",") if s.strip()]
-        # 采样时刻 t 是 KV 序列 [z_cls; z_s] 的前缀长度, 上界 = N=num_patches
+        # 采样时刻 t ∈ [0, N]（t ≤ K ≤ N 由模型构造时最终校验——显式 K 过小
+        # 会给出清晰报错; 这里只做快速失败, 免得到 DINO 加载完才报）
         assert steps and all(0 <= s <= num_patches for s in steps), \
-            f"decoder_steps 越界: {steps} (N={num_patches}, KV 长度 1+N)"
+            f"decoder_steps 越界: {steps} (N={num_patches})"
 
     # ── 数据（纯重建模式, tokenizer=None; data_v2.py 已提供）──
     train_files = sorted(glob.glob(os.path.join(args.data_dir, "train-*.parquet")))
@@ -211,7 +224,7 @@ def main():
     else:
         print("[warn] 无 test-*.parquet, 跳过 eval")
 
-    # ── 模型: DINOv2-large 不冻结 → ReEncoder → OutputQueryDecoder ──
+    # ── 模型: DINOv2-large 不冻结 + register specials(K) → OutputQueryDecoder ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     # 权重带 mask_token(use_mask_token=True) 但本任务不传 bool_masked_pos,
     # 该参数从不参与前向 → DDP 报"未用参数"。移除并关掉 flag。
@@ -221,27 +234,27 @@ def main():
 
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
-                       reencoder_depth=args.reencoder_depth,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
-                       causal_specials=not args.no_causal_specials,
                        decoder_steps=steps,
-                       register_specials=args.register_specials,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
-                       max_steps=args.slice_end)
-    model.init_reencoder_from_dino(args.reencoder_depth)
+                       max_steps=args.slice_end,
+                       num_specials=(args.num_specials or None))
 
+    K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
-          f"输入 {W}x{H}, patches={num_patches}, specials={num_patches} "
-          f"(序列 {1 + 2 * num_patches} token), decoder 采样 "
+          f"输入 {W}x{H}, patches={num_patches}, specials={K} "
+          f"(序列 {1 + K + num_patches} token), decoder 采样 "
           f"{len(model.decoder.steps)} 步 {model.decoder.steps}")
+    if args.num_specials:
+        print(f"[model] num_specials 显式 = {K}（须 ≥ max 采样步; "
+              f"复现旧 checkpoint 用, 如 K=N={num_patches}）")
+    else:
+        print(f"[model] num_specials 自动推导 = {K} "
+              f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
-    if args.register_specials:
-        print(f"[model] register_specials: specials 进 DINO 序列("
-              f"{1 + 2 * num_patches} token, 全双向) 由 24 层"
-              f"算出 z_s; 无 ReEncoder, 训练时长预计 ~2-3×")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -310,13 +323,11 @@ def main():
         torch.save(sd, final)
         info = {"input_size": [W, H], "canvas": [CW, CH],
                 "num_patches": num_patches,
+                "num_specials": model.num_specials,
                 "dim": dino.config.hidden_size,
-                "reencoder_depth": args.reencoder_depth,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "decoder_depth": args.decoder_depth,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
-                "causal_specials": not args.no_causal_specials,
-                "register_specials": args.register_specials,
                 "decoder_steps": raw.decoder.steps,
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}

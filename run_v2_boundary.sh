@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# run_v2_boundary.sh — 边界实验: 最大特殊 token 数 K=64 + 只监督"前 32/前 64"
-# 两个前缀序列（decoder_steps=[32,64], test 分支 OutputQueryDecoder）
+# run_v2_boundary.sh — 边界实验: 最大特殊 token 数 K=64 + 只采样两个时刻
+# decoder_steps=[32,64]（register 式, num_specials 与 N 解耦后唯一路径）
 #
-# 实验目的（压缩边界探索）:
-#   · K=64: 压缩键上限压到 64（对比默认 K=128 的 2.6% 键压缩, 这里是
-#     64/576 ≈ 11% 键还原全部 patch——边界条件探测压缩率上界）;
-#   · decoder_steps=[32,64]: 训练/推理只走两个采样时刻——KV 前缀长度 32
-#     与 64（全量前缀）。32-token 前缀 vs 64-token 全量前缀的重建能力
-#     对比, 检验"半压缩"下的信息保持。
-#   · register_specials: specials 进 DINO 序列（1+64+576 token, 全双向）,
-#     由 24 层算出 z_s —— 与 K=64 配套的显存/速度边界验证。
+# 实验目的（压缩边界探索, 2026-09-02 语义更新——register 式恒开, 无
+# ReEncoder/causal_specials/register_specials/loss_min_t 等旧参数）:
+#   · --num_specials 64（显式 K）: 压缩键上限压到 64（64/576 ≈ 11% 键还原
+#     全部 patch——边界条件探测压缩率上界）; 显式 K 断言: max(采样步) ≤ K,
+#     这里 max(decoder_steps)=64 ≤ 64 ✓;
+#   · decoder_steps=[32,64]: 训练/推理只走两个采样时刻——块起点 32（块
+#     5=[25..35], 首步前缀规则可见 0..35）与 64（块 8=[64..80] 被 K=64
+#     截到 [64..64], 只见自身; 位置 36..63 不被覆盖——显式非默认 steps
+#     不保证全覆盖, 见 DESIGN_v2_num_specials_from_max_steps.md）;
+#   · 序列 = [cls; specials(64); patches(576)] = 1+64+576 token, DINO 24 层
+#     全双向算出 z_s（与 K=64 配套的显存/速度边界验证）。
 #
 # 用法:
 #   NUM_GPUS=2 ./run_v2_boundary.sh            # 完整训练 (40 epochs)
@@ -37,8 +40,6 @@ ARGS=(
   --num_workers 8
   --num_specials 64
   --decoder_steps "32,64"
-  --loss_min_t 5
-  --register_specials
 )
 
 if [ "${NUM_GPUS}" -eq 1 ]; then
