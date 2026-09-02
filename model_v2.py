@@ -516,7 +516,7 @@ class OutputQueryDecoder(nn.Module):
         Y = self.stack(Y, A, memory_mask=mask)                   # (B,|T|·N,D)
         Y = Y.reshape(B, len(self.steps), N, D)                  # (B,|T|,N,D)
         self.last_Y = Y                                          # 采样步全部 patch 预测
-        return Y.sum(dim=1)                                      # (B,N,D) Σ_t Y_t 累加
+        return Y
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -663,8 +663,7 @@ class SRPhase1V2(nn.Module):
         N = self.num_patches
         # OutputQueryDecoder: 采样时刻上每步 (N,D) 全覆盖（返回值=特征累加,
         # 此处只用其 last_Y 副作用; 最终像素累加在下方由 Y_cum 给出）
-        self.decoder(z_cls, z_s)                        # 前向, 填充 last_Y
-        Y = self.decoder.last_Y                         # (B,|T|,N,D) 每步全部 patch
+        Y = self.decoder(z_cls, z_s)                        # 前向, 填充 last_Y
         # 像素目标: (B,3,H,W) 归一化像素 → (B,N,588) patch
         # 注意布局: DINO 的 patch 顺序是 row-major (先 y 后 x), 这里保持一致
         target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
