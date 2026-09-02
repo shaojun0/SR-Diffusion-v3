@@ -57,6 +57,16 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
         https://proceedings.neurips.cc/paper/2020/hash/e3b21256183cf7c2c7a66be163579d37-Abstract.html
     [6] Gao & Shou (2025), D-AR——顺序扩散 tokenizer;"token 顺序定义渐进细化"参考
         https://arxiv.org/abs/2505.23660
+    [7] Liang et al. (ICLR 2022), EViT——注意力分数排序剪枝 + 不重要 token 融合
+        （与 [4] 同域; 预算机制回归时的简单替代）
+        https://arxiv.org/abs/2202.07815
+        https://github.com/youweiliang/evit
+    [8] Darcet et al. (ICLR 2024), Vision Transformers Need Registers——register
+        token 式出处（架构段所引的 Darcet et al. 即此文）
+        https://arxiv.org/abs/2309.16588
+    [9] Jaegle et al. (ICML 2022), Perceiver IO——输出查询定义输出结构的通用化;
+        query_base 行 k↔patch k 的直接出处
+        https://arxiv.org/abs/2107.14795
 """
 
 import math
