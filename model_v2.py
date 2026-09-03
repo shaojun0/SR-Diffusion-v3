@@ -20,7 +20,9 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     24 层直接算出 z_s（register token 式, Darcet et al.）——深层网络做
     "内容路由", 修 F1（special 无内容输入）与 F2（z_s 冗余全局摘要）。
     DINO 内全双向注意力（HF 无 token 级 mask API）; z_s[k] 依赖全部 patch
-    （含 j>k）, "前缀稳定性"不成立——渐进语义由解码器分块掩码提供。
+    （含 j>k）, "前缀稳定性"不成立——渐进语义由解码器分块掩码提供: 读侧
+    memory_mask（每步只见自己的块）+ 查询侧 tgt_mask 块因果（步 t 只见
+    步 ≤ t 的查询行, 见 OutputQueryDecoder / build_causal_query_mask）。
     无 ReEncoder（省 51.6M 参数）。
     register 数 K（num_specials）= 解码器实际读取的 z_s 范围: 默认由
     "最终生效采样步集"自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
@@ -35,8 +37,10 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
                     上界; SRPhase1V2 里切片先于 K 推导, 上界 = N, 见
                     select_steps）上输出 (N,D) = 全部 patch 的预测（输出
                     查询注意力, 查询基行 k ↔ patch k, 行数 = N 不变）;
-                    分块掩码: 每步只 attend 自己的 z_s 块（掩码列数 =
-                    K+1）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
+                    分块掩码(memory_mask): 每步只 attend 自己的 z_s 块
+                    （掩码列数 = K+1）; 查询自注意力块因果（tgt_mask:
+                    步 t 只 attend 步 ≤ t 的查询行, 防后步查询内容泄露进
+                    前步输出）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
     L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
         （梯度按步解耦: carry 整体 detach + 自己的预测——每步恰收 1 份梯度,
         避免"t=0 收 |T| 份梯度"的三角失衡; 见 SRPhase1V2.decode）
@@ -247,6 +251,27 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
     return torch.stack(rows).repeat_interleave(Q, dim=0)
 
 
+# ═══ build_causal_query_mask — 查询自注意力块因果掩码 ═══
+
+def build_causal_query_mask(num_steps: int, num_queries: int,
+                            device: torch.device = None) -> Tensor:
+    """查询自注意力“块因果”掩码（torch float, -inf=屏蔽, 0=允许）。
+
+    查询行序 = (t,k) 展平（index = t*num_queries + k, 每采样步 N 行 patch
+    查询连排）; **块下三角**: 步 t 的行可 attend 步 ≤ t 的所有行——同步内
+    全双向（patch 间可交换信息）+ 之前步, 未来步屏蔽。目的: 后步查询内容
+    （z_s 采样种子）不再经查询自注意力影响前步输出——渐进语义由
+    memory_mask（读侧）+ tgt_mask（查询侧）双重保证。返回 (L,L) 方阵,
+    L = num_steps·num_queries。
+    """
+    T, Q = int(num_steps), int(num_queries)
+    L = T * Q
+    m = torch.full((L, L), float("-inf"), device=device)
+    for t in range(T):
+        m[t * Q:(t + 1) * Q, :(t + 1) * Q] = 0.0
+    return m
+
+
 # ═══ PixelHead — 特征 → 像素 patch 解码头 ═══
 
 class PixelHead(nn.Module):
@@ -283,9 +308,11 @@ class OutputQueryDecoder(nn.Module):
       不再恒等——pos_embed 尺寸 (1,K+1,D), query_base 行数 = N。
     · 分块掩码走 memory_mask（加法浮点, -inf=屏蔽; 见 build_block_mask）,
       列数 = K+1（每步只见自己的 z_s 块）
-    · 查询间自注意力无掩码全双向（Q-Former/Perceiver 惯例, 参考 [1][2]）——
-      渐进语义只由 memory_mask 提供, 后步查询内容仍可经查询自注意力影响
-      前步输出（有意为之, 标准模块的固有代价）
+    · 查询自注意力**块因果**（见 build_causal_query_mask, 加法浮点,
+      -inf=屏蔽）: 查询行序 = (t,k) 展平, 步 t 的行可 attend 步 ≤ t 的所有
+      行（同步内全双向）, 未来步屏蔽——后步查询内容不再经查询自注意力
+      影响前步输出, 渐进语义由 memory_mask（读侧）+ tgt_mask（查询侧）
+      双重保证。
     · 结果沿采样步累加; **梯度按步解耦**（carry detach + 自己的预测, 见
       SRPhase1V2.decode）——每步 Y_t 只从自己那一步的损失收 1 份梯度
     · 时刻采样（显存优化, 默认开启）: 查询只对 T_sub 构造——采样计划 =
@@ -338,7 +365,13 @@ class OutputQueryDecoder(nn.Module):
         mask = build_block_mask(self.num_specials, self.steps,
                                 num_queries=N, device=A.device)  # (|T|·N, K+1)
         self.attn_mask = mask                                    # 供自检
-        Y = self.stack(Y, A, memory_mask=mask)                   # (B,|T|·N,D)
+        # 查询自注意力块因果: 行序 = (t,k) 展平, 步 t 的行只允许步 ≤ t 的
+        # 列（同步内全双向）——后步查询内容不泄露进前步输出
+        tgt_mask = build_causal_query_mask(len(self.steps), N,
+                                                device=A.device)  # (L,L)
+        self.tgt_mask = tgt_mask
+        Y = self.stack(Y, A, memory_mask=mask,
+                       tgt_mask=tgt_mask)                   # (B,|T|·N,D)
         Y = Y.reshape(B, len(self.steps), N, D)                  # (B,|T|,N,D)
         self.last_Y = Y                                          # 采样步全部 patch 预测
         return Y
@@ -361,6 +394,10 @@ class SRPhase1V2(nn.Module):
     K=N（默认全量）序列 = [cls; specials(N); patches(N)] = 2N+1 token, 与
     历史一致; K<N 时序列 = 1+K+N token, register 1..K 全被解码器读（无
     "花瓶 register", 见 derive_num_specials / DESIGN doc）。
+    解码器查询自注意力为块因果: 查询行序 = (t,k) 展平, 步 t 只 attend 步
+    ≤ t 的查询行（同步内全双向）, 后步查询内容不泄露进前步输出——渐进
+    语义由 memory_mask（读侧）+ tgt_mask（查询侧）双重保证（见
+    OutputQueryDecoder / build_causal_query_mask）。
     """
 
     def __init__(
@@ -596,7 +633,8 @@ if __name__ == "__main__":
     print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} (像素 {PATCH_PX}D) "
           f"loss={out['loss'].item():.4f}")
 
-    # ── 2. OutputQueryDecoder: 分块采样计划 + 分块掩码 + 累加结果损失 ──
+    # ── 2. OutputQueryDecoder: 分块采样计划 + 分块掩码(读侧 memory_mask)
+    #    + 查询自注意力块因果(tgt_mask) + 累加结果损失 ──
     T_steps = model.decoder.steps
     assert T_steps == square_block_starts(N), T_steps       # N=16 → [1,4,9,16]
     assert len(model.decoder.stack.layers) == 2, "默认 decoder_depth=2"
@@ -617,6 +655,17 @@ if __name__ == "__main__":
             assert (row[:lo] == float("-inf")).all()         # 块前屏蔽
             assert (row[lo:hi + 1] == 0).all()               # 块内允许
             assert (row[hi + 1:] == float("-inf")).all()     # 块后屏蔽
+    # 查询自注意力块因果: tgt_mask (L,L), 行序 = (t,k) 展平, 步 ti 的行只
+    # 允许步 ≤ ti 的列（同步内全双向 + 之前步）, 未来步 -inf
+    tg = model.decoder.tgt_mask
+    assert tg is not None, "tgt_mask 不应为 None（查询自注意力块因果）"
+    assert tg.shape == (len(T_steps) * N, len(T_steps) * N), tg.shape
+    for ti in range(len(T_steps)):
+        qrow = tg[ti * N]
+        assert (qrow[:(ti + 1) * N] == 0).all(), \
+            f"步 {ti} 应可见步 ≤{ti} 的查询行"
+        assert (qrow[(ti + 1) * N:] == float("-inf")).all(), \
+            f"步 {ti} 不应见未来步查询行"
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
     # 与模型 decode 相同的梯度解耦构造: carry 无梯度 + 自己的预测
@@ -665,6 +714,7 @@ if __name__ == "__main__":
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
           f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
           f"+ 分块掩码(示例核对, 第一个步可见[0,1]) + 可选挑选 [4:9]={d_slice.steps} "
+          f"+ 查询自注意力块因果(步 t 只见步 ≤t) "
           f"+ 累加结果像素损失正确")
 
     # ── 2b. num_specials(K) 与 N 解耦: K 由最终采样步集自动推导（无花瓶）──
@@ -698,7 +748,7 @@ if __name__ == "__main__":
     for name, p in [("m_k.special_bank.pos", m_k.special_bank.pos),
                     ("m_k.decoder.pos_embed", m_k.decoder.pos_embed),
                     ("m_k.decoder.query_base", m_k.decoder.query_base),
-                    ("m_k.pixel_head.proj", m_k.pixel_head.proj.weight)]:
+                    ("m_k.pixel_head.net", m_k.pixel_head.net[0].weight)]:
         g = p.grad
         assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
     print(f"[ok] num_specials 自动推导: N={N} slice[1:3] → steps=[4,9], "
@@ -744,7 +794,7 @@ if __name__ == "__main__":
                      model.decoder.stack.layers[-1].linear1.weight),
                     ("decoder.query_base", model.decoder.query_base),
                     ("special_bank.pos", model.special_bank.pos),
-                    ("pixel_head.proj", model.pixel_head.proj.weight)]:
+                    ("pixel_head.net", model.pixel_head.net[0].weight)]:
         g = p.grad
         assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
     print(f"[ok] 梯度: DINO 嵌入/层 + OutputQueryDecoder({len(model.decoder.stack.layers)}×"
