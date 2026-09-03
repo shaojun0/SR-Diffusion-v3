@@ -252,20 +252,21 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
 class PixelHead(nn.Module):
     """每 patch 特征 (B,N,D) → 像素 patch (B,N,14*14*3)。
 
-    监督目标必须是原始像素而非 DINO 特征: 工地图的 DINO 特征在空间上近常数
-    （跨位置 std≈5e-5）, 学"输出质心"即达低 L1, 是假收敛; 像素目标有真实
-    空间结构, 强制模型保留空间信息。输出不加激活（像素已按 DINO_MEAN/STD
-    归一化, 评估时再反归一化）。
+    2 层 MLP（dim→hidden→588）: 回应"解码器参数量不够欠拟合"的担忧
+    （v2 是单层 Linear, 0.6M; 这里是 ~2.1M@dim=1024,hidden=2048, 且带
+    非线性）。输出不加激活: 像素按 DINO_MEAN/STD 归一化(范围≈[-2,2]),
+    L1 直接监督归一化空间, 评估时再反归一化。
     """
 
-    def __init__(self, dim: int, patch_px: int = 14 * 14 * 3):
+    def __init__(self, dim: int, patch_px: int = 14 * 14 * 3, hidden: int = 2048):
         super().__init__()
         self.patch_px = patch_px
-        self.proj = nn.Linear(dim, patch_px)   # 特征 → 588 维像素 patch
+        self.net = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(),
+                                 nn.Linear(hidden, patch_px))
 
     def forward(self, feat: Tensor) -> Tensor:
         """feat: (..., N, D) → (..., N, patch_px)"""
-        return self.proj(feat)
+        return self.net(feat)
 
 
 # ═══ OutputQueryDecoder — 输出查询注意力解码器（采样时刻上输出全部 patch）═══
