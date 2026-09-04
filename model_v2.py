@@ -305,7 +305,15 @@ class OutputQueryDecoder(nn.Module):
     (memory=A) + FFN）→ reshape (B,|T|,N,D), 返回 Y。
     · num_specials（K）= z_s 长度; None = num_patches（历史 K==N 行为）。
       num_patches（N）只决定查询基行数 = 输出 patch 预测数, 两者解耦后
-      不再恒等——pos_embed 尺寸 (1,K+1,D), query_base 行数 = N。
+      不再恒等——pos_embed 按 step 块共享（尺寸 (1,⌊√K⌋+1,D)）, query_base
+      行数 = N。
+    · 位置编码按 step 块分组（与 build_block_mask 同一分块: 位置 p 的块号
+      k = ⌊√p⌋, 块 k = [k², min((k+1)²-1, K)]）——**块内所有位置共享同一
+      向量**（位置 0 = z_cls 独占块 0）: 解码器对每个采样步**整块**读取
+      自己的 z_s 块（memory_mask 列级不区分块内位置, 查询 A_t 也只取块内
+      一个位置）, 块内逐位置编码对解码器没有可利用的语义（同一个 step 下
+      的位置编码失去意义）, 只需保留"哪个块/采样步"的位置信号——参数从
+      (1,K+1,D) 降到 (1,⌊√K⌋+1,D), 各块向量随对应采样步的整块读取而训练。
     · 分块掩码走 memory_mask（加法浮点, -inf=屏蔽; 见 build_block_mask）,
       列数 = K+1（每步只见自己的 z_s 块）
     · 查询自注意力**块因果**（见 build_causal_query_mask, 加法浮点,
@@ -349,14 +357,30 @@ class OutputQueryDecoder(nn.Module):
                 dropout=0.0, activation="gelu", batch_first=True, norm_first=True),
             num_layers=depth,
         )
-        self.pos_embed = nn.Parameter(torch.randn(1, S, dim) * 0.02)
+        # 位置编码按 step 块共享（块号 = 位置 p 的 ⌊√p⌋, 与 build_block_mask
+        # 同一分块; 块 0 只含位置 0 = z_cls）: 同一步整块读取的 z_s 位置共用
+        # 一个向量, 块内不再逐位置区分——解码器对块内各列掩码相同, 逐位置
+        # 编码没有可利用语义（同一个 step 下位置编码失去意义）, 只保留
+        # "哪个块(=哪个采样步)"的位置信号, 参数量从 (1,K+1,D) 降到
+        # (1,⌊√K⌋+1,D)。
+        num_blocks = math.isqrt(self.num_specials) + 1   # 块 0(z_cls)..⌊√K⌋
+        self.pos_embed = nn.Parameter(torch.randn(1, num_blocks, dim) * 0.02)
+        # 序列位置 p (0..K) → 所在块号: 展开 pos_embed 用（静态, 不入 state_dict）
+        self.register_buffer(
+            "pos_block_ids",
+            torch.tensor([math.isqrt(p) for p in range(S)], dtype=torch.long),
+            persistent=False,
+        )
 
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
         B, N, D = z_s.shape[0], self.num_patches, z_s.shape[-1]
         assert z_cls.shape[1] == 1, f"z_cls 应为 1 列, got {z_cls.shape[1]}"
         assert z_s.shape[1] == self.num_specials, \
             f"z_s 列数 {z_s.shape[1]} != num_specials(K)={self.num_specials}"
-        A = torch.cat([z_cls, z_s], dim=1) + self.pos_embed      # (B,S,D)
+        # 块级位置编码按块展开到每个序列位置（pos_block_ids: p → ⌊√p⌋）,
+        # 同块共享向量 → (1,S,D), 广播加到 [z_cls; z_s]
+        pos = self.pos_embed[:, self.pos_block_ids]              # (1,S,D)
+        A = torch.cat([z_cls, z_s], dim=1) + pos                 # (B,S,D)
         A_t = A[:, self.steps]                                   # (B,|T|,D) 采样时刻
         Y = (A_t.unsqueeze(2) + self.query_base) \
             .reshape(B, len(self.steps) * N, D)                  # 展平 (t,k), t∈T_sub
@@ -710,6 +734,9 @@ if __name__ == "__main__":
     r_def1 = d_full.attn_mask[0]                            # 默认计划第一个步 (t=1)
     assert (r_def1[0:4] == 0).all(), "第一个步应可见位置 0 (z_cls)"
     assert (r_def1[1] == 0).all(), "第一个步应可见位置 1"
+    # 块级位置编码的参数量: N=256 默认 → ⌊√256⌋+1 = 17 个块向量
+    # （旧逐位置版本是 K+1 = 257 行）
+    assert d_full.pos_embed.shape == (1, 17, D), d_full.pos_embed.shape
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
           f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
           f"+ 分块掩码(示例核对, 第一个步可见[0,1]) + 可选挑选 [4:9]={d_slice.steps} "
@@ -730,7 +757,16 @@ if __name__ == "__main__":
     assert m_k.num_specials == 15, m_k.num_specials
     assert m_k.decoder.steps == [4, 9], m_k.decoder.steps
     assert m_k.special_bank.pos.shape == (1, 15, D), m_k.special_bank.pos.shape
-    assert m_k.decoder.pos_embed.shape == (1, 16, D), m_k.decoder.pos_embed.shape
+    # 块级位置编码: K=15 → ⌊√15⌋+1 = 4 个块向量（块 0 = z_cls, 块 1=[1,3],
+    # 块 2=[4,8], 块 3=[9,15]）, 不再是逐位置的 (1,K+1,D)
+    assert m_k.decoder.pos_embed.shape == (1, 4, D), m_k.decoder.pos_embed.shape
+    pe_ids = m_k.decoder.pos_block_ids                        # (K+1,) 位置→块号
+    assert pe_ids.tolist() == [0, 1, 1, 1, 2, 2, 2, 2, 2,
+                               3, 3, 3, 3, 3, 3, 3], pe_ids.tolist()
+    pe_full = m_k.decoder.pos_embed[0][pe_ids]                # (K+1,D) 逐位置展开
+    same_blk = (pe_ids[:, None] == pe_ids[None, :])           # 同块对 = True
+    assert (pe_full[:, None] == pe_full[None, :]).all(dim=-1).equal(same_blk), \
+        "同块内位置编码应完全相同, 异块应不同"
     out_k = m_k(x)                                        # 同 x: (2,3,56,56)
     z_s_k = m_k.encode(x)[1]
     assert z_s_k.shape == (2, 15, D), z_s_k.shape         # 编码器只生成 K=15 个 register
