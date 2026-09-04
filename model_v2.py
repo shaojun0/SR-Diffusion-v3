@@ -503,8 +503,7 @@ class SRPhase1V2(nn.Module):
         # 特征空间累加 → 统一过 PixelHead（bias 只加一次）。
         # 梯度按步解耦: carry[n] = Σ_{t<n} Y_t（detach）; + Y[n] ⇒ 每步恰收
         # 1 份梯度（数值上 Y_cum[n] 仍 = Σ_{t≤n} Y_t, F_hat 不变）
-        Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
-                           Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y   # (B,|T|,N,D)
+        Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y   # (B,|T|,N,D)
         Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
         F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
         # 平权全覆盖损失: 每个采样步的累加结果都还原全部 patch 像素
