@@ -86,21 +86,12 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
 """
 
 import math
-import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Sequence
-
-# 读侧 memory 掩码总开关（2026-09-04 "仅保留因果 mask" 实验用）:
-# SRV2_MEMORY_OPEN=1 → build_block_mask 全 0（每采样步全键可及, 含位置 0
-# z_cls）, 查询侧因果 tgt_mask 保留不变。训练/推理须同开关; 训练侧写入
-# model_info.json 的 memory_open 字段, 推理侧按它强制对齐（见
-# infer_v2_test.py）。默认 0 = 分块/首步前缀读掩码原样（向后兼容）。
-SRV2_MEMORY_OPEN = os.environ.get("SRV2_MEMORY_OPEN", "").lower() \
-    in ("1", "true", "yes")
 
 
 # ═══ SpecialTokenBank — 特殊 token 池（输入相同, 仅位置编码不同）═══
@@ -245,10 +236,6 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
     """
     S = num_tokens + 1                      # z_cls + K 个 z_s
     Q = num_tokens if num_queries is None else int(num_queries)
-    if SRV2_MEMORY_OPEN:
-        # 读侧全开（"仅保留因果 mask"）: 每步全键可及, 无 -inf
-        # （含位置 0 = z_cls; 与旧"首步前缀/分块"规则一并放开）。
-        return torch.zeros((len(steps) * Q, S), device=device)
     rows = []
     for i, t in enumerate(steps):
         k = math.isqrt(int(t))              # 块号 = 步值所在的平方块

@@ -329,8 +329,6 @@ def main():
                 "decoder_depth": args.decoder_depth,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
-                "memory_open": os.environ.get("SRV2_MEMORY_OPEN", "").lower()
-                in ("1", "true", "yes"),   # 读侧全开（仅保留因果 mask）实验开关
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:

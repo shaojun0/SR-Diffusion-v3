@@ -52,7 +52,6 @@ from transformers import Dinov2Model
 
 from data_v2 import ParquetImageDataset, V2Collator, DINO_MEAN, DINO_STD
 from model_v2 import SRPhase1V2
-import model_v2   # 读侧掩码开关对齐（SRV2_MEMORY_OPEN, 见下方 memory_open 强制对齐）
 
 
 def parse_args():
@@ -180,18 +179,6 @@ def main():
                 print(f"    - {m}")
         else:
             print(f"[ok] 推理参数与训练侧 model_info.json 对齐 ({info_path})")
-
-    # ── memory_open（读侧全开, 2026-09-04）: 掩码影响前向输出, 推理必须与
-    # 训练同开关——以 model_info.json 记录为准强制对齐, 并打印证据 ──
-    mem_open = bool(train_info.get("memory_open", False)) if train_info else False
-    if mem_open != model_v2.SRV2_MEMORY_OPEN:
-        print(f"[warn] model_info.json 记录 memory_open={mem_open} 与当前环境 "
-              f"不一致: 以训练侧为准强制对齐 (model_v2.SRV2_MEMORY_OPEN := "
-              f"{mem_open})")
-        model_v2.SRV2_MEMORY_OPEN = mem_open
-    else:
-        print(f"[ok] memory_open={mem_open}（读侧掩码 "
-              f"{'全开(全键可及)' if mem_open else '分块/首步前缀'}）与训练侧一致")
 
     # ── 数据: test 分片, 与训练同预处理（1600:900 画布 → 448x252）──
     test_files = sorted(glob.glob(os.path.join(args.data_dir, "test-*.parquet")))
