@@ -1,92 +1,67 @@
-# SR-Diffusion-v3
+# SR-Diffusion-v3（main 分支: v2 最小可运行代码 + 全部实验文档）
 
-**项目目标（权威版，2026-08-28 修订 v2，详见 [`doc/2026-08-28/GOAL_compression_for_nlp.md`](doc/2026-08-28/GOAL_compression_for_nlp.md)）**：
-通过 **token 压缩**训练编码器的**联想能力**（把图像信息压进少量 special token z_s），训练完成后**冻结编码器**，作为 `model.py` 的编码器进行 **NLP 解码训练**（Qwen 生成中文工地描述/隐患）。
+**项目目标（权威版）**: 通过 **token 压缩**训练编码器的**联想能力**（把图像信息压进少量 special token z_s），训练完成后冻结编码器做 **Phase 2 NLP**（Qwen 生成工地描述/隐患）。像素重建是 Phase 1 的训练脚手架 + "信息保持"直接探针，不是最终目标；验收 = Phase 2 文字生成质量（详见 [`doc/2026-08-28/GOAL_compression_for_nlp.md`](doc/2026-08-28/GOAL_compression_for_nlp.md) §2）。
 
-⚠️ **像素重建是 Phase 1 的训练脚手架 + "信息保持"的直接探针，不是最终目标**——验收标准是 Phase 2 冻结编码器后的文字生成质量。但重建与 NLP **不构成对立**（语义是像素的函数：能还原像素 ⇒ z 携带整图信息 ⇒ 重建质量决定 NLP 天花板）；Phase 1 中间验收 = **K 压缩 × 重建质量**（K=32/64/128 下活信息=布局/物体/边界保真），不追的只是纹理级清晰度（死信息）。`doc/2026-08-27/DIAGNOSIS_clarity.md` 的机制分析在新目标下按 GOAL 文档 §3 重新解读。
+---
 
-Phase 1 架构：DINOv2-large(不冻结) → ReEncoder(因果 specials 前缀链) → OutputQueryDecoder(输出查询注意力 + KV 因果 + 平方采样) → PixelHead → **重建原始像素（脚手架）**。
+## 0. 2026-09-04 仓库整理说明（重要，先读）
 
-当前为最小可运行主干：工地图像素重建（448×252 → 576 patches）。实验文档与历史脚本按日期归档在 `doc/`。
+本次对仓库做了**结构性迁移**，后续分析/复现前请先理解：
 
-## 架构
+| 分支 | 内容 | 说明 |
+|---|---|---|
+| **main**（本分支） | ① **v2 最小可运行代码** ② `doc/` 全部实验/分析文档 | 日常开发/分析主分支 |
+| **test** | main 曾有的**除文档外的全部内容**归档：v1/v3/v4/v5 代码、`run_v2_boundary.sh`、`ds_config_zero2.json`、旧版 README 等 | **历史代码只在这里**（25 个根文件，无 doc/） |
+| dev | **已删除** | 旧"v2 最小可运行集"分支，tip = `04cfc02`（本地安全 tag `pre_reorg_dev`） |
 
-```
-448×252 原图 (1600:900 画布预处理)
-    │
-    ▼  [DINOv2-large, 不冻结]  (304M)
-patch 特征 (B, 577, 1024)
-    │
-    ▼  [ReEncoder 4层]  [cls; specials; patches] 因果 specials 块掩码
-z_cls, z_s (B, 577, 1024)
-    │
-    ▼  [OutputQueryDecoder]  平方采样 25 步, KV 因果前缀
-F_hat (B, 576, 1024) 特征
-    │
-    ▼  [PixelHead]  Linear 1024→588
-像素 patch (B, 576, 588) → 重建 448×252
-```
+- v2 最小可运行集 = `model_v2.py`、`train_v2.py`、`infer_v2_test.py`、`data_v2.py`、`visualize_recon_pixel.py`、`run_v2_train.sh`、`requirements.txt`、`.gitignore`。
+- 其余曾经在 main 的一切（v1 `model.py/train.py`、v3/v4/v5 全套、boundary 实验脚本、deepspeed 配置、旧 README）都移到了 **test**。
+- 文档（`doc/<日期>/…`）**只保留在 main**；test 上没有 doc/。
 
-**目标 = 原始像素 pixel_values**（L1 平权全覆盖，所有采样步 mean）。2026-08-27 重大修复：此前监督 DINO patch 特征会退化（工地图特征空间近常数，学质心即低 L1，假收敛）；像素目标有真实空间结构，强制模型保留空间信息。
+### ⚠️ 迁移可能对后续分析带来的问题 & 解决方案
 
-## 快速开始
+1. **文档里的复现命令引用了 main 上已不存在的文件**：`doc/` 大量实验报告（尤其 2026-09-01/09-02 及更早）的复现命令引用 `train_v3.py / train_v4.py / train_v5.py / infer_v3..5.py / model_v3..5.py / visualize_v3..5.py / run_v2_boundary.sh`（如"按 train_v4.py 配方重训"等），这些文件现在**只在 test 分支**。
+   - 方案：复现历史实验 → `git checkout test` 后在 test 里跑（对照 main 的 doc 阅读）；只取个别文件 → `git show test:<path>` 或 `git checkout test -- <path>`；要基于旧代码开新实验 → `git branch <新分支> test`。
+2. **文档头部标注的代码 commit 与 main 当前 HEAD 可能不一致**：每份报告头部都记录了当时运行代码的 commit（如 `b295016`/`66aa9d2`/`36cf777`）。机制分析/复现时要**以文档头部的 commit 为准**，而不是假设 main HEAD == 当时代码。
+   - 方案：需要"当时的代码" → `git checkout <文档标注的 commit>`（v2 代码全历史都在 main 的分支历史上）；v2 代码自 `b295016` 起语义兼容，`36cf777` 加的 `SRV2_MEMORY_OPEN`（读侧掩码开关）默认关闭、不影响旧配置复现。
+3. **被删/被重写的分支内容**：dev 已删、test 被重写（旧 test tip = `7fdb98a`）。本地保留安全 tag `pre_reorg_dev` / `pre_reorg_test` 可随时找回旧 tip；远程侧被删对象 GitHub 会在一段时间后 GC——需要长期保留时把本地 tag push 回远程，或在整理前 `git clone --mirror` 全量备份。
+4. **文档只留在 main**：在 test 上开发/复现实验后，新的报告与分析**请提交回 main 的 `doc/<日期>/`**（`git checkout main` → 写文档 → push），避免文档在两边分裂；v2 主线代码改动提交回 main，只属于归档代码的改动留 test。
+5. **若将来需要"多代代码同仓"分析**：从 test 取回文件（`git checkout test -- <files>`）或把 test 并入新分支即可；不建议直接改回整理前的 main 结构（会再次混淆"当前 v2 代码"与"历史代码"）。
+
+---
+
+## 1. v2 是什么（本分支保留的代码）
+
+register 式（2026-08-28 起唯一路径，`model_v2.py` 头部 docstring 是权威说明）：
+- specials 作为额外 token 直接拼进 DINOv2-large 输入序列 `[cls; specials(K); patches(N)]`，DINO 24 层全双向算出 z_s（register token 式）。
+- register 数 K（num_specials）与 patch 数 N 解耦：**K 由"最终生效采样步集"自动推导**（`K = min(max_t((⌊√t⌋+1)²−1), N)`，无"花瓶 register"）。
+- 解码器 = OutputQueryDecoder（输出查询注意力 + 分块读侧 mask + 查询自注意力**块因果 tgt_mask** + 2 层 PixelHead MLP）→ 像素重建。
+- 损失 = 每个采样步累加结果的平权全覆盖像素 L1，**梯度按步解耦**；K 压缩（如 K=63）是练联想的主要杠杆。
+- 实验开关：`SRV2_MEMORY_OPEN=1`（读侧掩码全开、仅留因果 mask，2026-09-04 实验用，默认关）。
+
+## 2. 快速开始
 
 ```bash
-# 1. 训练（2 GPU DDP, 全 fp32, 平权, bs16/卡）
+# 训练（2 GPU DDP, 全 fp32; 单卡冒烟加 --smoke --limit 32 --max_steps 3）
 NUM_GPUS=2 ./run_v2_train.sh \
     --data_dir /root/autodl-tmp/construction_site \
     --dino_dir /root/autodl-tmp/models/dinov2-large \
-    --output_dir output/phase1_v2_pixel_fp32 --epochs 40
+    --output_dir output/phase1_v2 --epochs 40
 
-# 2. 推理测试（全量 test, fp32, 像素 L1 + 渐进曲线）
-python infer_v2_test.py \
-    --data_dir /root/autodl-tmp/construction_site \
+# 全量 test 推理（slice 参数必须与训练一致）
+python infer_v2_test.py --data_dir /root/autodl-tmp/construction_site \
     --dino_dir /root/autodl-tmp/models/dinov2-large \
-    --final_model output/phase1_v2_pixel_fp32/final_model.pt \
-    --output output/phase1_v2_pixel_fp32/infer_test.json
-
-# 3. 重建可视化（原图 vs 各采样步）
-python visualize_recon_pixel.py \
-    --data_dir /root/autodl-tmp/construction_site \
-    --dino_dir /root/autodl-tmp/models/dinov2-large \
-    --final_model output/phase1_v2_pixel_fp32/final_model.pt \
-    --out output/phase1_v2_pixel_fp32/recon_visual.png
+    --final_model output/phase1_v2/final_model.pt \
+    --output output/phase1_v2/infer_test.json
 ```
 
-自检: `python model_v2.py`（形状 / 块掩码 / 梯度 / PixelHead / eval 同路径）。
+自检: `python model_v2.py`（形状 / 块掩码 / 梯度 / PixelHead / eval 同路径，应输出 `ALL CHECKS PASSED`）。
 
-## 目录结构
+环境：torch≥2.0 / transformers / accelerate（见 `requirements.txt`）；DINOv2-large 离线权重 + `HF_HUB_OFFLINE=1`（服务器路径 `/root/autodl-tmp/models/dinov2-large`）。
 
-```
-├── model_v2.py               # 核心模型（像素目标, 平权损失）
-├── data_v2.py                # 数据管线（1600:900 画布 → 448×252）
-├── train_v2.py               # 训练（HF Trainer, fp32, 平权, bs16）
-├── run_v2_train.sh           # 训练入口（NUM_GPUS=n）
-├── infer_v2_test.py          # 推理测试（像素 L1 + 渐进曲线）
-├── visualize_recon_pixel.py  # 重建可视化
-├── model.py / train.py       # v1 模型（SVD 思路, 存档）
-└── doc/                      # 实验文档与历史脚本（按日期归档）
-    ├── 2026-08-26/           # 第一轮: 特征目标 + 泄露排查 + 交接文档
-    ├── 2026-08-27/           # 像素目标训练 + 清晰度诊断
-    └── 2026-08-28/           # register 训练 + 目标权威版 + **最新交接文档**
-```
+## 3. 文档导航（doc/ 按日期归档，读最新在前）
 
-> 📌 **新会话请先读 [`doc/2026-08-28/HANDOFF_PROMPT.md`](doc/2026-08-28/HANDOFF_PROMPT.md)**——
-> 含项目目标、环境（服务器/数据/模型）、三轮实验脉络摘要、当前结论与下一步、已知坑，无需再向用户反复询问背景。
-
-## 已知结果（2026-08-27 像素目标版，脚手架口径）
-
-> 按项目目标（GOAL 文档 §2），以下像素指标是**训练压力/信息保持探针**的度量，
-> 本身不是最终验收标准；验收标准是 Phase 2 冻结编码器后的 NLP 文字生成质量。
-> Phase 1 中间验收 = K 压缩 × 重建质量（活信息保真），见 GOAL 文档 §2/§5。
-
-- 全量重建像素 L1 (0-255) = **23.41**（全图平均色参照 ≈61，改善 2.6×）→ 像素目标修复成功，编码器确实保留了空间信息
-- 渐进曲线: t=0（仅 1 键）L1=60（粗糙）→ t≥1 L1=22.7（精细）→ **联想能力已成立**（2 键≈577 键）
-- 重建偏平滑（边缘 ≈ 原图 1/3）：差距主要是块内高频纹理——按文献 [3] 属**死/冗余信息**，纹理级清晰度**不追**；但**活信息（布局/物体/边界）保真是 Phase 1 核心验证**（K 压缩 × 重建质量实验）；机制分析见 `doc/2026-08-27/DIAGNOSIS_clarity.md`，重新解读见 GOAL 文档 §3
-- 未决: 压缩率 K（32/64/128）、DINO 冻结策略、是否叠加文字 CE——见 GOAL 文档 §4
-
-## 环境
-
-- torch ≥ 2.12, transformers 5.x, accelerate, datasets, safetensors（`requirements.txt`）
-- 数据: parquet（image 列），预处理确定性（最优角旋转 + 等比缩放 + 1600:900 填充）
-- 模型: DINOv2-large（ModelScope 下载, `/root/autodl-tmp/models/dinov2-large`）
+- 权威目标: `doc/2026-08-28/GOAL_compression_for_nlp.md`
+- 全版本机制分析（"为什么曲线全平"、下一步选项）: `doc/2026-09-03/ANALYSIS_v2_story_and_next.md`、`doc/2026-09-04/ANALYSIS_v2_three_configs.md`
+- 最新实验（2026-09-04）: `doc/2026-09-04/REPORT_v2_block_slice05.md`（K=35 分块读，L1 20.55）、`doc/2026-09-04/REPORT_v2_slice05_memory_open.md`（读侧全开训练塌缩）、`doc/2026-09-04/ANALYZE_v2_slice05_exp1_leakage.md`（泄露专项探针）
+- 历史版本（v1/v3/v4/v5）代码与复现入口: 见 **test** 分支（本文档 §0）
