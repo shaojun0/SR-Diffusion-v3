@@ -10,10 +10,8 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
 架构（model_v2.py, register 式唯一路径）: DINOv2-large(参数不冻结) +
     register specials(K) 直接拼进输入序列 [cls; specials(K); patches(N)]
     (1+K+N token, 全双向) → OutputQueryDecoder（输出查询注意力 + 分块掩码 +
-    平方采样计划）→ PixelHead → **像素 patch 预测**, 分区掩码 L1 重建原始
-    像素 pixel_values（非 DINO 特征; 2026-09-07 起默认, 第 t 步只监督自己
-    的 patch 区域, --region_loss False 回退旧"每步整图"平权全覆盖）。
-    无 TextDecoder、无 ReEncoder。
+    平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
+    重建原始像素 pixel_values（非 DINO 特征）。无 TextDecoder、无 ReEncoder。
     register 数 K = num_specials 与 patch 数 N 解耦: 默认（--num_specials 0）
     由**最终生效采样步集**自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
     ——编码器 register 数 = 解码器实际读的范围, 不存在"花瓶 register"
@@ -50,28 +48,6 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
       patch 数。
     · model_info.json 记录 num_specials（推理/可视化按它对齐权重形状——
       K 错了 checkpoint 形状就对不上, strict load 即崩）与 decoder_steps。
-
-2026-09-07（分区掩码损失 region_loss, P1 首次实现; Qwen 审计确认此前历史
-    每一版都是 target.expand_as(Y_pix) 的"每步累加监督整图", 分区损失从未
-    实现过）:
-    · 训练损失从"第 t 步的累加结果还原整幅图"改为"第 t 步只还原自己的
-      patch 区域": region t = [⌊N·t/T⌋, ⌊N·(t+1)/T⌋)（N 个 patch 行按
-      升序步索引 t=0..T-1、T=|steps| 均分, 互不相交/大小差 ≤1）,
-      loss = mean_t mean_{B,region_t,588} |Y_pix_cum[:,t,region_t] −
-      target_pix[:,region_t]| ——每步有私有目标, 打破"step-1 独扛整图、
-      后步最优=零增量"的自锁均衡（动机见 doc/2026-09-07/
-      ANALYSIS_k3_why_later_steps_zero.md P1; 规格/风险见同目录
-      DESIGN_v2_region_loss.md; 实现在 model_v2.py region_slices /
-      SRPhase1V2.decode）。
-    · --region_loss（默认 True; False = 旧"每步整图"损失, 逐位复现历史
-      行为, A/B 对照/逃生口）。写进 model_info.json（与 memory_open 当年
-      的写法一致; 推理侧按 model_info 对齐——该开关只影响 loss 口径,
-      不进权重, 推理输出 F_hat/Y_pix/渐进曲线逐位不变）。
-    · eval 口径变化: eval_loss = 模型 forward 的 "loss"（与训练同口径）,
-      region_loss=True 下为**分区口径均值, 与历史 eval 数值（0.5037/
-      1.1394 等, 旧损失下 ≈ 全图 L1）不可直接对比**; 历史对比一律用
-      **eval_recon**（= recon = 全图 F_pix L1, 归一化空间, 口径自始未变,
-      compute_metrics 已输出, 见下方 Eval 指标段注释）。
 
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
@@ -117,19 +93,6 @@ from model_v2 import SRPhase1V2
 # CLI
 # ═══════════════════════════════════════════════════════════════
 
-def _str2bool(v) -> bool:
-    """布尔 CLI 参数解析（默认 True 的开关用: --region_loss false/0/no 关闭）。"""
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    raise argparse.ArgumentTypeError(
-        f"期望布尔值 (true/false/1/0/yes/no), got {v!r}")
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="train phase1 v2 (DINOv2-large unfrozen, OutputQueryDecoder)")
     p.add_argument("--data_dir", required=True, help="parquet 目录(train-*.parquet)")
@@ -173,15 +136,6 @@ def parse_args():
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(N) "
                         "(分块起点=平方数) 再按 slice 切片; K 自动由最终步集推导")
-    # ── 损失（2026-09-07 分区掩码损失 P1; 见 doc/2026-09-07/DESIGN_v2_region_loss.md）──
-    p.add_argument("--region_loss", type=_str2bool, nargs="?", const=True,
-                   default=True,
-                   help="True(默认)=分区掩码损失: 第 t 步累加结果只监督还原自己的 "
-                        "patch 区域 region t=[⌊N·t/T⌋,⌊N·(t+1)/T⌋) "
-                        "(model_v2.region_slices); False=旧'每步整图'平权损失"
-                        "(逐位复现历史行为, A/B 对照/逃生口)。只影响 loss/"
-                        "eval_loss 口径; F_hat/Y_pix/推理输出逐位不变。"
-                        "用法: --region_loss / --region_loss false")
     return p.parse_args()
 
 
@@ -190,17 +144,6 @@ def parse_args():
 # 把输出 dict 按插入序转成值的元组 (loss, recon, F_hat)（多 batch 后是
 # 拼接数组的元组; 4.x 与 5.x 行为一致）。该路径 loss=None, eval loop 不会
 # 自动算 eval_loss, 所以在这里显式从模型输出里取 loss / recon。
-#
-# 口径（2026-09-07 region_loss 起, 重要）:
-#   · eval_loss = 模型 forward 的 "loss"（SRPhase1V2Trainer.can_return_loss
-#     =True → eval 走 compute_loss 路径）——与训练损失同口径:
-#     region_loss=True（默认）下 = **分区掩码口径**（各步只在自己区域上的
-#     L1 的均值）, 与历史 eval_loss 数值（如 0.5037/1.1394——旧"每步整图"
-#     损失下 ≈ 全图 L1）**不可直接对比**;
-#   · eval_recon = recon = **全图 F_pix L1（归一化空间）**——口径自始未变,
-#     与历史数值对比一律用它（旧损失下两者几乎相等, 佐证: posenc 证据
-#     json 里 eval_loss 1.1394238 / eval_recon 1.1394248）。本函数从
-#     prediction_step 的元组里显式取 recon 报告, 机制未改动。
 # ═══════════════════════════════════════════════════════════════
 
 def compute_metrics(eval_pred):
@@ -296,8 +239,7 @@ def main():
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
-                       num_specials=(args.num_specials or None),
-                       region_loss=args.region_loss)
+                       num_specials=(args.num_specials or None))
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -313,12 +255,6 @@ def main():
               f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
-    print(f"[model] 损失口径: region_loss={args.region_loss} "
-          + ("（分区掩码: 第 t 步只监督自己的 patch 区域 region t="
-             "[⌊N·t/T⌋,⌊N·(t+1)/T⌋); eval_loss 同口径, 与历史数值对比"
-             "请看 eval_recon=全图 F_pix L1）" if args.region_loss else
-             "（旧'每步整图'平权损失, 逐位复现历史行为; eval_loss ≈ 全图"
-             "口径, 可与历史数值直接对比）"))
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -393,10 +329,6 @@ def main():
                 "decoder_depth": args.decoder_depth,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
-                "region_loss": bool(args.region_loss),
-                # ↑ 分区掩码损失开关（2026-09-07, 与当年 memory_open 的写法
-                # 一致）: 只影响训练/eval 的 loss 口径, 不进权重形状; infer
-                # 侧按 model_info 对齐, 缺字段 = 旧产物 = 旧"每步整图"口径
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:

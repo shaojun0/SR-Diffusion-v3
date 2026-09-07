@@ -32,16 +32,6 @@ SR-Diffusion Phase 1 v2 — register 式推理测试（像素目标版, 2026-08-
       自动推导, 公式同 derive_num_specials）; 都没有 = 全量默认 K=N。
       K 必须与 final_model.pt 权重形状一致, 否则 strict load 直接崩。
 
-2026-09-07（region_loss 最小兼容）:
-    · 训练侧新增分区掩码损失开关 region_loss（默认 True, 见 model_v2.py /
-      doc/2026-09-07/DESIGN_v2_region_loss.md）。它**只影响 out["loss"]
-      口径**: 推理输出 F_hat/Y_pix/target_pix（全量 L1、渐进曲线）与损失
-      无关, 逐位不变——本脚本的指标全部由 F_hat/Y_pix 直接算 L1, 不读
-      out["loss"], 因此推理数值不受任何影响。为口径一致性, 构造模型时按
-      model_info.json 的 region_loss 对齐（与 memory_open 当年的对齐方式
-      一致）; **缺字段 = 旧产物**（分区损失此前从未实现, Qwen 审计结论,
-      历史每版均为"每步整图"损失）→ region_loss=False 复现旧口径。
-
 用法:
     python infer_v2_test.py \
         --data_dir /root/autodl-tmp/construction_site \
@@ -150,14 +140,6 @@ def main():
               f"K=N={num_patches}）: 若 strict load 形状不符, 请显式 "
               f"--num_specials {num_patches}")
 
-    # ── region_loss 对齐（2026-09-07, 最小兼容）: model_info.json 优先;
-    # 缺字段 = 旧产物（分区损失此前从未实现, 历史每版均为"每步整图"损失）
-    # → False 复现旧口径。只影响 out["loss"]（本脚本不读）, 推理输出
-    # F_hat/Y_pix/渐进曲线与它无关, 逐位不变; 不进权重, strict load 不受影响。
-    region_loss = (bool(train_info["region_loss"])
-                   if train_info is not None and "region_loss" in train_info
-                   else False)
-
     # ── 模型: 训练好的重建权重 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     if getattr(dino.config, "use_mask_token", False):
@@ -170,8 +152,7 @@ def main():
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
-                       num_specials=num_specials,
-                       region_loss=region_loss)
+                       num_specials=num_specials)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -180,9 +161,6 @@ def main():
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
-    print(f"[model] region_loss={model.region_loss}（按 model_info.json 对齐, "
-          f"缺字段=旧产物=False; 只影响 out['loss'] 口径, 本脚本推理指标 = "
-          f"全图 F_pix/Y_pix L1, 与之无关）")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
     if train_info is not None:
