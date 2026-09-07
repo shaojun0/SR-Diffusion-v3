@@ -41,7 +41,16 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
                     （掩码列数 = K+1）; 查询自注意力块因果（tgt_mask:
                     步 t 只 attend 步 ≤ t 的查询行, 防后步查询内容泄露进
                     前步输出）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
-    L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
+    L = mean_t L1(cumsum_t(Y)|region_t, patch|region_t)   ← 分区掩码损失
+        （2026-09-07 起默认, 首次实现——此前历史每版均为"每步累加监督
+        整图" L = mean_n L1(cumsum_n(Y_t), patch), Qwen 审计结论）。
+        region t = [⌊N·t/T⌋, ⌊N·(t+1)/T⌋): N 个 patch 行按升序步索引
+        t=0..T-1（T=|steps|）均分成互不相交的连续区（大小差 ≤1）——第 t 步
+        的累加结果只监督还原自己的区域, 每步有私有目标（构造参数
+        region_loss 控制: False 逐位复现旧"每步整图"损失, 供对照; 见
+        region_slices / SRPhase1V2.decode / doc/2026-09-07/
+        DESIGN_v2_region_loss.md, 动机引 ANALYSIS_k3_why_later_steps_zero
+        .md P1）。
         （梯度按步解耦: carry 整体 detach + 自己的预测——每步恰收 1 份梯度,
         避免"t=0 收 |T| 份梯度"的三角失衡; 见 SRPhase1V2.decode）
 
@@ -272,6 +281,27 @@ def build_causal_query_mask(num_steps: int, num_queries: int,
     return m
 
 
+# ═══ region_slices — 分区掩码损失的 patch 行区间划分（步 t ↔ region t）═══
+
+def region_slices(num_patches: int, num_steps: int) -> list:
+    """把 N 个 patch 行均分成 T=|steps| 个互不相交的连续区（升序步索引 t=0..T-1）。
+
+    region t = [floor(N·t/T), floor(N·(t+1)/T))，用整数除法 (N*t)//T 计算
+    （无浮点舍入误差）。性质: 互不相交、连续覆盖 0..N-1、区间大小差 ≤ 1;
+    N ≥ T 时每区非空（N < T 会出现空区, 空区 mean = NaN, 调用方须断言）。
+    例: N=576, T=5 → [(0,115),(115,230),(230,345),(345,460),(460,576)]
+        （大小 115×4 + 116）; N=16, T=4 → 每区 4 行; T=1 → [(0,N)] 退化整图。
+
+    用途: SRPhase1V2.decode(region_loss=True)——第 t 步的累加结果只监督
+    还原自己区域的行（每步私有目标, 打破"step-1 独扛整图、后步最优=零"
+    的均衡; 见 doc/2026-09-07/DESIGN_v2_region_loss.md 与
+    ANALYSIS_k3_why_later_steps_zero.md P1）。
+    """
+    N, T = int(num_patches), int(num_steps)
+    assert T >= 1, f"num_steps 须 ≥ 1, got {T}"
+    return [((N * t) // T, (N * (t + 1)) // T) for t in range(T)]
+
+
 # ═══ PixelHead — 特征 → 像素 patch 解码头 ═══
 
 class PixelHead(nn.Module):
@@ -321,8 +351,10 @@ class OutputQueryDecoder(nn.Module):
       自定义（原样不切片）。未采样时刻不参与损失, 也不出现在 F_hat 累加里。
       注意: SRPhase1V2 会先按 N 计划选好步再以显式 steps 传入（两处结果
       一致, 见 select_steps 的 docstring）
-    · 覆盖语义: 每个采样时刻都预测全部 N 个 patch, 其累加结果都被监督
-      还原全部 patch
+    · 覆盖语义: 每个采样时刻都预测全部 N 个 patch（结构不变）; 监督口径由
+      SRPhase1V2.region_loss 决定: True（默认）= 第 t 步累加结果只监督
+      region t 的行（分区掩码, 见 region_slices）; False = 旧"每步累加
+      结果都监督还原全部 patch"
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
@@ -398,6 +430,16 @@ class SRPhase1V2(nn.Module):
     ≤ t 的查询行（同步内全双向）, 后步查询内容不泄露进前步输出——渐进
     语义由 memory_mask（读侧）+ tgt_mask（查询侧）双重保证（见
     OutputQueryDecoder / build_causal_query_mask）。
+
+    region_loss（2026-09-07 起默认 True, 首次实现; Qwen 审计确认此前历史
+    每版均为"每步累加监督整图"）: True = **分区掩码损失**——第 t 步的累加
+    结果只监督还原 region t = [⌊N·t/T⌋, ⌊N·(t+1)/T⌋) 的 patch 行（每步
+    私有目标, 动机/规格见 doc/2026-09-07/DESIGN_v2_region_loss.md 与
+    ANALYSIS_k3_why_later_steps_zero.md P1）; False = 旧"每步整图"平权
+    损失（逐位复现旧行为, 供 A/B 对照）。该开关**只影响 "loss" 口径**——
+    recon 与前向输出 F_hat/Y_pix/target_pix 与之无关, 逐位不变;
+    它是**普通 python 属性**（非 buffer/parameter）, 不进 state_dict,
+    旧 checkpoint 仍可 strict 加载。
     """
 
     def __init__(
@@ -413,12 +455,16 @@ class SRPhase1V2(nn.Module):
         skip_steps: Optional[int] = None,
         max_steps: Optional[int] = None,
         num_specials: Optional[int] = None,
+        region_loss: bool = True,
     ):
         super().__init__()
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
         self.patch_px = patch_px
+        # 分区掩码损失开关: 普通 python 属性（不是 buffer/parameter）,
+        # 不进 state_dict——旧 checkpoint strict 加载不受影响
+        self.region_loss = bool(region_loss)
 
         # 最终生效采样步集: 先按 N 计划选步（K 尚未推导; 与 train/infer
         # CLI 的 slice 索引口径一致, 见 select_steps）; K = 显式 num_specials
@@ -478,7 +524,7 @@ class SRPhase1V2(nn.Module):
 
     # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
-        """解码器 + 像素头 + 平权全覆盖像素 L1。
+        """解码器 + 像素头 + 像素 L1（region_loss 开关选损失口径）。
 
         **累加语义**: Y_cum[:, n] = Σ_{t≤n} Y_t（特征空间累加再统一过
         PixelHead——PixelHead 含 bias, 先投影再累加会重复加 bias）。
@@ -486,10 +532,23 @@ class SRPhase1V2(nn.Module):
         carry = [0, cumsum(Y)[:-1]] 整体 detach + 自己的预测——每个 Y_t 只
         从自己那一步的损失收 1 份梯度（平权 1/|T|）, 不再从所有 ≥t 的
         累加位置收梯度（否则 t=0 有 |T| 份梯度动力, 学乱）。
+        **损失口径**（region_loss, 均归一化像素空间 / 步间平权 / reduction
+        ="none" 再取均值——与旧损失同空间同风格）:
+        · True（默认, 2026-09-07 首次实现）= **分区掩码损失**: 第 t 步只
+          对自己 region t = [⌊N·t/T⌋, ⌊N·(t+1)/T⌋) 的行计算
+          mean |Y_pix_cum[:, t, region_t] − target_pix[:, region_t]|
+          （对 (batch, region 行, 588) 取均值）, loss = 各步区域损失的均值
+          ——每步有 step-1 抢不走的私有目标（见 DESIGN_v2_region_loss.md）。
+        · False = 旧"每步整图"损失: 每步累加结果都监督还原全部 patch,
+          loss = mean_t mean_{B,N,588} |Y_pix_cum[:, t] − target_pix|
+          （逐位复现历史行为, 供 A/B 对照）。
+        recon = 全图 L1(F_pix, target_pix) 保持不变（监控用, 全图口径,
+        与历史 eval 数值可比）。
 
         dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步累加
         像素 B,|T|,N,588), "target_pix"(B,N,588)}——训练取 loss; 推理取
-        F_hat / Y_pix / target_pix（全量 L1、渐进曲线、可视化同一路径）。
+        F_hat / Y_pix / target_pix（全量 L1、渐进曲线、可视化同一路径,
+        与 region_loss 无关）。
         """
         x = pixel_values
         B, C, H, W = x.shape
@@ -506,11 +565,23 @@ class SRPhase1V2(nn.Module):
         Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y   # (B,|T|,N,D)
         Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
         F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
-        # 平权全覆盖损失: 每个采样步的累加结果都还原全部 patch 像素
-        per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
-                             reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
-        loss = per_step.mean()                          # 平权
-        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
+        T = Y_pix.shape[1]                              # |steps|（升序步索引 t=0..T-1）
+        if self.region_loss:
+            # 分区掩码损失: 第 t 步只对自己 region 的行还原（每步私有目标）。
+            # N < T 会有空区（空 tensor 的 mean = NaN）, 快速失败
+            assert N >= T, \
+                f"region_loss 需 N({N}) ≥ 步数 T({T}): 否则存在空区域, 损失为 NaN"
+            per_step = torch.stack([
+                F.l1_loss(Y_pix[:, t, lo:hi], target_pix[:, lo:hi],
+                          reduction="none").mean()      # (B, region 行, 588) 均值
+                for t, (lo, hi) in enumerate(region_slices(N, T))])   # (|T|,)
+        else:
+            # 旧"每步整图"平权全覆盖损失（逐位复现历史行为, 对照用）:
+            # 每个采样步的累加结果都还原全部 patch 像素
+            per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
+                                 reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
+        loss = per_step.mean()                          # 步间平权
+        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间, 全图口径不变）
         return {"loss": loss, "recon": recon, "F_hat": F_pix,
                 "Y_pix": Y_pix, "target_pix": target_pix}
 
@@ -521,9 +592,11 @@ class SRPhase1V2(nn.Module):
 
         监督**原始像素**而非 DINO patch 特征（特征目标退化: 工地图特征
         空间近常数, 学质心即低 L1 是假收敛）。H,W 须为 14 的倍数。
-        损失: 每个采样步的**累加结果**都监督还原全部 patch —— 平权全覆盖
-        L = mean_n L1(cumsum_n Y_pix, target_pix)。F_hat = Σ_t Y_t → 像素;
-        recon 仅作监控。
+        损失（region_loss=True 默认）: **分区掩码**——第 t 步的累加结果只
+        监督还原 region t 的行, L = mean_t L1(cumsum_t Y_pix|region_t,
+        target_pix|region_t); region_loss=False 回退旧"每步整图"
+        L = mean_n L1(cumsum_n Y_pix, target_pix)（见 decode）。
+        F_hat = Σ_t Y_t → 像素; recon 仅作监控（全图口径不变）。
         """
         x = pixel_values                                # (B,3,H,W)
         B, C, H, W = x.shape
@@ -537,9 +610,11 @@ class SRPhase1V2(nn.Module):
 
 # ═══ 自检（python model_v2.py）═══
 #   1. 形状正确性（register 式全路径）
-#   2. OutputQueryDecoder 分块采样计划 + 分块掩码结构
+#   2. OutputQueryDecoder 分块采样计划 + 分块掩码结构 + 分区掩码损失数值
+#      自洽（region_loss=True 默认: 损失 == 手工按区域掩码的均值;
+#      region_loss=False: 逐位复现旧"每步整图"损失; 开关不改前向数值）
 #   3. 梯度流向（整模型可训）+ 梯度按步解耦（Y_cum 数值==cumsum, 每步只收
-#      自己那一步的梯度）
+#      自己那一步的损失梯度, 且只落在自己 region 的行上）
 #   4. eval 同路径
 
 if __name__ == "__main__":
@@ -676,9 +751,41 @@ if __name__ == "__main__":
     assert torch.allclose(Y_cum, Y.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
         "梯度解耦构造数值上应≈原 cumsum（float32 求和顺序噪声内）"
     assert torch.isclose(out["F_hat"], Y_pix[:, -1]).all(), "F_hat 应为各步像素累加和"
-    per = F.l1_loss(Y_pix, target.unsqueeze(1).expand_as(Y_pix),
-                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步累加结果
-    assert torch.isclose(out["loss"], per.mean()), "loss 应为累加结果平权 L1"
+    # ── 分区掩码损失（region_loss=True 默认, 2026-09-07 首次实现）数值自洽 ──
+    # 区域划分定义: region t = [⌊N·t/T⌋, ⌊N·(t+1)/T⌋), 互不相交/连续覆盖
+    # 0..N-1/大小差 ≤1（本配置 N=16, T=4 → 每区 4 行）
+    regs = region_slices(N, len(T_steps))
+    assert regs == [(0, 4), (4, 8), (8, 12), (12, 16)], regs
+    assert regs[0][0] == 0 and regs[-1][1] == N, "区域应连续覆盖 0..N-1"
+    assert all(regs[i][1] == regs[i + 1][0] for i in range(len(regs) - 1)), \
+        "区域应互不相交且无缝衔接"
+    _sz = [hi - lo for lo, hi in regs]
+    assert max(_sz) - min(_sz) <= 1, _sz
+    # 非整除/退化例核对（权威规格: N=576, T=5 → 115×4 + 116; T=1 → 整图）
+    assert region_slices(576, 5) == [(0, 115), (115, 230), (230, 345),
+                                     (345, 460), (460, 576)]
+    assert region_slices(17, 4) == [(0, 4), (4, 8), (8, 12), (12, 17)]
+    assert region_slices(8, 1) == [(0, 8)], "T=1 应退化为整图"
+    # 随机固定输入上: 模型损失 == 手工按区域掩码计算的均值（无外部数据依赖）
+    per_region = torch.stack([
+        F.l1_loss(Y_pix[:, t, lo:hi], target[:, lo:hi],
+                  reduction="none").mean()               # 第 t 步只算自己区域
+        for t, (lo, hi) in enumerate(regs)])             # (|T|,)
+    assert torch.isclose(out["loss"], per_region.mean()), \
+        "region 损失应 = 各步'只在自己区域上的 L1'的均值（步间平权）"
+    # region_loss=False: 逐位复现旧"每步整图"平权损失（对照/逃生口）
+    model.region_loss = False
+    with torch.no_grad():
+        out_full = model(x)
+    per_full = F.l1_loss(out_full["Y_pix"],
+                         target.unsqueeze(1).expand_as(out_full["Y_pix"]),
+                         reduction="none").mean(dim=(0, 2, 3))   # (|T|,) 每步整图
+    assert torch.isclose(out_full["loss"], per_full.mean()), \
+        "region_loss=False 时 loss 应 = 每步整图平权 L1（旧行为）"
+    assert torch.equal(out_full["F_hat"], out["F_hat"]) and \
+        torch.equal(out_full["Y_pix"], out["Y_pix"]), \
+        "损失开关不得改变前向数值（F_hat/Y_pix 逐位不变）"
+    model.region_loss = True                             # 恢复默认, 后续段用
     # 计划自动适配任意 N（可扩展性）: 12→3 块, 256→16 块, 512→22 块
     assert square_block_starts(12) == [1, 4, 9], square_block_starts(12)
     assert len(square_block_starts(256)) == 16
@@ -713,8 +820,11 @@ if __name__ == "__main__":
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
           f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
           f"+ 分块掩码(示例核对, 第一个步可见[0,1]) + 可选挑选 [4:9]={d_slice.steps} "
-          f"+ 查询自注意力块因果(步 t 只见步 ≤t) "
-          f"+ 累加结果像素损失正确")
+          f"+ 查询自注意力块因果(步 t 只见步 ≤t)")
+    print(f"[ok] 分区掩码损失: region(N={N},T={len(T_steps)})={regs} "
+          f"loss={out['loss'].item():.4f} == 手工区域掩码均值; "
+          f"region_loss=False 逐位复现旧每步整图损失 "
+          f"loss={out_full['loss'].item():.4f}, 前向数值不变")
 
     # ── 2b. num_specials(K) 与 N 解耦: K 由最终采样步集自动推导（无花瓶）──
     # derive_num_specials 公式核对（权威示例）
@@ -799,11 +909,13 @@ if __name__ == "__main__":
     print(f"[ok] 梯度: DINO 嵌入/层 + OutputQueryDecoder({len(model.decoder.stack.layers)}×"
           f"TransformerDecoderLayer,query_base)/SpecialTokenBank/PixelHead 全部可训")
 
-    # ── 3b. 梯度按步解耦 ──
-    # 数值上 Y_cum == cumsum(Y)（F_hat/损失语义不变）; 但 dL/dY_t 只来自
+    # ── 3b. 梯度按步解耦（region 口径）──
+    # 数值上 Y_cum == cumsum(Y)（F_hat/累加语义不变）; 但 dL/dY_t 只来自
     # 第 t 步自己的损失项——每步平权 1 份梯度, 不再有"t=0 收 |T| 份"的
     # 三角失衡。校验: (a) 数值恒等; (b) 全量梯度在位置 n == 仅第 n 步损失
-    # 的梯度(÷|T|); (c) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）。
+    # 的梯度(÷|T|); (c) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）;
+    # (d) region_loss 新增: 第 n 步损失在 Y_n 内部也只落在 region n 的行上
+    # （PixelHead 逐行 + carry detach ⇒ 非本步区域行梯度精确为 0）。
     out_b = model(x)
     Y_b = model.decoder.last_Y                              # (B,|T|,N,D)
     Tb = Y_b.shape[1]
@@ -812,9 +924,13 @@ if __name__ == "__main__":
     assert torch.allclose(Y_cum_b, Y_b.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
         "梯度解耦后 Y_cum 数值上应≈原 cumsum（float32 求和顺序噪声内）"
     assert torch.isclose(out_b["F_hat"], out_b["Y_pix"][:, -1]).all()
-    per_b = F.l1_loss(out_b["Y_pix"],
-                      out_b["target_pix"].unsqueeze(1).expand_as(out_b["Y_pix"]),
-                      reduction="none").mean(dim=(0, 2, 3))     # (|T|,) 每步损失
+    regs_b = region_slices(N, Tb)
+    per_b = torch.stack([
+        F.l1_loss(out_b["Y_pix"][:, n, lo:hi],
+                  out_b["target_pix"][:, lo:hi], reduction="none").mean()
+        for n, (lo, hi) in enumerate(regs_b)])              # (|T|,) 每步区域损失
+    assert torch.isclose(out_b["loss"], per_b.mean()), \
+        "loss 应为各步区域损失的平权均值"
     g_total = torch.autograd.grad(out_b["loss"], Y_b, retain_graph=True)[0]
     for n in range(Tb):
         g_n = torch.autograd.grad(per_b[n] / Tb, Y_b,
@@ -825,8 +941,12 @@ if __name__ == "__main__":
             f"step {n} 的损失不应给其他步的预测梯度"
         assert torch.allclose(g_total[:, n], g_n[:, n], atol=1e-5), \
             f"step {n} 的 Y 梯度应只来自自己那一步的损失（平权 1/{Tb}）"
-    print(f"[ok] 梯度按步解耦: Y_cum 数值==cumsum(F_hat 不变), "
-          f"每步 Y_t 恰收 1/{Tb} 份梯度（不再三角失衡）")
+        lo_n, hi_n = regs_b[n]
+        g_out = torch.cat([g_n[:, n, :lo_n], g_n[:, n, hi_n:]], dim=1)
+        assert torch.allclose(g_out, torch.zeros_like(g_out), atol=1e-6), \
+            f"step {n} 的损失只应给 region [{lo_n},{hi_n}) 行梯度"
+    print(f"[ok] 梯度按步解耦(region 口径): Y_cum 数值==cumsum(F_hat 不变), "
+          f"每步 Y_t 恰收 1/{Tb} 份梯度且只落在 region {regs_b} 自己的行上")
 
     # ── 4. 推理: 同一 forward（eval + no_grad）──
     model.eval()
