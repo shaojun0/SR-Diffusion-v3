@@ -45,6 +45,12 @@ def parse_args():
                    help="分块切片起点(与训练 --slice_start 一致); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
                    help="分块切片终点(与训练 --slice_end 一致); 默认 None = 全部分块")
+    p.add_argument("--query_mask_mode", default=None,
+                   choices=("causal", "blockdiag"),
+                   help="解码器查询自注意力掩码模式(必须与训练一致)。默认取 "
+                        "model_info.json 记录值; 无记录(2026-09-10 之前的旧产物)则 "
+                        "causal(当时的历史行为)。本项不改权重形状 → 错了不报错, "
+                        "只会静默画错")
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
@@ -94,6 +100,24 @@ def main():
               f"产物, K=N={num_patches}）: 若 strict load 形状不符, 请 "
               f"显式 --num_specials {num_patches}")
 
+    # query_mask_mode 对齐（与 num_specials 同理, 且**更隐蔽**）:
+    # 本项不改变任何权重形状 ⇒ 模式错了 strict load 不报错, 只会静默画错图。
+    # 训练侧默认自 2026-09-10 起为 blockdiag; 无该字段的产物一律是此前用
+    # causal 训的, 故 fallback 取 causal（历史行为）。
+    if train_info is not None and "query_mask_mode" in train_info:
+        qmm = str(train_info["query_mask_mode"])
+    elif args.query_mask_mode:
+        qmm = args.query_mask_mode
+    else:
+        qmm = "causal"
+        if train_info is not None:
+            print("[info] model_info.json 无 query_mask_mode 字段（2026-09-10 之前的"
+                  "旧产物）: 按当时的历史行为 causal 构造")
+        else:
+            print(f"[warn] 无 {info_path}: 无法判断训练时掩码模式, 按历史行为 causal "
+                  f"构造; 若该权重是 2026-09-10 之后训练的, 请显式传 "
+                  f"--query_mask_mode blockdiag")
+
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
@@ -103,7 +127,8 @@ def main():
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
-                       num_specials=num_specials)
+                       num_specials=num_specials,
+                       query_mask_mode=qmm)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)

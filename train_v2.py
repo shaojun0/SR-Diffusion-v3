@@ -128,17 +128,20 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
-    p.add_argument("--query_mask_mode", default="causal",
+    p.add_argument("--query_mask_mode", default="blockdiag",
                    choices=("causal", "blockdiag"),
-                   help="解码器查询自注意力掩码语义。causal(默认, 历史行为)=块下三角, "
-                        "步 t 可见步 ≤ t 的查询行: 信息沿步前进单向流动, 但『前步→后步』"
-                        "泄露被允许 → 步 t 的实际依赖集是累积前缀(之前所有块的整块), "
-                        "且 loss 跨步梯度回流存在。blockdiag=块对角, 每步只 attend 自己那 "
-                        "N 行: 步间在自注意力上完全隔离, memory_mask 的『每步只见自己的 "
-                        "z_s 块』在整条前向路径上字面成立, 跨步梯度回流切断(与 decode 的 "
-                        "carry.detach() 合起来 = 每步只从自己那一步的损失收梯度)。"
+                   help="解码器查询自注意力掩码语义。**默认 blockdiag**。"
+                        "blockdiag=块对角, 每步只 attend 自己那 N 行: 步间在自注意力上完全"
+                        "隔离, memory_mask 的『每步只见自己的 z_s 块』在整条前向路径上字面成立, "
+                        "跨步梯度回流切断(与 decode 的 carry.detach() 合起来 = 每步只从自己那一步"
+                        "的损失收梯度); 步间前向信息流动被移除(模型从『5 步串行共享权重的循环结构』"
+                        "变为『5 个共享权重的并行预测头 + 输出累加』)。"
+                        "causal=历史行为(3151bab 之前的全部产物), 块下三角: 步 t 可见步 ≤ t 的查询行, "
+                        "信息沿步前进单向流动, 但『前步→后步』泄露被允许 → 步 t 的实际依赖集是"
+                        "累积前缀(之前所有块的整块), 且 loss 跨步梯度回流存在。"
                         "两者都不破坏渐进语义(渐进性由读侧 memory_mask 的列数单调递增提供)。"
-                        "不改变任何权重形状, 旧 checkpoint 双向可载, 但**必须与训练时一致**")
+                        "**复现历史结果必须显式传 causal**。不改变任何权重形状 ⇒ 旧 checkpoint "
+                        "双向可载, 但模式错了不会报错、只会静默算错(消费方以 model_info.json 为准)")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -268,7 +271,8 @@ def main():
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
     print(f"[model] 查询自注意力掩码 query_mask_mode={model.query_mask_mode} "
-          f"({'块下三角, 步间单向可见' if model.query_mask_mode == 'causal' else '块对角, 步间自注意力隔离'})")
+          f"({'块对角, 步间自注意力隔离(默认)' if model.query_mask_mode == 'blockdiag' else '块下三角, 步间单向可见(历史行为)'})"
+          f"{'  ← 非默认: 复现历史结果用' if model.query_mask_mode != 'blockdiag' else ''}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:

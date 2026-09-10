@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from model_v2 import (OutputQueryDecoder, build_causal_query_mask,
-                      QUERY_MASK_MODES)
+                      QUERY_MASK_MODES, DEFAULT_QUERY_MASK_MODE)
 
 # 与真实训练同规格的掩码/形状口径, 但 D 缩小以便 CPU 秒级跑完
 N = 32                  # 查询行数 = patch 数 (真实 576)
@@ -43,9 +43,11 @@ def block_of(pos):
 
 
 def build(mode, seed=SEED):
+    """mode=None → 不传该 kwarg, 用于验证**默认值**本身。"""
     torch.manual_seed(seed)
+    kw = {} if mode is None else {"query_mask_mode": mode}
     d = OutputQueryDecoder(dim=D, num_patches=N, heads=4, steps=STEPS,
-                           num_specials=K, depth=2, query_mask_mode=mode)
+                           num_specials=K, depth=2, **kw)
     return d.eval()
 
 
@@ -60,13 +62,19 @@ def main():
     torch.manual_seed(1)
     z_s = torch.randn(1, K, D)
 
-    # ── A1. 默认 mode 必须与历史块下三角逐位相同 ──
+    # ── A1. 默认 mode == blockdiag; 显式 causal 必须复现历史块下三角 ──
     T, Q = len(STEPS), N
+    assert DEFAULT_QUERY_MASK_MODE == "blockdiag", DEFAULT_QUERY_MASK_MODE
     assert torch.equal(build_causal_query_mask(T, Q),
-                       build_causal_query_mask(T, Q, mode="causal")), \
-        "默认 mode 必须等价 'causal'"
-    assert QUERY_MASK_MODES == ("causal", "blockdiag"), QUERY_MASK_MODES
-    print(f"[ok] A1 默认 mode == 'causal'（历史行为逐位不变）")
+                       build_causal_query_mask(T, Q, mode="blockdiag")), \
+        "默认 mode 必须是 'blockdiag'"
+    tm_hist = build_causal_query_mask(T, Q, mode="causal")
+    for ti in range(T):                                  # 历史块下三角回归
+        row = tm_hist[ti * Q]
+        assert (row[:(ti + 1) * Q] == 0).all(), f"causal 步 {ti} 应见步 ≤{ti}"
+        assert (row[(ti + 1) * Q:] == float("-inf")).all(), \
+            f"causal 步 {ti} 不应见未来步"
+    print("[ok] A1 默认 == 'blockdiag'; 显式 'causal' 仍复现历史块下三角")
 
     # ── A2. blockdiag 掩码结构: 对角块全允许 + 其余全 -inf, 且是 causal 的真子集 ──
     tc = build_causal_query_mask(T, Q, mode="causal")
@@ -94,6 +102,8 @@ def main():
     print("[ok] A3 非法 mode 均报错")
 
     # ── A4. 权重形状不变 → causal/blockdiag 互载 ──
+    d_def = build(None)                              # 不传 mode = 默认
+    assert d_def.query_mask_mode == "blockdiag", d_def.query_mask_mode
     d_ca, d_bd = build("causal"), build("blockdiag")
     d_bd.load_state_dict(d_ca.state_dict())          # 必须不抛
     d_ca.load_state_dict(d_bd.state_dict())

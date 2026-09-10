@@ -1,7 +1,25 @@
 # DESIGN · 解码器查询自注意力掩码开关 `query_mask_mode`
 
-> 日期: 2026-09-10 ｜ 改动: `model_v2.py`（`build_causal_query_mask` / `OutputQueryDecoder` / `SRPhase1V2`）+ `train_v2.py` / `infer_v2_test.py` CLI
-> 默认值 `"causal"` 与历史行为**逐位相同**，本次改动不改变任何既有训练结果。
+> 日期: 2026-09-10 ｜ 改动: `model_v2.py`（`build_causal_query_mask` / `OutputQueryDecoder` / `SRPhase1V2`）+ `train_v2.py` / `infer_v2_test.py` / `visualize_recon_pixel.py` CLI
+> **默认值已翻转为 `"blockdiag"`（原 `"causal"`）**。这是一次**架构级默认变更**，见 §0 与 §7。
+
+---
+
+## 0. ⚠️ 默认值变更的影响面（先读这一节）
+
+自本次提交起，**不显式指定 `query_mask_mode` 就等于 `blockdiag`**。后果：
+
+| 影响面 | 说明 |
+|---|---|
+| **新训练** | `train_v2.py` 默认 `--query_mask_mode blockdiag` → 架构与 3151bab 之前的全部实验**不同**（步间前向信息流动被移除，见 §5） |
+| **旧 checkpoint** | 权重形状不变 ⇒ `strict load` **不会报错**；但若不显式传 `causal`，就会被静默用错掩码推理 |
+| **既有脚本** | 任何 `SRPhase1V2(...)` / `OutputQueryDecoder(...)` 未传该参数的脚本，行为从此改变 |
+
+**已做的保护**：`infer_v2_test.py` 与 `visualize_recon_pixel.py` 一律以 `model_info.json` 记录的 `query_mask_mode` 为准；**没有该字段的产物（2026-09-10 之前的全部 checkpoint）fallback 到 `causal`**——因为那时确实都是用 `causal` 训的。两者都在 fallback 时打印 `[info]`，在完全读不到 `model_info.json` 时打印 `[warn]`。
+
+**仍未覆盖的脚本**（`doc/` 下的历史分析/探针脚本，部分在本次改动前就已因 `reencoder_depth` / `SRV2_MEMORY_OPEN` 等失效 API 跑不通）：`doc/2026-09-07/probe_e1.py`、`doc/2026-09-07/ab_compare.py`、`doc/2026-08-26~27/*`。**若要复现它们的历史数字，必须显式传 `query_mask_mode="causal"`。**
+
+**复现历史结果的唯一方式**：显式 `query_mask_mode="causal"`（或 `--query_mask_mode causal`）。
 
 ---
 
@@ -65,16 +83,16 @@ build_causal_query_mask(num_steps, num_queries, device=None, mode="causal")
 
 | mode | 掩码 | 语义 |
 |---|---|---|
-| `"causal"`（默认） | 块下三角：步 `t` 可见步 `≤ t` | 历史行为，**逐位不变**（自检断言保证） |
-| `"blockdiag"` | 块对角：步 `t` 只可见自己那 `N` 行 | 步间在自注意力上完全隔离 |
+| `"blockdiag"`（**默认**） | 块对角：步 `t` 只可见自己那 `N` 行 | 步间在自注意力上完全隔离 |
+| `"causal"`（历史行为） | 块下三角：步 `t` 可见步 `≤ t` | 3151bab 之前的全部产物；**须显式传** |
 
-函数名保留历史名（4 处 md 文档 + 探针脚本按此名引用）；两种语义由 `mode` 承载，`build_causal_query_mask` 的 docstring 已写明该模式名在 `blockdiag` 下不再是因果语义。
+函数名保留历史名（4 处 md 文档 + 探针脚本按此名引用）；两种语义由 `mode` 承载，默认值由模块级常量 `DEFAULT_QUERY_MASK_MODE = "blockdiag"` 统一提供，`build_causal_query_mask` 的 docstring 已写明该模式名在 `blockdiag` 下不再是因果语义。
 
-**参数贯通**：`OutputQueryDecoder(query_mask_mode=...)` → `SRPhase1V2(query_mask_mode=...)` → `train_v2.py --query_mask_mode` / `infer_v2_test.py --query_mask_mode`。非法值直接 `AssertionError`，不静默退化。
+**参数贯通**：`OutputQueryDecoder(query_mask_mode=...)` → `SRPhase1V2(query_mask_mode=...)` → `train_v2.py --query_mask_mode`（默认 `blockdiag`）/ `infer_v2_test.py` + `visualize_recon_pixel.py --query_mask_mode`（默认 `None` = 按 `model_info.json` 解析）。非法值直接 `AssertionError`，不静默退化。
 
 **向后兼容性**：
 - 不改任何权重形状（实测 `state_dict` 键集合与形状逐项相同），旧 checkpoint 双向可载；
-- 因此 `model_info.json` **必须记录** `query_mask_mode`，且 `infer_v2_test.py` 按"model_info.json 优先 → CLI → causal"解析并告警——本项不一致**不会**触发 `strict load` 形状错，只会静默算错，是比 K 错更隐蔽的坑。
+- 因此 `model_info.json` **必须记录** `query_mask_mode`，且 checkpoint 消费方按"`model_info.json` 优先 → CLI → `causal`"解析并告警——本项不一致**不会**触发 `strict load` 形状错，只会静默算错，是比 K 错更隐蔽的坑。`causal` 这个 fallback 是**故意**的（见 §0）：无字段 = 2026-09-10 之前的产物 = 当时用 `causal` 训的。
 
 ---
 
@@ -100,25 +118,32 @@ blockdiag : 0.000e+00      ← 一样锁死
 
 **渐进语义不受影响**：渐进性来自读侧 `memory_mask` 的允许列数随步单调递增（4→5→7→9→11），不依赖 `tgt_mask`；`blockdiag` 不破坏它。
 
-**表达力确实变了**：从"5 步串行、共享权重的循环结构（信息沿步向前流动）"变成"5 个共享权重的并行预测头 + 输出累加"。参数效率不降（权重仍共享），但每步的有效输入从累积前缀缩回自己那一块。这是**必须用实验决定**的问题，不能靠审美定。
+**表达力确实变了 —— 这是把默认值翻过去必须接受的代价**：
+从"5 步串行、共享权重的循环结构（信息沿步向前流动）"变成"5 个共享权重的并行预测头 + 输出累加"。参数效率不降（权重仍共享），但每步的有效输入从累积前缀缩回自己那一块。
+
+⚠️ **本默认变更尚未经过 A/B 验证**：§4 的三条收益（隔离性、梯度切断、可归因性）都是**性质层面**的实测，**没有任何证据表明 `blockdiag` 训练效果更好**。§5 的两条实测（塌缩中性、渐进性不受影响）说明它"不该更差"，但"不该更差"不等于"更好"。§7 的对照协议因此从"可选"变成"必做"。
 
 ---
 
 ## 6. 验证
 
 **模型自检**（`python model_v2.py`，全部通过）：新增 §2b 段，覆盖
-- 默认 `mode` 与历史块下三角**逐位相同**；
+- **默认 `mode` 必须是 `blockdiag`**（`DEFAULT_QUERY_MASK_MODE` + `OutputQueryDecoder` 默认值双向断言）；
+- 显式 `mode="causal"` 仍**逐位复现**历史块下三角（回归保护：复现旧结果的能力不能被破坏）；
 - `blockdiag` 对角块全允许 + 其余全 `-inf` + 是 `causal` 的真子集；
 - 非法 `mode` 报错；
 - 解码器级隔离性（`causal` 泄露 vs `blockdiag` 恰好 0）；
 - 梯度级切断（`causal` 非零 vs `blockdiag` 恰好 0）。
 
+注：`__main__` 里用于校验历史掩码语义的 `model` 已**显式 pin 成 `query_mask_mode="causal"`**，否则默认翻转后 §2 的历史断言会失去覆盖。
+
 **独立 smoke test**（`python doc/2026-09-10/smoke_query_mask_mode.py`，CPU 秒级，无需 DINO 权重/GPU）：形状 + 互载 + 掩码结构 + 逐块隔离性矩阵 + 梯度矩阵，输出形如
 
 ```
+[ok] A1 默认 == 'blockdiag'; 显式 'causal' 仍复现历史块下三角
 [B] 改哪块      step 1  step 4  step 9  step 16
-    causal 块1   4.4e+00  2.9e-01  2.4e-01  1.3e-01
-    blockd 块1   4.4e+00  0.0e+00  0.0e+00  0.0e+00
+    causal 块1   4.2e+00  3.0e-01  2.3e-01  1.2e-01
+    blockd 块1   4.2e+00  0.0e+00  0.0e+00  0.0e+00
 [C] causal    : 块1(种子)=3.4e+01  块2(种子)=3.9e+01  块3(种子)=3.6e+01
     blockdiag : 块1(种子)=0.0e+00  块2(种子)=0.0e+00  块3(种子)=0.0e+00
 ```
@@ -127,12 +152,25 @@ blockdiag : 0.000e+00      ← 一样锁死
 
 ## 7. 若要跑 A/B 对照（协议要求）
 
-本开关是**移除一条通路**的干净消融，但**必须配 P0 协议**，否则会重蹈 `REPORT_v2_block_slice05_posenc.md:13` 那个"同预算唯一变量"自相矛盾的覆辙（见 `ANALYSIS_k3_posenc_failure.md` §4.1 列出的 4 项运行层混淆）：
+本开关是**移除一条通路**的干净消融，但**必须配 P0 协议**，否则会重蹈 `REPORT_v2_block_slice05_posenc.md:13` 那个"同预算唯一变量"自相矛盾的覆辙（见 `ANALYSIS_k3_posenc_failure.md` §4.1 列出的 4 项运行层混淆）。
 
+**默认值翻转后，这个对照从"可选"升级为"必做"**：现在新训练默认就是 `blockdiag`，而它相对 `causal` 的表达力差异（§5）尚未被任何实验评估过。两臂只差一个 flag：
+
+```bash
+# 臂 A（新默认）
+--query_mask_mode blockdiag
+# 臂 B（历史行为）
+--query_mask_mode causal
+```
+
+其余必须完全对齐：
 - 两臂同 `max_steps`（否则 `warmup` 262 vs 48、cosine 相位不同，端点不可比）；
 - `eval_every` 加密到 **step 250–450 每 20 步**（A 臂只有 1 个 eval 点就是教训）；
 - 判据全部用**匹配步**的 train loss + grad_norm，不用端点 eval；
 - **≥3 seed**（n=1/臂只能得"共现"，得不出"塌缩率"）；
 - 记录 `‖Δθ‖`、Adam `v` 范数，避免再次陷入"梯度小 ⇒ 参数不动"的未验证推断。
 
-预期：若 `blockdiag` 对塌缩**中性**（§5 实测支持），两臂应同样健康或同样塌；若 `blockdiag` 反而更稳，说明跨步耦合本身在贡献不稳定，那是一条新线索。
+预期与判读：
+- 若两臂同样健康或同样塌 → 印证 §5 的"对塌缩中性"，`blockdiag` 的收益只在可归因性/梯度洁净度上；
+- 若 `blockdiag` 显著更好 → 跨步耦合本身在贡献不稳定，是一条新线索；
+- 若 `blockdiag` 显著更差 → 说明"5 步串行 refinement"的表达力是真的在用，默认值应当翻回 `causal`。
