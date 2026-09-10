@@ -79,6 +79,12 @@ def parse_args():
                    help="可选挑选分块终点索引(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
+    p.add_argument("--query_mask_mode", default=None,
+                   choices=("causal", "blockdiag"),
+                   help="解码器查询自注意力掩码模式(必须与训练一致; 默认取 "
+                        "model_info.json 记录值, 无记录则 causal=历史行为)。"
+                        "注意本项**不改变任何权重形状** → 不一致时 strict load 不会崩, "
+                        "只会静默产生不同输出, 故务必对齐")
     return p.parse_args()
 
 
@@ -145,6 +151,21 @@ def main():
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
+    # query_mask_mode 解析: ① model_info.json 优先; ② --query_mask_mode CLI;
+    # ③ 都没有 → "causal"（历史行为, 旧产物无此字段）
+    # 本项不改权重形状 ⇒ 错了不会崩, 只会静默算错, 故优先级 + 告警都要显式。
+    if train_info is not None and "query_mask_mode" in train_info:
+        qmm = str(train_info["query_mask_mode"])
+        if args.query_mask_mode and args.query_mask_mode != qmm:
+            print(f"[warn] model_info.json 记录 query_mask_mode={qmm}, 与 "
+                  f"--query_mask_mode={args.query_mask_mode} 不一致: 以 model_info 为准")
+    elif args.query_mask_mode:
+        qmm = args.query_mask_mode
+    else:
+        qmm = "causal"
+        if train_info is not None:
+            print("[info] model_info.json 无 query_mask_mode 字段（旧产物）: "
+                  "按历史行为 causal 构造")
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=args.heads, mlp_ratio=args.mlp_ratio,
@@ -152,7 +173,8 @@ def main():
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
-                       num_specials=num_specials)
+                       num_specials=num_specials,
+                       query_mask_mode=qmm)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -160,6 +182,7 @@ def main():
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
+          f"query_mask_mode={model.query_mask_mode}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
@@ -173,6 +196,10 @@ def main():
                 and list(train_info["decoder_steps"]) != T_steps):
             mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
                         f"!= 推理 {T_steps}")
+        if ("query_mask_mode" in train_info
+                and str(train_info["query_mask_mode"]) != model.query_mask_mode):
+            mism.append(f"query_mask_mode: 训练 {train_info['query_mask_mode']} "
+                        f"!= 推理 {model.query_mask_mode}（不崩但会静默算错!）")
         if mism:
             print(f"[warn] 推理参数与训练侧 model_info.json 不一致 ({info_path}):")
             for m in mism:

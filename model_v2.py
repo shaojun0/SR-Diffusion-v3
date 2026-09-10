@@ -21,8 +21,9 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     "内容路由", 修 F1（special 无内容输入）与 F2（z_s 冗余全局摘要）。
     DINO 内全双向注意力（HF 无 token 级 mask API）; z_s[k] 依赖全部 patch
     （含 j>k）, "前缀稳定性"不成立——渐进语义由解码器分块掩码提供: 读侧
-    memory_mask（每步只见自己的块）+ 查询侧 tgt_mask 块因果（步 t 只见
-    步 ≤ t 的查询行, 见 OutputQueryDecoder / build_causal_query_mask）。
+    memory_mask（每步只见自己的块）+ 查询侧 tgt_mask（默认块因果: 步 t 只见
+    步 ≤ t 的查询行; 可切块对角, 见 OutputQueryDecoder /
+    build_causal_query_mask 的 query_mask_mode）。
     无 ReEncoder（省 51.6M 参数）。
     register 数 K（num_specials）= 解码器实际读取的 z_s 范围: 默认由
     "最终生效采样步集"自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
@@ -38,9 +39,10 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
                     select_steps）上输出 (N,D) = 全部 patch 的预测（输出
                     查询注意力, 查询基行 k ↔ patch k, 行数 = N 不变）;
                     分块掩码(memory_mask): 每步只 attend 自己的 z_s 块
-                    （掩码列数 = K+1）; 查询自注意力块因果（tgt_mask:
-                    步 t 只 attend 步 ≤ t 的查询行, 防后步查询内容泄露进
-                    前步输出）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
+                    （掩码列数 = K+1）; 查询自注意力掩码（tgt_mask, 见
+                    query_mask_mode）: 默认块因果（步 t 只 attend 步 ≤ t 的
+                    查询行, 防后步查询内容泄露进前步输出）, 可选块对角
+                    （步间自注意力完全隔离）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
     L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
         （梯度按步解耦: carry 整体 detach + 自己的预测——每步恰收 1 份梯度,
         避免"t=0 收 |T| 份梯度"的三角失衡; 见 SRPhase1V2.decode）
@@ -251,24 +253,66 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
     return torch.stack(rows).repeat_interleave(Q, dim=0)
 
 
-# ═══ build_causal_query_mask — 查询自注意力块因果掩码 ═══
+# ═══ build_causal_query_mask — 查询自注意力掩码（块因果 / 块对角）═══
+
+# 查询自注意力掩码的合法模式（见 build_causal_query_mask / OutputQueryDecoder
+# 的 query_mask_mode）:
+#   "causal"    历史行为: 块下三角（步 t 可见步 ≤ t）。信息沿步前进单向流动。
+#   "blockdiag" 块对角: 每步只 attend 自己那 num_queries 行, 步间在自注意力
+#               上完全隔离。配合 memory_mask 使"每步只见自己的 z_s 块"在整条
+#               前向路径上字面成立, 并切断 loss 的跨步梯度回流。
+QUERY_MASK_MODES = ("causal", "blockdiag")
+
 
 def build_causal_query_mask(num_steps: int, num_queries: int,
-                            device: torch.device = None) -> Tensor:
-    """查询自注意力“块因果”掩码（torch float, -inf=屏蔽, 0=允许）。
+                            device: torch.device = None,
+                            mode: str = "causal") -> Tensor:
+    """查询自注意力掩码（torch float, -inf=屏蔽, 0=允许）。返回 (L,L) 方阵,
+    L = num_steps·num_queries; 查询行序 = (t,k) 展平
+    （index = t*num_queries + k, 每采样步 num_queries 行 patch 查询连排;
+    列 = 同一套查询行）。
 
-    查询行序 = (t,k) 展平（index = t*num_queries + k, 每采样步 N 行 patch
-    查询连排）; **块下三角**: 步 t 的行可 attend 步 ≤ t 的所有行——同步内
-    全双向（patch 间可交换信息）+ 之前步, 未来步屏蔽。目的: 后步查询内容
-    （z_s 采样种子）不再经查询自注意力影响前步输出——渐进语义由
-    memory_mask（读侧）+ tgt_mask（查询侧）双重保证。返回 (L,L) 方阵,
-    L = num_steps·num_queries。
+    函数名沿用历史名（既有文档/脚本按此名引用）; 两种语义由 mode 选择
+    （合法值见 QUERY_MASK_MODES）:
+
+    · mode="causal"（默认 = 历史行为）—— **块下三角**: 步 t 的行可 attend
+      步 ≤ t 的所有行（同步内全双向, patch 间可交换信息; + 之前步）, 未来步
+      屏蔽。目的: 后步查询内容（z_s 采样种子）不再经查询自注意力影响前步
+      输出。
+      **范围限定（2026-09-10 实测）**: 本模式只保证"后步不泄露进前步";
+      反方向（前步 → 后步）的泄露被允许且实际发生——因 depth≥2 时第一层
+      输出的各行已含"自己那块的 cross-attn 结果", 第二层的块下三角会把
+      **之前所有块的整块信息**带进后步。故步 t 的实际依赖集是**累积前缀**
+      （z_s 从位置 1 到自己块末）, 而非"只有自己那一块"。实测 N=576/K=35/
+      steps=[1,4,9,16,25]: 步 1→z_s[0:2], 步 4→z_s[0:7], 步 9→z_s[0:14],
+      步 16→z_s[0:23], 步 25→z_s[0:34]。同理 loss 的跨步梯度回流也经由本
+      掩码存在（步 25 的损失会推动块 1 的 register）。要消除这两条耦合,
+      用 mode="blockdiag"。
+
+    · mode="blockdiag"—— **块对角**: 步 t 的行只能 attend 自己那
+      num_queries 行。每步退化为一个独立的 num_queries×num_queries 稠密
+      双向注意力, 步与步在自注意力上完全隔离。此时:
+        - memory_mask 的"每步只见自己的 z_s 块"在整条前向路径上字面成立;
+        - loss 的跨步梯度回流被切断, 与 SRPhase1V2.decode 的
+          carry.detach()（累加路径按步解耦）合起来实现"每步只从自己那一步
+          的损失收梯度"（该意图见 decode 的 docstring）。
+      **渐进语义不依赖本掩码**: 它来自 memory_mask 侧的信息量递增（每步只
+      读自己块, 允许列数随步单调增 4→5→7→9→11）, 故 blockdiag 不破坏渐进性。
+      **局限（实测）**: 对 register 塌缩**中性**——块内非种子成员的梯度差在
+      两种模式下都恰为 0（该对称性只由"自己的 cross-attn + 块内 pos"决定,
+      与跨步自注意力无关）, 故它不是塌缩的修复手段。
     """
+    assert mode in QUERY_MASK_MODES, \
+        f"未知查询掩码 mode={mode!r}, 合法值 {QUERY_MASK_MODES}"
     T, Q = int(num_steps), int(num_queries)
+    assert T >= 1 and Q >= 1, f"num_steps/num_queries 须 ≥1, got {T}/{Q}"
     L = T * Q
     m = torch.full((L, L), float("-inf"), device=device)
     for t in range(T):
-        m[t * Q:(t + 1) * Q, :(t + 1) * Q] = 0.0
+        if mode == "causal":
+            m[t * Q:(t + 1) * Q, :(t + 1) * Q] = 0.0
+        else:                                        # mode == "blockdiag"
+            m[t * Q:(t + 1) * Q, t * Q:(t + 1) * Q] = 0.0
     return m
 
 
@@ -308,11 +352,18 @@ class OutputQueryDecoder(nn.Module):
       不再恒等——pos_embed 尺寸 (1,K+1,D), query_base 行数 = N。
     · 分块掩码走 memory_mask（加法浮点, -inf=屏蔽; 见 build_block_mask）,
       列数 = K+1（每步只见自己的 z_s 块）
-    · 查询自注意力**块因果**（见 build_causal_query_mask, 加法浮点,
-      -inf=屏蔽）: 查询行序 = (t,k) 展平, 步 t 的行可 attend 步 ≤ t 的所有
-      行（同步内全双向）, 未来步屏蔽——后步查询内容不再经查询自注意力
-      影响前步输出, 渐进语义由 memory_mask（读侧）+ tgt_mask（查询侧）
-      双重保证。
+    · 查询自注意力走 tgt_mask（见 build_causal_query_mask, 加法浮点,
+      -inf=屏蔽）, 查询行序 = (t,k) 展平; 语义由 query_mask_mode 选择:
+        - "causal"（默认）: **块下三角**——步 t 的行可 attend 步 ≤ t 的所有
+          行（同步内全双向）, 未来步屏蔽, 后步查询内容不再经查询自注意力
+          影响前步输出。**注意**: 该模式允许"前步 → 后步"的泄露, 故步 t 的
+          实际依赖集是**累积前缀**（之前所有块的整块 + 自己块）;
+        - "blockdiag": **块对角**——每步只 attend 自己那 N 行, 步间在自注意力
+          上完全隔离, 使 memory_mask 的"每步只见自己的 z_s 块"在整条前向
+          路径上字面成立, 并切断 loss 的跨步梯度回流（与 decode 的
+          carry.detach() 合起来 = 每步只从自己那一步的损失收梯度）。
+      渐进语义由 memory_mask（读侧, 列数随步单调增）负责, **不**依赖
+      本掩码; 两种模式都不破坏渐进性。
     · 结果沿采样步累加; **梯度按步解耦**（carry detach + 自己的预测, 见
       SRPhase1V2.decode）——每步 Y_t 只从自己那一步的损失收 1 份梯度
     · 时刻采样（显存优化, 默认开启）: 查询只对 T_sub 构造——采样计划 =
@@ -330,8 +381,12 @@ class OutputQueryDecoder(nn.Module):
                  steps: Optional[Sequence[int]] = None, heads: int = 8,
                  depth: int = 2, skip_steps: Optional[int] = None,
                  max_steps: Optional[int] = None,
-                 num_specials: Optional[int] = None):
+                 num_specials: Optional[int] = None,
+                 query_mask_mode: str = "causal"):
         super().__init__()
+        assert query_mask_mode in QUERY_MASK_MODES, \
+            f"未知 query_mask_mode={query_mask_mode!r}, 合法值 {QUERY_MASK_MODES}"
+        self.query_mask_mode = query_mask_mode   # 查询自注意力掩码语义; 见 build_causal_query_mask
         self.num_patches = num_patches                 # 查询基行数 = N（输出 N 个 patch 预测, 不变）
         self.num_specials = num_patches if num_specials is None else int(num_specials)
         # 采样计划: 与 SRPhase1V2 共用 select_steps; 独立使用时默认计划
@@ -365,10 +420,11 @@ class OutputQueryDecoder(nn.Module):
         mask = build_block_mask(self.num_specials, self.steps,
                                 num_queries=N, device=A.device)  # (|T|·N, K+1)
         self.attn_mask = mask                                    # 供自检
-        # 查询自注意力块因果: 行序 = (t,k) 展平, 步 t 的行只允许步 ≤ t 的
-        # 列（同步内全双向）——后步查询内容不泄露进前步输出
+        # 查询自注意力掩码（块因果 / 块对角, 见 query_mask_mode 与
+        # build_causal_query_mask）: 行序 = (t,k) 展平
         tgt_mask = build_causal_query_mask(len(self.steps), N,
-                                                device=A.device)  # (L,L)
+                                           device=A.device,
+                                           mode=self.query_mask_mode)  # (L,L)
         self.tgt_mask = tgt_mask
         Y = self.stack(Y, A, memory_mask=mask,
                        tgt_mask=tgt_mask)                   # (B,|T|·N,D)
@@ -394,10 +450,12 @@ class SRPhase1V2(nn.Module):
     K=N（默认全量）序列 = [cls; specials(N); patches(N)] = 2N+1 token, 与
     历史一致; K<N 时序列 = 1+K+N token, register 1..K 全被解码器读（无
     "花瓶 register", 见 derive_num_specials / DESIGN doc）。
-    解码器查询自注意力为块因果: 查询行序 = (t,k) 展平, 步 t 只 attend 步
-    ≤ t 的查询行（同步内全双向）, 后步查询内容不泄露进前步输出——渐进
-    语义由 memory_mask（读侧）+ tgt_mask（查询侧）双重保证（见
-    OutputQueryDecoder / build_causal_query_mask）。
+    解码器查询自注意力语义由 query_mask_mode 选择（见
+    OutputQueryDecoder / build_causal_query_mask）: "causal"（默认, 历史
+    行为）= 块下三角, 步 t 可 attend 步 ≤ t 的查询行（同步内全双向）,
+    后步查询内容不泄露进前步; "blockdiag" = 块对角, 每步只 attend 自己那
+    N 行, 步间在自注意力上完全隔离。渐进语义由 memory_mask（读侧, 列数
+    随步单调增）负责, 两种模式都不破坏渐进性。
     """
 
     def __init__(
@@ -413,6 +471,7 @@ class SRPhase1V2(nn.Module):
         skip_steps: Optional[int] = None,
         max_steps: Optional[int] = None,
         num_specials: Optional[int] = None,
+        query_mask_mode: str = "causal",
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -443,7 +502,9 @@ class SRPhase1V2(nn.Module):
                                           mlp_ratio=mlp_ratio, heads=heads,
                                           steps=steps_selected,
                                           depth=decoder_depth,
-                                          num_specials=K)
+                                          num_specials=K,
+                                          query_mask_mode=query_mask_mode)
+        self.query_mask_mode = self.decoder.query_mask_mode
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     # ── encode: 输入 → 解码器输入 z_cls, z_s ──
@@ -665,6 +726,78 @@ if __name__ == "__main__":
             f"步 {ti} 应可见步 ≤{ti} 的查询行"
         assert (qrow[(ti + 1) * N:] == float("-inf")).all(), \
             f"步 {ti} 不应见未来步查询行"
+
+    # ── 2b. query_mask_mode = "causal"(默认) / "blockdiag"(块对角) ──
+    # 本段会另跑 model.decoder（B=1）, 先存下上面的 last_Y 供后续断言复用
+    _last_Y_saved = model.decoder.last_Y
+    # 掩码层: 默认 mode 必须与历史块下三角**逐位相同**（不改变既有行为）
+    T3, Q3 = 3, 4
+    tm_def = build_causal_query_mask(T3, Q3)
+    assert torch.equal(tm_def, build_causal_query_mask(T3, Q3, mode="causal")), \
+        "默认 mode 应为 'causal'（历史行为不变）"
+    tm_bd = build_causal_query_mask(T3, Q3, mode="blockdiag")
+    assert tm_bd.shape == (T3 * Q3, T3 * Q3), tm_bd.shape
+    for ti in range(T3):
+        row = tm_bd[ti * Q3]
+        assert (row[ti * Q3:(ti + 1) * Q3] == 0).all(), \
+            f"blockdiag 对角块 {ti} 应全允许（同步内全双向）"
+        rest = torch.cat([row[:ti * Q3], row[(ti + 1) * Q3:]])
+        assert (rest == float("-inf")).all(), \
+            f"blockdiag 步 {ti} 不应见其它步的查询行"
+    # blockdiag 是 causal 的**真子集**（只砍跨步列, 不动同步内全双向）
+    assert int(((tm_bd == 0) & (tm_def != 0)).sum()) == 0, \
+        "blockdiag 的允许集应为 causal 的子集（更严格）"
+    assert int((tm_def == 0).sum()) > int((tm_bd == 0).sum()), \
+        "blockdiag 应真的砍掉跨步列（否则等同 causal）"
+    # 非法 mode 立刻报错（不静默退化成默认）
+    for bad in ("", "causal ", "diag", "block_diag", None):
+        try:
+            build_causal_query_mask(T3, Q3, mode=bad)
+            raise AssertionError(f"mode={bad!r} 应被拒绝")
+        except AssertionError as e:
+            assert "未知查询掩码 mode" in str(e), f"mode={bad!r}: {e}"
+    # 解码器层: 形状与 causal 完全一致（权重形状不变, 旧 checkpoint 仍可载）
+    d_bd = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps,
+                              num_specials=N, query_mask_mode="blockdiag")
+    assert d_bd.query_mask_mode == "blockdiag"
+    assert model.decoder.query_mask_mode == "causal", "默认必须是 causal"
+    Y_bd = d_bd(torch.randn(1, 1, D), torch.randn(1, N, D))
+    assert Y_bd.shape == (1, len(T_steps), N, D), Y_bd.shape
+    assert torch.equal(d_bd.tgt_mask,
+                       build_causal_query_mask(len(T_steps), N, mode="blockdiag"))
+    # 隔离性（本模式的核心语义）: 只改"块 1"的**非种子** register 内容
+    #   causal    : 步 1 变 + 后续步也变（累积前缀泄露, 实测 N=576/K=35 时步
+    #               4/9/16/25 变化为其自身尺度 ~5.7%/3.9%/3.0%/1.7%）
+    #   blockdiag : 后续步**逐位不变（恰好 0）**
+    zc = torch.randn(1, 1, D)
+    z_s0 = torch.randn(1, N, D)
+    z_s1 = z_s0.clone()
+    z_s1[:, 1:3] += 5.0                     # 位置 2,3 = 块 1 的非种子成员
+    with torch.no_grad():
+        Yc0, Yc1 = model.decoder(zc, z_s0), model.decoder(zc, z_s1)
+    d_bd.load_state_dict(model.decoder.state_dict())        # 同权重, 只换掩码
+    with torch.no_grad():
+        Yb0, Yb1 = d_bd(zc, z_s0), d_bd(zc, z_s1)
+    assert (Yc1[0, 0] - Yc0[0, 0]).abs().max() > 0, "causal: 改块1 应影响步1(自己块)"
+    for ti in range(1, len(T_steps)):
+        assert (Yb1[0, ti] - Yb0[0, ti]).abs().max().item() == 0.0, \
+            f"blockdiag: 改块1 不应影响步 {T_steps[ti]}（应恰好 0）"
+    assert (Yc1[0, -1] - Yc0[0, -1]).abs().max() > 0, \
+        "causal: 改块1 应经累积前缀影响最后一步（本模式的已知泄露）"
+    # 梯度侧: blockdiag 下最后一步的损失**推不动**块1 的 register（跨步回流被切断）
+    zg_bd = z_s0.clone().requires_grad_(True)
+    g_bd = torch.autograd.grad(d_bd(zc, zg_bd)[0, -1].pow(2).sum(), zg_bd)[0]
+    assert g_bd[0, 1].abs().max().item() == 0.0, \
+        "blockdiag: 最后一步损失不应推动块1 register（应恰好 0）"
+    zg_ca = z_s0.clone().requires_grad_(True)
+    g_ca = torch.autograd.grad(model.decoder(zc, zg_ca)[0, -1].pow(2).sum(),
+                               zg_ca)[0]
+    assert g_ca[0, 1].abs().max() > 0, \
+        "causal: 最后一步损失会推动块1 register（累积前缀 = 跨步梯度回流）"
+    model.decoder.last_Y = _last_Y_saved                    # 复原, 不影响后续断言
+    print("[ok] query_mask_mode: causal(默认, 块下三角) / "
+          "blockdiag(块对角, 步间自注意力隔离, 跨步梯度回流切断)")
+
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
     # 与模型 decode 相同的梯度解耦构造: carry 无梯度 + 自己的预测

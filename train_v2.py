@@ -128,6 +128,17 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
+    p.add_argument("--query_mask_mode", default="causal",
+                   choices=("causal", "blockdiag"),
+                   help="解码器查询自注意力掩码语义。causal(默认, 历史行为)=块下三角, "
+                        "步 t 可见步 ≤ t 的查询行: 信息沿步前进单向流动, 但『前步→后步』"
+                        "泄露被允许 → 步 t 的实际依赖集是累积前缀(之前所有块的整块), "
+                        "且 loss 跨步梯度回流存在。blockdiag=块对角, 每步只 attend 自己那 "
+                        "N 行: 步间在自注意力上完全隔离, memory_mask 的『每步只见自己的 "
+                        "z_s 块』在整条前向路径上字面成立, 跨步梯度回流切断(与 decode 的 "
+                        "carry.detach() 合起来 = 每步只从自己那一步的损失收梯度)。"
+                        "两者都不破坏渐进语义(渐进性由读侧 memory_mask 的列数单调递增提供)。"
+                        "不改变任何权重形状, 旧 checkpoint 双向可载, 但**必须与训练时一致**")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -239,7 +250,8 @@ def main():
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
-                       num_specials=(args.num_specials or None))
+                       num_specials=(args.num_specials or None),
+                       query_mask_mode=args.query_mask_mode)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -255,6 +267,8 @@ def main():
               f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
+    print(f"[model] 查询自注意力掩码 query_mask_mode={model.query_mask_mode} "
+          f"({'块下三角, 步间单向可见' if model.query_mask_mode == 'causal' else '块对角, 步间自注意力隔离'})")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -329,6 +343,7 @@ def main():
                 "decoder_depth": args.decoder_depth,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
+                "query_mask_mode": raw.query_mask_mode,
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
