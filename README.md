@@ -64,6 +64,7 @@ python infer_v2_test.py --data_dir /root/autodl-tmp/construction_site \
 ## 3. 文档导航（doc/ 按日期归档，读最新在前）
 
 - 权威目标: `doc/2026-08-28/GOAL_compression_for_nlp.md`
+- 最新实验（2026-09-10，新默认 blockdiag 单卡复跑 + 后步坍缩探针）: `doc/2026-09-10/REPORT_v2_blockdiag_slice05.md`（slice[0:5] K=35 单卡 bs=32，`eval_recon` 0.3584→**0.3318**）、`doc/2026-09-10/PROBE_v2_step_collapse_blockdiag.md`（探针 `probe_step_collapse.py`：**step1~5 仍坍缩且 blockdiag 更甚**；证明该增益来自单发通路而非后步分工）
 - 最新机制分析（2026-09-10，块级共享位置编码 `3151bab` 塌缩归因：三路独立取证 + 交叉验证 + 对抗裁决）: `doc/2026-09-10/ANALYSIS_k3_posenc_failure.md`；配套设计与实测 `doc/2026-09-10/DESIGN_query_mask_mode.md`（`query_mask_mode` 开关，自检 `doc/2026-09-10/smoke_query_mask_mode.py`）
 - 机制分析（2026-09-07，后步归零的最短因果链，见 §4）: `doc/2026-09-07/ANALYSIS_k3_why_later_steps_zero.md`、`doc/2026-09-07/DESIGN_v2_region_loss.md`（P1 设计，实现已还原见 §4.1）
 - 全版本机制分析（"为什么曲线全平"、下一步选项）: `doc/2026-09-03/ANALYSIS_v2_story_and_next.md`、`doc/2026-09-04/ANALYSIS_v2_three_configs.md`
@@ -109,6 +110,9 @@ DINO，但读出上限 ~19 使"键分化"的收益≈0，键收到的主要是�
 
 **状态：留档待决。** 2026-09-07 用户暂无时间，解决路径后续再想；本条目只记录框架与判据，不作实施承诺。
 P1 曾实现并通过本地自检 + 服务器数值冒烟（`doc/2026-09-07/DESIGN_v2_region_loss.md`，`region_loss=True` 默认），但**代码已还原**（HEAD `a8eeabc` "原提交不符合实际需要，暂时还原"）——当前 `model_v2.py` 仍是旧"每步整图"平权损失；若走渐进路线，按该 doc 重新落地即可（~20 行核心改动）。
+
+**2026-09-10 补充证据（掩码侧已排除）**：`query_mask_mode` 默认翻转为 `blockdiag` 后按 slice[0:5] K=35 单卡 bs=32 复跑，`eval_recon` 0.3584→**0.3318**（`doc/2026-09-10/REPORT_v2_blockdiag_slice05.md`）；但同尺探针（`doc/2026-09-10/PROBE_v2_step_collapse_blockdiag.md`）实测 `step_px_scale` = `[1.0273, 0.0395, 0.0349, 0.0342, 0.0335]`（causal 对照 `[1.0072, 0.0630, 0.0584, 0.0572, 0.0563]`）——
+**step1~5 仍然坍缩，且 blockdiag 下后步相对量级从 5.6–6.3% 降到 3.3–3.8%**，区域×步矩阵两臂都是五行逐位相同。⇒ 上述增益来自**单发通路收敛更好**，不是后步分工被激活；**掩码开关不是本条的杠杆**，与 `ANALYSIS_k3` §5 预判一致。附带一条判据层实证：blockdiag 的逐块 register cos 从 `[0.619, 0.854, 0.990, 0.998, 0.999]` 变"健康"到 `[0.734, 0.876, 0.918, 0.916, 0.926]`、`within-std` 0.054→0.095，而后步输出反而**更接近零**——实测支持本节"键相似度既不必要也不充分"的判据修正。
 
 **战略上下文**：渐进阶梯**不是** GOAL 验收项（`doc/2026-08-28/GOAL_compression_for_nlp.md`），Phase 2 一次性消费全部 K token；v4 单发（8.26）已是仓库最佳。除非"token 增量性"叙事本身成为目标，本条目可长期冻结，不挡主路线。
 
