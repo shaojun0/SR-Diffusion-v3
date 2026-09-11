@@ -21,25 +21,34 @@ def load_json(p):
         return json.load(f)
 
 
-def parse_eval_log(path):
-    """从训练 log 抓 (step, eval_recon) 序列（Trainer 的 {'eval_recon': ...}）。"""
+def parse_eval_log(path, steps_per_epoch=219):
+    """从训练 log 抓 (step, eval_recon) 序列。
+
+    Trainer 的 eval 行有两种排布：
+      ① 附在 tqdm 进度条后（step 是"打印时"的步，偏大）：
+         `... 2190/8760 [50:57<...]{'eval_loss': ..., 'eval_recon': '0.486', ..., 'epoch': '9.132'}`
+      ② 单独成行（被 \\r / ANSI 光标序列覆盖后）：
+         `[A{'eval_loss': ..., 'eval_recon': '0.5112', ..., 'epoch': '9.132'}`
+    两种都带 'epoch'，故**优先用 epoch 反推真实 eval step**（= round(epoch*steps_per_epoch)），
+    保证同一次 eval 在不同排版下得到同一个 step；没有 epoch 时才退回进度条步号。
+    """
     if not path:
         return []
     try:
         raw = open(path, errors="ignore").read().replace("\r", "\n")
     except OSError:
         return []
-    out = []
-    # 形如  2190/8760 [50:57<...]{'eval_loss': '0.4842', 'eval_recon': '0.486', ...}
+    by_epoch = {}
+    for m in re.finditer(
+            r"\{'eval_loss': '[0-9.]+', 'eval_recon': '([0-9.]+)'[^\n]*?'epoch': '([0-9.]+)'", raw):
+        by_epoch[round(float(m.group(2)) * steps_per_epoch)] = float(m.group(1))
+    if by_epoch:
+        return sorted(by_epoch.items())
+    bar = {}
     for m in re.finditer(
             r"(\d+)/\d+ \[[^]]*\][^\n]*?'eval_recon': '([0-9.]+)'", raw):
-        out.append((int(m.group(1)), float(m.group(2))))
-    # 末尾无进度条的那条（final eval）
-    for m in re.finditer(r"\{'eval_loss': '[0-9.]+', 'eval_recon': '([0-9.]+)'", raw):
-        v = float(m.group(1))
-        if not out or out[-1][1] != v:
-            out.append((None, v))
-    return out
+        bar[int(m.group(1))] = float(m.group(2))
+    return sorted(bar.items())
 
 
 def main():
@@ -136,8 +145,8 @@ def main():
                                 xycoords=("axes fraction", "data"),
                                 ha="right", va="bottom", color=color, fontsize=9)
             ax.set_xlabel("train step")
-            ax.set_ylabel("eval_recon (归一化 L1)")
-            ax.set_title("训练中 eval_recon")
+            ax.set_ylabel("eval_recon (normalized L1)")
+            ax.set_title("eval_recon during training")
             ax.legend()
             ax.grid(alpha=0.3)
 
@@ -148,9 +157,9 @@ def main():
             if ns:
                 ax.plot(range(1, len(ns) + 1), ns, "o-", color="#c0392b",
                         label="self.stack 2x")
-            ax.set_xlabel("累积采样步序号")
-            ax.set_ylabel("0-255 像素 L1")
-            ax.set_title("渐进曲线（累积结果）")
+            ax.set_xlabel("cumulative sample-step index")
+            ax.set_ylabel("pixel L1 (0-255)")
+            ax.set_title("progressive curve (cumulative)")
             ax.legend()
             ax.grid(alpha=0.3)
             fig.tight_layout()
