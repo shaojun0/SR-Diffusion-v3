@@ -22,6 +22,8 @@ def load_json(p):
 
 
 def parse_eval_log(path, steps_per_epoch=219):
+    # steps_per_epoch = len(train_ds) // (per_device_bs * n_proc)（Trainer 口径，
+    # **不含 grad_accum**）。基线/stack2x: 7009//(16*2)=219；stack8x(bs8*accum2): 437。
     """从训练 log 抓 (step, eval_recon) 序列。
 
     Trainer 的 eval 行有两种排布：
@@ -57,6 +59,13 @@ def main():
     ap.add_argument("--base", required=True, help="基线 infer_test.json")
     ap.add_argument("--new_log", default=None)
     ap.add_argument("--base_log", default=None)
+    ap.add_argument("--new_name", default="self.stack 2x",
+                    help="新模型在表/图中的显示名")
+    ap.add_argument("--new_spe", type=int, default=219,
+                    help="新 run 的 steps_per_epoch (Trainer 口径 = len(train)//(bs*nproc), "
+                         "不含 grad_accum); 默认 219")
+    ap.add_argument("--base_spe", type=int, default=219,
+                    help="基线 run 的 steps_per_epoch; 默认 219")
     ap.add_argument("--md", default=None, help="可选: 把 markdown 写到该路径")
     ap.add_argument("--plot", default=None, help="可选: 画对比图(PNG)到该路径")
     a = ap.parse_args()
@@ -68,7 +77,7 @@ def main():
         lines.append(s)
         print(s)
 
-    emit("# A/B: self.stack 2x(d_model 2048/heads 16/depth 4/dropout 0.05) vs 基线 blockdiag slice[0:5]")
+    emit(f"# A/B: {a.new_name} vs 基线 blockdiag slice[0:5]")
     emit()
     emit(f"- 新模型: `{a.new}`")
     emit(f"- 基线:   `{a.base}`")
@@ -79,7 +88,7 @@ def main():
 
     emit("## 1. 全量重建（同一推理脚本/口径）")
     emit()
-    emit("| 指标 | 基线 blockdiag slice[0:5] | 本次 self.stack 2x | 变化 |")
+    emit(f"| 指标 | 基线 blockdiag slice[0:5] | 本次 {a.new_name} | 变化 |")
     emit("|---|---|---|---|")
     for key, label, fmt in (("full_norm_l1", "归一化空间 L1 (eval_recon 口径)", "{:.4f}"),
                             ("full_pixel_l1_255", "0-255 像素 L1", "{:.2f}")):
@@ -98,7 +107,7 @@ def main():
     bs = base.get("step_pixel_l1_255") or []
     ns = new.get("step_pixel_l1_255") or []
     steps = new.get("decoder_steps") or list(range(len(ns)))
-    emit("| 采样步 t | 基线 | self.stack 2x | 变化 |")
+    emit(f"| 采样步 t | 基线 | {a.new_name} | 变化 |")
     emit("|---|---|---|---|")
     for i, t in enumerate(steps):
         if i < len(bs) and i < len(ns):
@@ -109,14 +118,14 @@ def main():
         emit(f"- 本次 step1→末步 落差: {ns[0] - ns[-1]:+.2f}")
     emit()
 
-    bl, nl = parse_eval_log(a.base_log), parse_eval_log(a.new_log)
+    bl, nl = parse_eval_log(a.base_log, a.base_spe), parse_eval_log(a.new_log, a.new_spe)
     if bl or nl:
         bd = {s: v for s, v in bl}
         nd = {s: v for s, v in nl}
         keys = sorted(set(bd) | set(nd), key=lambda x: (x is None, x if x is not None else 0))
         emit("## 3. 训练中 eval_recon 曲线")
         emit()
-        emit("| checkpoint step | 基线 | self.stack 2x |")
+        emit(f"| checkpoint step | 基线 | {a.new_name} |")
         emit("|---|---|---|")
         for s in keys:
             b = f"{bd[s]:.4f}" if s in bd else "—"
@@ -131,9 +140,9 @@ def main():
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3))
             ax = axes[0]
-            for lg, name, color in ((a.base_log, "baseline blockdiag", "#7f8c8d"),
-                                    (a.new_log, "self.stack 2x", "#c0392b")):
-                ev = parse_eval_log(lg)
+            for lg, spe, name, color in ((a.base_log, a.base_spe, "baseline blockdiag", "#7f8c8d"),
+                                         (a.new_log, a.new_spe, "self.stack 8x", "#c0392b")):
+                ev = parse_eval_log(lg, spe)
                 pts = [(s, v) for s, v in ev if s is not None]
                 if pts:
                     xs, ys = zip(*pts)
@@ -156,7 +165,7 @@ def main():
                         label="baseline blockdiag")
             if ns:
                 ax.plot(range(1, len(ns) + 1), ns, "o-", color="#c0392b",
-                        label="self.stack 2x")
+                        label=a.new_name)
             ax.set_xlabel("cumulative sample-step index")
             ax.set_ylabel("pixel L1 (0-255)")
             ax.set_title("progressive curve (cumulative)")
