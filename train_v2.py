@@ -128,6 +128,14 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数")
+    p.add_argument("--stack_dim", type=int, default=0,
+                   help="OutputQueryDecoder 的 self.stack 的 d_model: 0=与模型 dim "
+                        "相同（默认, 不加投影, 与历史实现逐位一致）; >0 且 ≠dim 时"
+                        "在 self.stack 前后各加一层 Linear 投影(dim→stack_dim→dim), "
+                        "FFN 宽度随 stack_dim 等比缩放(mlp_ratio 语义不变)。"
+                        "nhead(--heads) 须整除 stack_dim")
+    p.add_argument("--decoder_dropout", type=float, default=0.0,
+                   help="self.stack(nn.TransformerDecoderLayer) 的 dropout, 默认 0.0")
     p.add_argument("--query_mask_mode", default="blockdiag",
                    choices=("causal", "blockdiag"),
                    help="解码器查询自注意力掩码语义。**默认 blockdiag**。"
@@ -254,7 +262,9 @@ def main():
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
-                       query_mask_mode=args.query_mask_mode)
+                       query_mask_mode=args.query_mask_mode,
+                       stack_dim=args.stack_dim,
+                       decoder_dropout=args.decoder_dropout)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -273,6 +283,10 @@ def main():
     print(f"[model] 查询自注意力掩码 query_mask_mode={model.query_mask_mode} "
           f"({'块对角, 步间自注意力隔离(默认)' if model.query_mask_mode == 'blockdiag' else '块下三角, 步间单向可见(历史行为)'})"
           f"{'  ← 非默认: 复现历史结果用' if model.query_mask_mode != 'blockdiag' else ''}")
+    print(f"[model] self.stack: d_model={model.decoder.stack_dim} "
+          f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
+          f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
+          f"{'  ← 加宽: 前后 Linear 投影' if model.decoder.stack_dim != dino.config.hidden_size else '  (未加宽)'}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -345,6 +359,8 @@ def main():
                 "dim": dino.config.hidden_size,
                 "heads": args.heads, "mlp_ratio": args.mlp_ratio,
                 "decoder_depth": args.decoder_depth,
+                "stack_dim": int(raw.decoder.stack_dim),
+                "decoder_dropout": args.decoder_dropout,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
                 "query_mask_mode": raw.query_mask_mode,
