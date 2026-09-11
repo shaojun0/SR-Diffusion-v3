@@ -197,3 +197,19 @@ python probe_step_collapse.py --ckpt <ckpt>/final_model.pt --tag stack2x_ckpt200
   - 图：loss / grad_norm / lr / eval_recon（含基线 0.3318 虚线）；探针 `step_px_scale`(step1~5)、
     `prog_curve_255`、`E_px` step×region 热力图、`z_s` 统计；数据源状态表。
   - 源码：`tools/metrics_dash/`（commit `b819f7c`），45 s 准实时刷新，数据源缺失时按预期路径提示。
+
+## 附 C: 后续根因与超参分析（同日完成）
+
+- **根因排查（受控消融）**：`doc/2026-09-11/ANALYSIS_stack2x_collapse_rootcause.md`
+  - 结论：不是纯参数量问题 / 不是 dropout / 不是实现 bug（四重证据：hook 计数、手写参考 maxdiff=0、
+    `stack_dim=0` 逐位相同、权重审计 stack_in/out 未塌），而是 **`lr × 解码器宽度` 的超参交互**；
+    触发变量是 **d_model 宽度**（仅 depth、仅 dropout、仅 heads 均不塌，去掉 dropout 照样塌）。
+  - 失效时间线：step240（lr≈1.37e-4）灾难性更新 → 解码器幅度爆涨 → step290 **DINO register 先塌** →
+    step330 pixel_head 输出被压平 → 梯度全消。
+  - 修复佐证：峰值 lr **7.5e-5–1.0e-4** 不塌，且 `lr=7.5e-5` 的 600 步末 loss **0.5445 为 10 臂最低**
+    （基线同口径 0.5723）⇒ **加宽本身有收益，只是不能沿用 1.5e-4**。
+  - 诊断脚本/数据：`tools/diag_*.py`、`tools/diag_out/*.json`。
+- **Step Law 超参评估**：`doc/2026-09-11/ANALYSIS_lr_batch_vs_steplaw.md`
+  - `η_opt = 1.79·N^(−0.713)·D^(0.307)`、`B_opt = 0.58·D^0.571`（arXiv:2503.04715v7，含正文笔误更正）。
+  - 放大 N 后 η_opt 比值 ×0.685（全模型口径）~×0.227（模块口径）⇒ 应降至 1.03e-4~3.4e-5；
+    与实测安全边界 (1.0e-4, 1.5e-4] 吻合。**batch 与 N 无关，32 保持不变是对的。**
