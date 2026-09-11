@@ -73,6 +73,11 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 的 TransformerDecoder 层数(与训练一致)")
+    p.add_argument("--stack_dim", type=int, default=0,
+                   help="OutputQueryDecoder 的 self.stack 的 d_model(与训练一致); "
+                        "0=与 dim 相同。model_info.json 有 stack_dim 字段时以它为准")
+    p.add_argument("--decoder_dropout", type=float, default=0.0,
+                   help="self.stack 的 dropout(与训练一致; eval 推理下不生效, 但构造须对齐)")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(与训练 --slice_start 一致); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -115,20 +120,38 @@ def main():
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"decoder_steps 越界: {steps} (N={num_patches})"
 
-    # ── model_info.json 提前读取（K/采样对齐提示, 不强制）──
-    # 训练侧把 num_specials / decoder_depth / slice_start / slice_end /
-    # decoder_steps 写在 output_dir/model_info.json。K 错则 strict load 形状
-    # 不匹配直接崩, 所以**构造模型前**先按训练侧配置对齐 num_specials。
+    # ── model_info.json: **结构超参一律以训练侧记录为准** ──
+    # 训练侧把 num_specials / decoder_depth / heads / mlp_ratio / slice_start /
+    # slice_end / decoder_steps / stack_dim / decoder_dropout / query_mask_mode
+    # 写在 output_dir/model_info.json。其中 heads / mlp_ratio / query_mask_mode
+    # 不改变权重形状 ⇒ 传错时 strict load 不报错、只会静默算错; decoder_depth /
+    # stack_dim 传错则形状不符直接崩。故构造模型前先用 model_info 覆盖 CLI。
     info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
     train_info = None
     if os.path.exists(info_path):
         with open(info_path) as f:
             train_info = json.load(f)
-        for k in ("slice_start", "slice_end", "decoder_depth"):
-            if k in train_info and train_info[k] != args.__dict__[k]:
-                print(f"[warn] model_info.json 记录 {k}={train_info[k]}, "
-                      f"但 --{k}={args.__dict__[k]}: 与训练配置不一致, "
-                      f"请按训练配置传参")
+
+    def _pick(name, cli, default):
+        """model_info.json 优先; CLI 与之不一致且非默认时告警, 仍以 model_info 为准。"""
+        if train_info is not None and name in train_info:
+            val = train_info[name]
+            if cli != val and cli != default:
+                print(f"[warn] model_info.json 记录 {name}={val!r}, 与 "
+                      f"--{name}={cli!r} 不一致: 以 model_info 为准")
+            if val is not None:
+                return val
+        return cli
+
+    decoder_depth = int(_pick("decoder_depth", args.decoder_depth, 2))
+    heads = int(_pick("heads", args.heads, 8))
+    mlp_ratio = float(_pick("mlp_ratio", args.mlp_ratio, 4.0))
+    slice_start = _pick("slice_start", args.slice_start, None)
+    slice_end = _pick("slice_end", args.slice_end, None)
+    stack_dim = int(_pick("stack_dim", args.stack_dim, 0))
+    decoder_dropout = float(_pick("decoder_dropout", args.decoder_dropout, 0.0))
+    if steps is None and train_info is not None and "decoder_steps" in train_info:
+        steps = [int(s) for s in train_info["decoder_steps"]]
     # num_specials(K) 解析: ① model_info.json 优先; ② --num_specials CLI;
     # ③ 都没有 → None = 全量默认 K=N
     num_specials = None
@@ -172,15 +195,18 @@ def main():
             print(f"[warn] 无 {info_path}: 无法判断训练时掩码模式, 按历史行为 causal "
                   f"构造; 若该权重是 2026-09-10 之后训练的, 请显式传 "
                   f"--query_mask_mode blockdiag")
+    # self.stack 形状对齐: model_info.json 优先（形状不符 strict load 直接崩）
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
-                       heads=args.heads, mlp_ratio=args.mlp_ratio,
+                       heads=heads, mlp_ratio=mlp_ratio,
                        decoder_steps=steps,
-                       decoder_depth=args.decoder_depth,
-                       skip_steps=args.slice_start,
-                       max_steps=args.slice_end,
+                       decoder_depth=decoder_depth,
+                       skip_steps=slice_start,
+                       max_steps=slice_end,
                        num_specials=num_specials,
-                       query_mask_mode=qmm)
+                       query_mask_mode=qmm,
+                       stack_dim=stack_dim,
+                       decoder_dropout=decoder_dropout)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)

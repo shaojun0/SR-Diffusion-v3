@@ -41,6 +41,14 @@ def parse_args():
                         ">0=显式 K。model_info.json 有 num_specials 字段时以它为准")
     p.add_argument("--decoder_depth", type=int, default=2,
                    help="OutputQueryDecoder 层数(与训练 --decoder_depth 一致)")
+    p.add_argument("--heads", type=int, default=8,
+                   help="self.stack 注意力头数(须与训练一致; 不改权重形状, 错了"
+                        "strict load 不报错只会静默画错)。model_info.json 优先")
+    p.add_argument("--stack_dim", type=int, default=0,
+                   help="self.stack 的 d_model(与训练一致); 0=与 dim 相同。"
+                        "model_info.json 有该字段时以它为准")
+    p.add_argument("--decoder_dropout", type=float, default=0.0,
+                   help="self.stack 的 dropout(仅构造对齐; eval 下不生效)")
     p.add_argument("--slice_start", type=int, default=None,
                    help="分块切片起点(与训练 --slice_start 一致); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -122,13 +130,29 @@ def main():
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
+    # self.stack 形状/头数对齐: model_info.json 优先
+    stack_dim = args.stack_dim
+    if train_info is not None and "stack_dim" in train_info:
+        stack_dim = int(train_info["stack_dim"])
+    heads = args.heads
+    if train_info is not None and "heads" in train_info:
+        heads = int(train_info["heads"])
+        if args.heads != heads:
+            print(f"[warn] model_info.json 记录 heads={heads}, 与 --heads={args.heads} "
+                  f"不一致: 以 model_info 为准（本项不改权重形状, 错了不报错）")
+    decoder_dropout = args.decoder_dropout
+    if train_info is not None and "decoder_dropout" in train_info:
+        decoder_dropout = float(train_info["decoder_dropout"])
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
+                       heads=heads,
                        decoder_depth=args.decoder_depth,
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
                        num_specials=num_specials,
-                       query_mask_mode=qmm)
+                       query_mask_mode=qmm,
+                       stack_dim=stack_dim,
+                       decoder_dropout=decoder_dropout)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)

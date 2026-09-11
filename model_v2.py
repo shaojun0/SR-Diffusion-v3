@@ -395,7 +395,8 @@ class OutputQueryDecoder(nn.Module):
                  depth: int = 2, skip_steps: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  num_specials: Optional[int] = None,
-                 query_mask_mode: str = DEFAULT_QUERY_MASK_MODE):
+                 query_mask_mode: str = DEFAULT_QUERY_MASK_MODE,
+                 stack_dim: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
         assert query_mask_mode in QUERY_MASK_MODES, \
             f"未知 query_mask_mode={query_mask_mode!r}, 合法值 {QUERY_MASK_MODES}"
@@ -411,12 +412,27 @@ class OutputQueryDecoder(nn.Module):
         # 标准解码器堆叠: nn.TransformerDecoder 内部按 num_layers 深拷贝同一
         # decoder_layer 并顺序执行（含逐层传掩码）, 无需手写循环。每层 =
         # 自注意力 + 交叉注意力(memory=A) + FFN + 残差, 各层共享同一 memory
+        #
+        # stack_dim（= self.stack 的 d_model）与模型 dim 解耦:
+        #   · 默认 None/0 ⇒ stack_dim == dim, 不加任何投影, 与原实现逐位一致;
+        #   · 显式放大（如 2×dim=2048）⇒ 模型其余部分（pos_embed / query_base /
+        #     PixelHead / DINO 输出）仍是 dim 维, 故在 self.stack 前后各加一层
+        #     Linear: dim→stack_dim（输入侧, 查询 Y 与 memory A 共用同一投影）
+        #     与 stack_dim→dim（输出侧, 交回 PixelHead / 累加损失）。
+        # dim_feedforward 随 stack_dim 等比缩放（mlp_ratio 语义不变）。
+        self.stack_dim = int(dim if not stack_dim else stack_dim)
         self.stack = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=dim, nhead=heads, dim_feedforward=int(dim * mlp_ratio),
-                dropout=0.0, activation="gelu", batch_first=True, norm_first=True),
+                d_model=self.stack_dim, nhead=heads,
+                dim_feedforward=int(self.stack_dim * mlp_ratio),
+                dropout=dropout, activation="gelu", batch_first=True,
+                norm_first=True),
             num_layers=depth,
         )
+        self.stack_in = (nn.Identity() if self.stack_dim == dim
+                         else nn.Linear(dim, self.stack_dim))
+        self.stack_out = (nn.Identity() if self.stack_dim == dim
+                          else nn.Linear(self.stack_dim, dim))
         self.pos_embed = nn.Parameter(torch.randn(1, S, dim) * 0.02)
 
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
@@ -439,8 +455,11 @@ class OutputQueryDecoder(nn.Module):
                                            device=A.device,
                                            mode=self.query_mask_mode)  # (L,L)
         self.tgt_mask = tgt_mask
-        Y = self.stack(Y, A, memory_mask=mask,
-                       tgt_mask=tgt_mask)                   # (B,|T|·N,D)
+        # stack_dim == dim 时 stack_in/out 为 Identity（零额外开销）;
+        # 放大时输入侧投影 Y 与 memory A, 输出侧投影回 dim
+        Y = self.stack(self.stack_in(Y), self.stack_in(A),
+                       memory_mask=mask, tgt_mask=tgt_mask)     # (B,|T|·N,stack_dim)
+        Y = self.stack_out(Y)                                   # → (B,|T|·N,D=dim)
         Y = Y.reshape(B, len(self.steps), N, D)                  # (B,|T|,N,D)
         self.last_Y = Y                                          # 采样步全部 patch 预测
         return Y
@@ -489,6 +508,8 @@ class SRPhase1V2(nn.Module):
         max_steps: Optional[int] = None,
         num_specials: Optional[int] = None,
         query_mask_mode: str = DEFAULT_QUERY_MASK_MODE,
+        stack_dim: int = 0,
+        decoder_dropout: float = 0.0,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -520,7 +541,9 @@ class SRPhase1V2(nn.Module):
                                           steps=steps_selected,
                                           depth=decoder_depth,
                                           num_specials=K,
-                                          query_mask_mode=query_mask_mode)
+                                          query_mask_mode=query_mask_mode,
+                                          stack_dim=stack_dim,
+                                          dropout=decoder_dropout)
         self.query_mask_mode = self.decoder.query_mask_mode
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
@@ -998,5 +1021,40 @@ if __name__ == "__main__":
         out_e = model(x)
     assert out_e["F_hat"].shape == (2, N, PATCH_PX)
     print(f"[ok] eval 同路径: loss={out_e['loss'].item():.4f}")
+
+    # ── 5. self.stack 加宽（stack_dim ≠ dim, 前后 Linear 投影）+ dropout ──
+    # 默认（stack_dim=0 ⇒ stack_dim==dim）必须与原实现完全同构: 不新增任何
+    # 参数、state_dict 键不变（旧 checkpoint 仍可 strict load）。
+    assert model.decoder.stack_dim == D
+    assert isinstance(model.decoder.stack_in, nn.Identity), \
+        "默认 stack_dim=dim 时输入侧应为 Identity（零额外参数）"
+    assert isinstance(model.decoder.stack_out, nn.Identity)
+    assert not [k for k in model.state_dict()
+                if "stack_in" in k or "stack_out" in k], \
+        "默认路径不应出现投影层参数（旧权重 strict load 必须继续成立）"
+    # 显式加宽: dim → stack_dim → dim; FFN 随 stack_dim 等比（mlp_ratio 不变）
+    m_wide = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                        decoder_steps=square_block_starts(N), heads=4,
+                        decoder_depth=4, stack_dim=2 * D, decoder_dropout=0.05,
+                        query_mask_mode="causal")
+    dec = m_wide.decoder
+    assert dec.stack_dim == 2 * D, dec.stack_dim
+    assert isinstance(dec.stack_in, nn.Linear) and dec.stack_in.in_features == D \
+        and dec.stack_in.out_features == 2 * D, "输入侧应为 dim→stack_dim 投影"
+    assert isinstance(dec.stack_out, nn.Linear) and dec.stack_out.in_features == 2 * D \
+        and dec.stack_out.out_features == D, "输出侧应为 stack_dim→dim 投影"
+    assert len(dec.stack.layers) == 4, "加宽路径 depth 应生效"
+    assert dec.stack.layers[0].linear1.in_features == 2 * D
+    assert dec.stack.layers[0].linear1.out_features == 4 * (2 * D), \
+        "dim_feedforward 应随 stack_dim 等比缩放（mlp_ratio=4）"
+    assert dec.stack.layers[0].dropout1.p == 0.05, "dropout 应透传进 stack"
+    out_w = m_wide(x)
+    assert out_w["F_hat"].shape == (2, N, PATCH_PX), out_w["F_hat"].shape
+    assert out_w["loss"].shape == ()
+    # 加宽权重可 save/load 往返（训练收尾 final_model.pt 依赖此路径）
+    m_wide.load_state_dict(m_wide.state_dict(), strict=True)
+    print(f"[ok] self.stack 加宽: d_model {D}→{dec.stack_dim}, heads=4, "
+          f"depth={len(dec.stack.layers)}, dropout=0.05, "
+          f"投影 {tuple(dec.stack_in.weight.shape)}→{tuple(dec.stack_out.weight.shape)}")
 
     print("\nALL CHECKS PASSED")
