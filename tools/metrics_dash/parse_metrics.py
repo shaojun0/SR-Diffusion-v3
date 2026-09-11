@@ -73,10 +73,34 @@ BASELINE_EVAL_RECON = float(os.environ.get("SRDASH_BASELINE_RECON", "0.3318"))
 
 PROBE_DIR = os.path.join(PROJECT_ROOT, "output", "probe")
 
+#: 训练日志超过这么久没有新写入且未跑完 → 判定为 stalled（不要显示成 "running" 骗人）
+STALE_SECONDS = int(os.environ.get("SRDASH_STALE_SECONDS", "420"))
+
 RUNS = {
+    # ---- 修复版 run（峰值 lr 1.5e-4 → 1.0e-4），当前正在训练 ----
+    "stack2x_lr1e4_slice05": {
+        "label": "stack2x lr1e-4 slice05（修复版）",
+        "role": "fix",
+        "color": "#2ca02c",
+        "logs": [os.path.join(TRAIN_LOG_DIR, "stack2x_lr1e4_slice05.log")],
+        "probe_files": [
+            os.path.join(PROBE_DIR, "probe_stack2x_lr1e4_slice05.json"),
+            os.path.join(TRAIN_LOG_DIR, "probe_stack2x_lr1e4_slice05.json"),
+        ],
+        # 注意 glob 必须精确到 lr1e4，否则会与旧 run 的 probe_stack2x_slice05* 互相串数据
+        "probe_globs": [
+            os.path.join(PROBE_DIR, "probe_stack2x_lr1e4_slice05*.json"),
+            os.path.join(TRAIN_LOG_DIR, "probe_stack2x_lr1e4_slice05*.json"),
+        ],
+        "infer_files": [
+            os.path.join(PROJECT_ROOT, "output", "phase1_v2_stack2x_lr1e4_slice05",
+                         "infer_test.json"),
+        ],
+    },
+    # ---- 旧 run（lr 1.5e-4，后步坍缩），日志停在 step 2500 ----
     "stack2x_slice05": {
-        "label": "stack2x slice05（新实验）",
-        "role": "new",
+        "label": "stack2x lr1.5e-4 slice05（旧）",
+        "role": "old",
         "color": "#1f77b4",
         "logs": [os.path.join(TRAIN_LOG_DIR, "stack2x_slice05.log")],
         # 优先用任务书给出的正式路径，其次回落到历史目录
@@ -84,14 +108,16 @@ RUNS = {
             os.path.join(PROBE_DIR, "probe_stack2x_slice05.json"),
             os.path.join(TRAIN_LOG_DIR, "probe_stack2x_slice05.json"),
         ],
+        # 精确前缀，避免把 probe_stack2x_lr1e4_slice05* 也扫进来
         "probe_globs": [
-            os.path.join(PROBE_DIR, "probe_*stack2x*slice05*.json"),
-            os.path.join(TRAIN_LOG_DIR, "probe_*stack2x*slice05*.json"),
+            os.path.join(PROBE_DIR, "probe_stack2x_slice05*.json"),
+            os.path.join(TRAIN_LOG_DIR, "probe_stack2x_slice05*.json"),
         ],
         "infer_files": [
             os.path.join(PROJECT_ROOT, "output", "phase1_v2_stack2x_slice05", "infer_test.json"),
         ],
     },
+    # ---- 基线对照 ----
     "baseline_blockdiag_slice05": {
         "label": "blockdiag slice05（基线）",
         "role": "baseline",
@@ -245,6 +271,9 @@ def parse_train_log(path: str):
         "total_steps": tqdm_total or TOTAL_STEPS,
         "last_step": train[-1]["step"] if train else (tqdm_max or None),
     }
+    meta["log_age_seconds"] = (
+        round(time.time() - meta["log_mtime"], 1) if meta["log_mtime"] else None
+    )
     meta["progress"] = (
         round(meta["last_step"] / meta["total_steps"], 4)
         if meta["last_step"] and meta["total_steps"]
@@ -255,13 +284,19 @@ def parse_train_log(path: str):
 
 
 def classify_status(meta, evals, text) -> str:
-    if "TRAIN_EXIT=0" in text:
-        return "finished"
-    if "[final]" in text:
+    """finished / running / stalled / unknown。
+
+    ``stalled``：日志在 STALE_SECONDS 内没有任何新写入，但进度又没跑满
+    —— 例如旧 run 在 step 2500 被中断，不能显示成 "running"。
+    """
+    if "TRAIN_EXIT=0" in text or "[final]" in text:
         return "finished"
     if meta["tqdm_step"] and meta["tqdm_total"] and meta["tqdm_step"] >= meta["tqdm_total"]:
         return "finished"
     if meta["n_train_points"] or meta["tqdm_step"]:
+        age = meta.get("log_age_seconds")
+        if age is not None and age > STALE_SECONDS:
+            return "stalled"
         return "running"
     return "unknown"
 

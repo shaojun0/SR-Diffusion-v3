@@ -130,11 +130,18 @@ def render():
         s = series.get(run, {})
         with cols[i]:
             label = meta.get(run, {}).get("label", run)
-            st.metric(f"{label} · step", s.get("last_step") or "—",
-                      delta=f"{s.get('status')}")
+            status = s.get("status")
+            age = s.get("log_age_seconds")
+            age_txt = ("刚刚" if (age is not None and age < 120)
+                       else (f"{age/60:.0f} 分钟前" if age is not None else "无日志"))
+            st.metric(
+                f"{label} · step", s.get("last_step") or "—", delta=f"{status}",
+                delta_color="normal" if status == "running"
+                else ("inverse" if status in ("stalled", "missing") else "off"),
+                help=f"日志：{s.get('log_path')}\n最后写入：{age_txt}")
             st.progress(min(max(s.get("progress") or 0.0, 0.0), 1.0),
                         text=f"进度 {((s.get('progress') or 0) * 100):.1f}%  "
-                             f"({s.get('n_train_points', 0)} 条日志点)")
+                             f"({s.get('n_train_points', 0)} 条日志点 · 日志{age_txt})")
     with cols[-1]:
         n_ok = len(bundle.get("sources", {}).get("ok", []))
         n_miss = len(bundle.get("sources", {}).get("missing", []))
@@ -212,6 +219,36 @@ def render():
             "基线 step1≈1.03 → step5≈0.033 说明后步坍缩。"
         )
 
+        # ---- 三路关键指标对照表（baseline / 旧 / 修复版）----
+        st.subheader("三路关键指标对照")
+        cmp_rows = []
+        for run in runs:
+            s = series.get(run, {})
+            tr, ev = s.get("train") or [], s.get("eval") or []
+            p = probes.get(run) or {}
+            sps = p.get("step_px_scale") or [None] * 5
+            last = tr[-1] if tr else {}
+            last_ev = ev[-1] if ev else {}
+            cmp_rows.append({
+                "run": meta.get(run, {}).get("label", run),
+                "状态": s.get("status"),
+                "最后 step": s.get("last_step"),
+                "train loss": last.get("loss"),
+                "grad_norm": last.get("grad_norm"),
+                "lr": last.get("learning_rate"),
+                "eval_recon": last_ev.get("eval_recon"),
+                "探针 step": p.get("step"),
+                "探针 tag": p.get("tag"),
+                "px_scale step1": sps[0] if len(sps) > 0 else None,
+                "px_scale step5": sps[4] if len(sps) > 4 else None,
+                "z_s_within_std": p.get("z_s_within_std"),
+            })
+        st.dataframe(cmp_rows, width="stretch", hide_index=True)
+        st.caption(
+            f"基线参考 eval_recon = **{baseline_recon}**（图④虚线）。"
+            "`px_scale step1 → step5` 落差越小说明后步越没有贡献（坍缩）。"
+        )
+
     # ================= Tab 2 =================
     with tabs[1]:
         st.subheader("step1~5 的平均值变化（探针 step_px_scale）")
@@ -232,22 +269,24 @@ def render():
                     "step_px_scale"), key=key)
             return True
 
-        c1, c2 = st.columns(2)
-        with c1:
-            p = probes.get("stack2x_slice05")
-            if not probe_bars(p, "新实验 stack2x slice05", "#1f77b4", "bar_new"):
-                empty_note(f"探针缺失，等待训练结束后生成：\n\n"
-                           f"`{cfg.get('probe_dir')}/probe_stack2x_slice05.json`")
-        with c2:
-            p = probes.get("baseline_blockdiag_slice05")
-            if not probe_bars(p, "基线 blockdiag slice05", "#d62728", "bar_base"):
-                empty_note("基线探针缺失")
+        # 每个 run 一格柱状图（自动适配 N 路对照：基线 / 旧 / 修复版）
+        bar_runs = show_runs or runs
+        ncol = min(len(bar_runs), 3) or 1
+        cols = st.columns(ncol)
+        for idx, run in enumerate(bar_runs):
+            with cols[idx % ncol]:
+                p = probes.get(run)
+                label = meta.get(run, {}).get("label", run)
+                if not probe_bars(p, label, meta.get(run, {}).get("color", "#333"),
+                                  f"bar_{run}"):
+                    expected = os.path.join(cfg.get("probe_dir") or "", f"probe_{run}.json")
+                    empty_note(f"探针缺失，等待生成：\n\n`{expected}`")
 
         st.divider()
         st.subheader("随训练进程的变化（多 checkpoint 探针）")
         fig = go.Figure()
         has_hist = False
-        for run in runs:
+        for run in bar_runs:
             hist = [e for e in probe_hist.get(run, []) if e.get("step") is not None]
             if not hist:
                 continue
@@ -267,24 +306,25 @@ def render():
             empty_note("目前每个 run 只有 1 个探针文件，尚不能画随训练进程的曲线。\n\n"
                        "**如何加上新 checkpoint 的探针数据**：把新的探针 JSON 放到 "
                        f"`{cfg.get('probe_dir')}/` 下，文件名带上 step 号"
-                       "（如 `probe_stack2x_slice05_step4000.json`），"
+                       "（如 `probe_stack2x_lr1e4_slice05_step4000.json`），"
                        "或让 JSON 内含 `step` 字段 —— 刷新循环会自动纳入。详见 README。")
 
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
             fig = go.Figure()
-            for run in runs:
+            for run in bar_runs:
                 e = probes.get(run)
                 if not e:
                     continue
                 fig.add_trace(go.Bar(x=steps_axis, y=e.get("z_s_block_cos"),
+                                     marker_color=meta.get(run, {}).get("color"),
                                      name=meta.get(run, {}).get("label", run)))
             base_layout(fig, "块内 cos（z_s_block_cos）vs 采样步", "cos", "采样步")
             chart(fig) if fig.data else empty_note("暂无 z_s_block_cos")
         with c2:
             rows = []
-            for run in runs:
+            for run in bar_runs:
                 e = probes.get(run)
                 if not e:
                     continue
@@ -307,7 +347,7 @@ def render():
     with tabs[2]:
         st.subheader("E_px：step × region 的 0-255 L1 矩阵")
         any_heat = False
-        for run in runs:
+        for run in bar_runs:
             e = probes.get(run)
             if not e or not e.get("E_px"):
                 continue
@@ -333,7 +373,7 @@ def render():
         c1, c2 = st.columns(2)
         with c1:
             fig = go.Figure()
-            for run in runs:
+            for run in bar_runs:
                 e = probes.get(run)
                 if not e:
                     continue
@@ -346,7 +386,7 @@ def render():
             chart(fig) if fig.data else empty_note("暂无 prog_curve_255")
         with c2:
             fig = go.Figure()
-            for run in runs:
+            for run in bar_runs:
                 e = probes.get(run)
                 if not e:
                     continue
@@ -361,7 +401,7 @@ def render():
         st.divider()
         st.subheader("E_nrm（可选，归一化矩阵）")
         any_nrm = False
-        for run in runs:
+        for run in bar_runs:
             e = probes.get(run)
             if not e or not e.get("E_nrm"):
                 continue
