@@ -52,7 +52,7 @@ from torch.utils.data import DataLoader
 from transformers import Dinov2Model
 
 from data_v2 import ParquetImageDataset, V2Collator, DINO_MEAN, DINO_STD
-from model_v2 import SRPhase1V2
+from model_v2 import SRPhase1V2, patches_to_image
 
 
 def parse_args():
@@ -91,16 +91,15 @@ def parse_args():
 
 
 def _patch_to_img(pix_patches, H, W):
-    """(B,N,14,14,3) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 图像。
+    """(B,N,588) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 numpy 图像。
 
-    布局与 DINO 一致: row-major (先 y 后 x), N = (H/14)*(W/14)。
+    布局与反归一化统一走 model_v2.patches_to_image（target_pix 布局的唯一反
+    变换, 见其 docstring 与 model_v2.py 自检 §1b 的往返断言）。**不要在消费方
+    手写 reshape**: 2026-09-15 前这里把 patch 向量当 "(14,14,3) 通道在后" 读,
+    与 decode 的通道优先 (C,14,14) 不符 ⇒ 每个 14×14 patch 内部像素被打乱。
     """
-    B = pix_patches.shape[0]
-    img = pix_patches.reshape(B, H // 14, W // 14, 14, 14, 3) \
-                     .permute(0, 1, 3, 2, 4, 5) \
-                     .reshape(B, H, W, 3)
-    img = img.cpu().numpy() * DINO_STD + DINO_MEAN
-    return np.clip(img, 0, 255)
+    return patches_to_image(pix_patches, H, W, DINO_MEAN, DINO_STD) \
+        .cpu().numpy()
 
 
 def main():
@@ -171,9 +170,16 @@ def main():
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
-    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐。2026-09-15 之前的
-    # 并行产物缺 rec_* 参数 ⇒ strict load 必崩（预期行为; 复现并行时代权重请从
-    # git 取回当时的 model_v2.py）。
+    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐。
+    # ⚠️ checkpoint 兼容性（2026-09-15 更正, 与旧注释相反）: 循环版**不新增
+    # 任何参数**（rec_* 随并行路径的开关一起删掉了）, 与并行时代默认配置的
+    # state_dict 逐 key 逐形状完全相同（实测 44 keys 全等）⇒ 2026-09-15 之前
+    # 训出的 final_model.pt 用本代码 strict load **不会报错**, 会按新语义
+    # （循环 + carry detach + 直预 loss）静默算错、画出/量错的图。
+    # 本文件与 model_info.json 目前都无法自动区分这两种产物, 判据只能靠人工:
+    # 产物目录的 args.json/model_info.json 里若没有本轮新增字段（如
+    # "decoder_steps" 之外看不到循环语义）, 一律先确认它是在哪个 commit 训的;
+    # 要复现并行产物请用 git 取回当时的 model_v2.py, 不要拿旧权重在本代码上推理。
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=heads, mlp_ratio=mlp_ratio,

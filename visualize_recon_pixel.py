@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader
 from transformers import Dinov2Model
 
 from data_v2 import ParquetImageDataset, V2Collator, DINO_MEAN, DINO_STD
-from model_v2 import SRPhase1V2
+from model_v2 import SRPhase1V2, patches_to_image
 
 
 def parse_args():
@@ -64,15 +64,16 @@ def parse_args():
 
 
 def patch_to_img(pix_patches, H, W):
-    """(B,N,14,14,3) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 (uint8)。
-    布局与 DINO 一致: row-major (先 y 后 x), N = (H/14)*(W/14)。
+    """(B,N,588) 归一化像素 patch → (B,H,W,3) 反归一化 0-255 (uint8)。
+
+    布局与反归一化统一走 model_v2.patches_to_image（target_pix 布局的唯一反
+    变换, 见其 docstring 与 model_v2.py 自检 §1b 的往返断言）。**不要在消费方
+    手写 reshape**: 2026-09-15 前这里把 patch 向量当 "(14,14,3) 通道在后" 读,
+    与 decode 的通道优先 (C,14,14) 不符 ⇒ 图里每个 14×14 patch 内部像素被打乱
+    （"原图"面板与重建面板同用一个错变换, 所以肉眼看不出, 但两类图都不是真图）。
     """
-    B = pix_patches.shape[0]
-    img = pix_patches.reshape(B, H // 14, W // 14, 14, 14, 3) \
-                     .permute(0, 1, 3, 2, 4, 5) \
-                     .reshape(B, H, W, 3)
-    img = img.cpu().numpy() * DINO_STD + DINO_MEAN
-    return np.clip(img, 0, 255).astype(np.uint8)
+    img = patches_to_image(pix_patches, H, W, DINO_MEAN, DINO_STD)
+    return img.cpu().numpy().astype(np.uint8)
 
 
 def main():
@@ -122,8 +123,11 @@ def main():
     decoder_dropout = args.decoder_dropout
     if train_info is not None and "decoder_dropout" in train_info:
         decoder_dropout = float(train_info["decoder_dropout"])
-    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐（2026-09-15 之前的
-    # 并行产物缺 rec_* 参数 ⇒ strict load 必崩, 预期行为）。
+    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐。
+    # ⚠️ checkpoint 兼容性（2026-09-15 更正, 与旧注释相反）: 循环版不新增任何
+    # 参数, 与并行时代默认配置的 state_dict 逐 key 逐形状完全相同 ⇒ 2026-09-15
+    # 之前训出的 final_model.pt strict load **不会报错**, 会按新语义静默算错并
+    # 画出错误的对比图。要复现并行产物请用 git 取回当时的 model_v2.py。
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=heads,

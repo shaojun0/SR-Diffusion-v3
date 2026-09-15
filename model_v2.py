@@ -367,6 +367,49 @@ class PixelHead(nn.Module):
         return self.net(feat)
 
 
+# ═══ patches_to_image — 像素 patch → 图像（target_pix 布局的唯一反变换）═══
+
+def patches_to_image(pixels: Tensor, H: int, W: int,
+                     mean: Optional[Sequence[float]] = None,
+                     std: Optional[Sequence[float]] = None,
+                     clamp_255: bool = True) -> Tensor:
+    """(B,N,588) 像素 patch → (B,H,W,3) 图像（给定 mean/std 时反归一化到 0-255）。
+
+    **布局的权威定义 = SRPhase1V2.decode 里 target_pix 的构造**: patch 向量 =
+    (C,14,14) **通道优先**（展开序 = c*14*14 + dy*14 + dx）, patch 顺序
+    row-major（先 y 后 x）, N=(H/14)*(W/14)。本函数是它的**严格逆**,
+    model_v2.py 自检 §1b 有往返断言（patches_to_image(target_pix,
+    clamp_255=False) == 输入图 (B,H,W,C) 逐位相等）。
+
+    踩坑记录（2026-09-15 修）: 消费方历史上把反变换写成
+    `reshape(B, gh, gw, 14, 14, 3).permute(0,1,3,2,4,5)`——把 588 当成
+    "(14,14,3) 通道在后"读, 与 decode 的通道优先布局不符 ⇒ 每张"重建图"的
+    每个 14×14 patch 内部像素被打乱（实测往返 vs 原图 max|diff|=255 /
+    mean≈85; 修正后为 0）。训练不受影响（loss 两侧同用同一个 patch 平铺
+    向量, 无需求逆）, 但可视化与 0-255 口径的 L1 都不可信。消费方
+    （infer_v2_test.py / visualize_recon_pixel.py）一律调用本函数。
+
+    clamp_255: 只在反归一化后生效（默认 True）; 纯布局往返（输入已在
+    归一化空间、不传 mean/std）传 False, 否则会被 clamp 破坏数值。
+    """
+    B, N, px = pixels.shape
+    assert px == 3 * 14 * 14, f"patch 向量长度应为 588, got {px}"
+    assert (H // 14) * (W // 14) == N, \
+        f"N={N} 与 {H}x{W} 的 patch 数 {(H // 14) * (W // 14)} 不符"
+    img = pixels.reshape(B, H // 14, W // 14, 3, 14, 14) \
+                .permute(0, 1, 4, 2, 5, 3) \
+                .reshape(B, H, W, 3)
+    if mean is not None and std is not None:
+        m = torch.as_tensor(mean, dtype=img.dtype,
+                            device=img.device).view(1, 1, 1, 3)
+        s = torch.as_tensor(std, dtype=img.dtype,
+                            device=img.device).view(1, 1, 1, 3)
+        img = img * s + m
+    if clamp_255:
+        img = img.clamp(0.0, 255.0)
+    return img
+
+
 # ═══ OutputQueryDecoder — 输出查询注意力解码器（采样时刻上输出全部 patch）═══
 
 class OutputQueryDecoder(nn.Module):
@@ -471,9 +514,17 @@ class OutputQueryDecoder(nn.Module):
             Y = self.stack(self.stack_in(Y), A_in[:, lo:hi + 1])
             Y = self.stack_out(Y)
             Y_total.append(Y)                                    # 该步全部 patch 预测
-            # carry detach: 步间不反传 ⇒ 每步 Y_t 只从自己那一步的损失收 1 份梯度
-            # （decode 侧无累加, 不存在跨步恒等捷径 ⇒ 全局按步解耦）。前向数值与
-            # 不 detach 逐位相同 ⇒ 各步预测 / loss 数值不变, 只是梯度图被切断。
+            # carry detach（**当前唯一行为, 没有开关**）: 步间不反传 ⇒ 每步 Y_t
+            # 只从自己那一步的损失收 1 份梯度（decode 侧无累加, 不存在跨步恒等
+            # 捷径 ⇒ 全局按步解耦）。前向数值与不 detach 逐位相同 ⇒ 各步预测 /
+            # loss 数值不变, 只是梯度图被切断。**代价（实测）**: ①∂L_t/∂Y_{t-1}=0,
+            # 即循环只有前向耦合、BPTT 被关闭——没有任何损失项要求 Y_{t-1} 成为
+            # "对下一步有用的草稿"; ②query_base 只从 step0 的损失收梯度
+            # （∂L_t/∂query_base=0 for t≥1, 因喂给下一步的 query 被 detach）,
+            # 而 step0 恰是读窗口最小的那一步。注意这与设计文档
+            # doc/2026-09-15/DESIGN_v2_recurrent.md §2.4 记的默认
+            # （recurrent_detach=False = 整条循环反传 BPTT）**不一致**: 那些开关
+            # 已随并行路径删除, 本行是唯一路径; 需要 BPTT 的口径只能改这里。
             Y = (self.query_base + Y).detach()                    # 喂给下一步当查询
         Y = torch.stack(Y_total, dim=1)                          # (B,|T|,N,D) 沿步
         self.last_Y = Y                                          # 采样步全部 patch 预测
@@ -619,6 +670,8 @@ class SRPhase1V2(nn.Module):
         target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
                       .permute(0, 2, 4, 1, 3, 5) \
                       .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
+        # 本布局 = (C,14,14) 通道优先; 唯一反变换 = patches_to_image
+        # （自检 §1b 有"target_pix → 图像 == 原图"的往返断言; 消费方别再手写）
         # 直接预测: 每步 Y_t 各自过 PixelHead（无累加/集成 ⇒ F_hat = 最后一步）
         Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588) 每步直接预测
         F_pix = Y_pix[:, -1]                            # (B,N,588) 最终输出 = 最后一步
@@ -745,8 +798,24 @@ if __name__ == "__main__":
                .permute(0, 2, 4, 1, 3, 5).reshape(B, N, PATCH_PX)
     assert torch.isclose(out["recon"],
                          F.l1_loss(out["F_hat"], target)), "recon 应为像素 L1"
+    # ── 1b. 像素 patch ↔ 图像 往返（布局回归测试, 2026-09-15）──
+    # patches_to_image 必须是 decode 里 target_pix 布局（通道优先 (C,14,14)）
+    # 的严格逆。历史上消费方把反变换写成 (14,14,3) 通道在后 ⇒ 每个 patch
+    # 内部像素被打乱（可视化全错）, 这条断言就是那次 bug 的回归测试。
+    rt = patches_to_image(out["target_pix"], H, W, clamp_255=False)  # (B,H,W,C)
+    assert rt.shape == (B, H, W, C), rt.shape
+    assert torch.allclose(rt, x.permute(0, 2, 3, 1)), \
+        "patches_to_image 必须与 decode 的 target_pix 布局互为严格逆（通道优先）"
+    # 反归一化 + clamp 路径也要能跑通（推理/可视化走这条）
+    img255 = patches_to_image(out["F_hat"], H, W,
+                              mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
+                              std=[0.229 * 255, 0.224 * 255, 0.225 * 255])
+    lo, hi = float(img255.detach().min()), float(img255.detach().max())
+    assert img255.shape == (B, H, W, C) and lo >= 0.0 and hi <= 255.0, \
+        (img255.shape, lo, hi)
     print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} (像素 {PATCH_PX}D) "
-          f"loss={out['loss'].item():.4f}")
+          f"loss={out['loss'].item():.4f}; patch↔图像 往返逐位相等, "
+          f"0-255 反归一化范围 [{lo:.1f}, {hi:.1f}]")
 
     # ── 2. OutputQueryDecoder: 采样计划 + 顺序循环(块切片当 memory) ──
     # 注: 解码器现在**没有** attn_mask / tgt_mask（读窗口是 A[:, lo:hi+1] 块切片,
@@ -947,8 +1016,13 @@ if __name__ == "__main__":
 
     # ── 5. self.stack 加宽（stack_dim ≠ dim, 前后 Linear 投影）+ dropout ──
     # 默认（stack_dim=0 ⇒ stack_dim==dim）不加任何投影: 不新增 stack_in/out 参数
-    # （与 stack_dim=0 的循环实现同构; 注意循环架构本身始终带 rec_* 参数 ⇒ 与
-    # 并行时代的 checkpoint 形状不兼容, 这是本轮架构切换的既定代价）。
+    # （与 stack_dim=0 的循环实现同构）。
+    # ⚠️ checkpoint 兼容性（2026-09-15 更正）: 循环版**不新增任何参数**（没有
+    # rec_* 参数——那些随并行路径的开关一起删掉了）, 故与并行时代**默认配置**的
+    # state_dict 逐 key 逐形状完全相同（实测 44 keys 全等）⇒ 旧 final_model.pt
+    # 用本代码 strict load **不会报错**, 会按新语义（循环 + carry detach + 直预
+    # loss）静默算错。要复现并行产物必须用 git 取回当时的 model_v2.py, 不要拿
+    # 旧权重在本代码上推理。
     assert model.decoder.stack_dim == D
     assert isinstance(model.decoder.stack_in, nn.Identity), \
         "默认 stack_dim=dim 时输入侧应为 Identity（零额外参数）"

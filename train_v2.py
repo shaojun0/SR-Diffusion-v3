@@ -59,6 +59,13 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     · 循环 carry detach（当时 decode 侧还有一层"累加 carry detach", 现已随累加
       口径删除）⇒ 每步 Y_t 恰从自己那一步的损失收 1 份梯度（步间无梯度回流）;
       代价 = 时间（步间顺序依赖, 无法并行算完 T 步）。
+    · ⚠️ detach 的实测语义（2026-09-15 复核, 与 doc/2026-09-15/
+      DESIGN_v2_recurrent.md §2.4 记的"默认 recurrent_detach=False = 整条循环
+      反传 BPTT"不同）: carry 被硬编码 detach ⇒ ①∂L_t/∂Y_{t-1}=0,
+      循环只有**前向**耦合, 没有任何损失项要求"上一步输出成为对下一步有用的
+      草稿"; ②query_base 只从 step0 的损失收梯度（∂L_t/∂query_base=0, t≥1）。
+      "后期步基于当前画布做残差修正"目前只有前向通路支撑; 要 BPTT 口径需改
+      model_v2.py OutputQueryDecoder.forward 里那一行（已无开关）。
 
 2026-09-15（损失口径 = 直接预测, 无累加）:
     · 训练 loss = `mean_t L1(PixelHead(Y_t), target)`: 每个采样步的输出 Y_t
@@ -172,9 +179,10 @@ def parse_args():
 
 # ═══════════════════════════════════════════════════════════════
 # Eval 指标 — Trainer 的 prediction_step 对无 labels 模型直接 forward,
-# 把输出 dict 按插入序转成值的元组 (loss, recon, F_hat)（多 batch 后是
-# 拼接数组的元组; 4.x 与 5.x 行为一致）。该路径 loss=None, eval loop 不会
-# 自动算 eval_loss, 所以在这里显式从模型输出里取 loss / recon。
+# 把输出 dict 按插入序转成值的元组（多 batch 后是拼接数组的元组; 4.x 与
+# 5.x 行为一致）。注意: HF 会把 "loss" 从 logits 里剔除（只剩 recon /
+# F_hat）, 所以本函数实际只统计得到 recon; eval_loss 由 Trainer 自己的
+# compute_loss 路径报告（见下面的 SRPhase1V2Trainer）, 不在这里。
 # ═══════════════════════════════════════════════════════════════
 
 def compute_metrics(eval_pred):
@@ -182,12 +190,14 @@ def compute_metrics(eval_pred):
     if isinstance(preds, dict):
         items = preds
     elif isinstance(preds, (tuple, list)):
-        # prediction_step 无 labels 路径: logits = 除 loss 外所有输出
-        # (recon, F_hat)（dict 插入序）。loss 单独在 eval_loss 里报告。
+        # prediction_step 无 labels 路径: logits = 除 loss/ignore_keys 外所有
+        # 输出（dict 插入序）= (recon, F_hat)。
         items = dict(zip(("recon", "F_hat"), preds))
     else:
         items = {}
     metrics = {}
+    # ("loss", "recon") 里 "loss" 因上面所述恒为 None（保留只是防御性写法,
+    # 若将来 HF 不再剔除 loss 键也能取到）。
     for k in ("loss", "recon"):
         v = items.get(k)
         if v is not None:
