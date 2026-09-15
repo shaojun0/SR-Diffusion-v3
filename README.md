@@ -35,12 +35,12 @@
 register 式（2026-08-28 起唯一路径，`model_v2.py` 头部 docstring 是权威说明）：
 - specials 作为额外 token 直接拼进 DINOv2-large 输入序列 `[cls; specials(K); patches(N)]`，DINO 24 层全双向算出 z_s（register token 式）。
 - register 数 K（num_specials）与 patch 数 N 解耦：**K 由"最终生效采样步集"自动推导**（`K = min(max_t((⌊√t⌋+1)²−1), N)`，无"花瓶 register"）。
-- 解码器 = OutputQueryDecoder（输出查询注意力 + 分块读侧 mask + 查询自注意力**块对角 tgt_mask**（默认）+ 2 层 PixelHead MLP）→ 像素重建。
-- 损失 = **每个采样步累加结果的平权全覆盖像素 L1**（`mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)`，全轨迹深监督），**不是**"直接监督 `F_hat`"——`F_hat = Σ_t Y_t` 的 L1 只是监控量 `recon`；累加 carry 默认 `detach`（"按步解耦"）。两档开关：`--loss_mode {cumulative,final}`、`--loss_decouple {true,false}`（`false`=保留跨步恒等捷径，循环架构建议试；详见 `doc/2026-09-15/DESIGN_v2_recurrent.md` §2.7）。K 压缩（如 K=63）是练联想的主要杠杆。
-- 实验开关：`query_mask_mode`（`train_v2.py --query_mask_mode`，默认 **`blockdiag`**）——查询自注意力语义。`blockdiag` = 块对角，步间自注意力完全隔离（`memory_mask` 的"每步只见自己的块"在整条前向路径上字面成立，跨步梯度回流切断）；`causal` = 历史行为（块下三角，3151bab 之前全部产物的口径，**复现历史结果须显式传**）。详见 `doc/2026-09-10/DESIGN_query_mask_mode.md`。
-  - 本项**不改任何权重形状** ⇒ 旧 checkpoint 双向可载，但模式错了 `strict load` 不报错、只会静默算错；消费方（`infer_v2_test.py` / `visualize_recon_pixel.py`）一律以 `model_info.json` 记录值为准，无该字段的旧产物 fallback 到 `causal`。
+- 解码器 = OutputQueryDecoder（**循环读出**：step1 查询 = `query_base`，step t≥2 查询 = `query_base + fuse(上一步输出)`；读侧分块 `memory_mask` 每步只读自己那块 `z_s`；合成 `rec_*` 参数 + 2 层 PixelHead MLP）→ 像素重建。
+- 损失 = **直接预测口径**（2026-09-15 起）：每个采样步的输出 `Y_t` **各自直接**过 PixelHead 预测整图（无累加/集成），`loss = mean_t L1(PixelHead(Y_t), target)`（全轨迹深监督、各步平权）；`F_hat = Y_pix[:, -1]`（最后一步的直接预测），监控量 `recon` = 它的 L1（= loss 的最后一项）。旧的"累加结果"口径（`mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)`）与 `--loss_mode` / `--loss_decouple` 两个开关**已整块删除**（传即 `TypeError`，不静默忽略；复现从 git 取回，旧细节见 `doc/2026-09-15/DESIGN_v2_recurrent.md` §2.7）。K 压缩（如 K=63）是练联想的主要杠杆。
+- 循环架构开关（`recurrent_*`）：`--recurrent_state {cumulative,increment}`（反馈的是累积估计还是上一步增量）、`--recurrent_fuse {proj,add}`（zero-init Linear / 标量门控）、`--recurrent_memory {block,prefix,open}`（读窗口：block=只读自己那块分块掩码 / prefix=累积前缀 / **open=每步读全部键**）、`--recurrent_step_embed`（逐采样步 zero-init 偏置；**open 时必需**, 否则实测各步逐位退化）、`--recurrent_detach`（截断 BPTT）。详见 `doc/2026-09-15/DESIGN_v2_recurrent.md`（§2.5 掩码怎么变 / §2.5.2 open 步退化）。
+- **已删除（2026-09-15, 需复现请从 git 取回）**：并行解码路径（|T| 步一次算完 + 跨步 `tgt_mask`）与 `--recurrent` / `--query_mask_mode` 两个开关——循环架构是**唯一路径**，上述 `recurrent_*` 子开关里没有"总开关"。`model_v2.py` 不再有 `query_mask_mode`/`tgt_mask`（传即 `TypeError`，不静默忽略），`build_causal_query_mask` 仅作历史遗留纯函数供诊断脚本引用。
+  - **本轮 checkpoint 形状与并行时代不兼容**（新增 `rec_*` 参数）：旧 `final_model.pt` 用当前代码 `strict load` 会明确报错；需要它就用 git 取回当时的 `model_v2.py`（`git log -- model_v2.py`，最后一个含并行路径的提交 = `043ef2a`）。
   - 早期文档提到的 `SRV2_MEMORY_OPEN`（读侧掩码总开关）**已不在代码里**（`0a1ee45` 回滚时移除），勿再使用。
-- 实验开关（2026-09-15）：`recurrent`（`train_v2.py --recurrent`，默认**关**）——把解码器从"一次并行算完 T 步"改成**顺序循环**：step1 查询 = `query_base`（去掉 `A_t`），step t≥2 查询 = `query_base + fuse(上一步的输出)`；`memory_mask` 不变（每步仍只读自己那块 `z_s`），历史输出经循环显式携带 ⇒ 后期步可基于当前估计做残差修正。**代价 = 时间**（步间顺序依赖）。子开关 `--recurrent_state {cumulative,increment}`（反馈的是累积估计还是上一步增量）、`--recurrent_fuse {proj,add}`（zero-init Linear / 标量门控）、`--recurrent_memory {block,prefix,open}`（读窗口：block=与并行同一分块掩码 / prefix=累积前缀 / **open=删掉 memory_mask, 交叉注意力进循环**）、`--recurrent_step_embed`（逐采样步 zero-init 偏置；**open 时必需**, 否则实测各步逐位退化）、`--recurrent_detach`（截断 BPTT）。默认关时并行路径**逐位不变**；开启新增 `rec_*` 参数 ⇒ 与非循环 checkpoint 形状不兼容（`strict load` 会明确报错）。详见 `doc/2026-09-15/DESIGN_v2_recurrent.md`。
 
 ## 2. 快速开始
 
@@ -92,7 +92,7 @@ DINO，但读出上限 ~19 使"键分化"的收益≈0，键收到的主要是�
 
 | 耦合 | 表现 | 干预手段（候选） |
 |---|---|---|
-| **步间任务同构** | 每步监督在函数形式上等价（都做 `L1(累加_t, 整图)`、平权、各收 1 份梯度）——"哪一步干活"对损失中性，step-1 可以一肩扛完全部 | **P1 分区域掩码损失**：step t 只监督自己对应的 patch 行区，制造 step-1 抢不走的**私有目标**；让损失本身产生 register 分工压力 |
+| **步间任务同构** | 每步监督在函数形式上等价（当时口径都做 `L1(累加_t, 整图)`；**现为** `L1(PixelHead(Y_t), 整图)`、仍平权、各收 1 份梯度）——"哪一步干活"对损失中性，step-1 可以一肩扛完全部 | **P1 分区域掩码损失**：step t 只监督自己对应的 patch 行区，制造 step-1 抢不走的**私有目标**；让损失本身产生 register 分工压力 |
 | **键的内容可寻址性不足** | 后区键的读出内容高度相似（slice27_v2 位置 16..63 两两 cos 0.963–0.974，采样种子 cos 0.998+），解码器难以**按内容指名**某一位 | **P2 F1/E2' 编码侧注入**：special 输入拼 `Linear(patch_feat)`，让键有"各自携带逐 patch 内容"的可能（可叠正交/负余弦/使用率正则） |
 
 - 要点：① 两者需**同时**处理——只给私有目标则键仍无可读内容，只改键则损失仍奖励后步归零；② 手段不是外部扰动/正则"推一把"，而是改损失/改输入通路，让均衡点本身失稳、让分工方向长出梯度；③ 已证伪的单侧手段：去解耦/后步加权（17.46 vs 18.77）、课程 fade-in（只推迟同一均衡）、残差目标显式化（单独无效——零仍是残差不可预测时的最优）。
@@ -106,7 +106,7 @@ DINO，但读出上限 ~19 使"键分化"的收益≈0，键收到的主要是�
 - 且解码器 `pos_embed` 是**加性**偏移，块内键 `z_s[j] + pos_p` 因内容不同而彼此不同——"键表示趋同"在措辞上也不成立。
 
 ⇒ 键相似度**既不必要也不充分**，不能单独作为判据或优化目标。仍然可用的判据（全部用**匹配步**，且历史对比一律用 `eval_recon`，勿用 `eval_loss`——口径已随 region_loss 变化）：
-① 后步 `\|W·Y_t\| ≫ 0.015`；② 累加曲线出真阶梯（覆盖区单调降）且 `eval_recon` 不劣化；③ 各步**隔离** L1 在自己区域上相近（不再 39 vs 61）。
+① 后步 `\|W·Y_t\| ≫ 0.015`；② 渐进曲线出真阶梯（覆盖区单调降；当时口径为累加曲线，现为每步直接预测曲线）且 `eval_recon` 不劣化；③ 各步**隔离** L1 在自己区域上相近（不再 39 vs 61）。
 （早期框架同时声称"交换任意键系统不变"——该对称性在当前逐位置 `pos_embed` 下**不存在**：置换 register 会改变其键与查询种子。仅在 `3151bab` 的块级共享变体下，解码器读出路径才对**块内非种子成员**的置换精确不变；这条精确不变性同时意味着"塌缩一旦发生就没有免费的恢复梯度"，正是 `ANALYSIS_k3_posenc_failure.md` §2.3 实测的 `0.00e+00`。详见该文档 §2.2/§2.4/§2.5。）
 
 **状态：留档待决。** 2026-09-07 用户暂无时间，解决路径后续再想；本条目只记录框架与判据，不作实施承诺。
@@ -115,7 +115,7 @@ P1 曾实现并通过本地自检 + 服务器数值冒烟（`doc/2026-09-07/DESI
 **2026-09-10 补充证据（掩码侧已排除）**：`query_mask_mode` 默认翻转为 `blockdiag` 后按 slice[0:5] K=35 单卡 bs=32 复跑，`eval_recon` 0.3584→**0.3318**（`doc/2026-09-10/REPORT_v2_blockdiag_slice05.md`）；但同尺探针（`doc/2026-09-10/PROBE_v2_step_collapse_blockdiag.md`）实测 `step_px_scale` = `[1.0273, 0.0395, 0.0349, 0.0342, 0.0335]`（causal 对照 `[1.0072, 0.0630, 0.0584, 0.0572, 0.0563]`）——
 **step1~5 仍然坍缩，且 blockdiag 下后步相对量级从 5.6–6.3% 降到 3.3–3.8%**，区域×步矩阵两臂都是五行逐位相同。⇒ 上述增益来自**单发通路收敛更好**，不是后步分工被激活；**掩码开关不是本条的杠杆**，与 `ANALYSIS_k3` §5 预判一致。附带一条判据层实证：blockdiag 的逐块 register cos 从 `[0.619, 0.854, 0.990, 0.998, 0.999]` 变"健康"到 `[0.734, 0.876, 0.918, 0.916, 0.926]`、`within-std` 0.054→0.095，而后步输出反而**更接近零**——实测支持本节"键相似度既不必要也不充分"的判据修正。
 
-**2026-09-15 新尝试：循环架构（代码已就位，待服务器训练）**：旧架构在 `blockdiag` 下"步 t 的查询行看不到其它步、`memory_mask` 又只给它自己那块 `z_s`"⇒ 每步的可用信息只有一块键 + 静态 `query_base`，用一块键重建整图不成立 ⇒ 最优解退化为"交给 step-1、自己输出≈0"（§1 诊断的结构性缺口）。新方案把解码器改为**顺序循环**：step1 查询 = `query_base`（去掉 `A_t`），step t≥2 查询 = `query_base + fuse(上一步的输出)`；历史输出经循环显式携带 ⇒ 后步可基于"当前画到哪"做残差修正。**掩码侧**：跨步 `tgt_mask` **删除**（其职责被循环状态 `h` 取代，单步内 N 行全双向自注意力自动等价 `blockdiag` 对角块）；读侧 `memory_mask` 保留、并升为三档 `--recurrent_memory`（默认 `block` 与并行路径逐位同一掩码；`prefix`=累积前缀；`open`=**删掉 mask**、每步读全部键 ⇒ 交叉注意力进循环，对同一份键迭代细化，**但需配 `--recurrent_step_embed`**——实测 open + zero-init + 无步信号时各步输出逐位相同）。代价 = 时间（步间顺序依赖，无法并行算完 T 步）。开关 `--recurrent`（默认关 ⇒ 旧并行路径逐位不变），细节/自检/判据见 **`doc/2026-09-15/DESIGN_v2_recurrent.md`**（§2.5 专门讲掩码怎么变、§2.5.2 讲 open 的步退化）。**损失侧**：训练损失一直是**累加口径**（逐步深监督），`F_hat` 的 L1 只是监控量 `recon`；但循环下"累加 carry detach"会切断跨步恒等梯度（`rec_proj` zero-init 时循环通路梯度也恰为 0 ⇒ 各步初始独立受训），故新增 `--loss_decouple false`（耦合 BPTT 深监督）与 `--loss_mode final`（只监督 `F_hat`，不建议先试）——见该 doc §2.7。
+**2026-09-15 循环架构成为唯一路径（并行路径已删除）**：旧架构在 `blockdiag` 下"步 t 的查询行看不到其它步、`memory_mask` 又只给它自己那块 `z_s`"⇒ 每步的可用信息只有一块键 + 静态 `query_base`，用一块键重建整图不成立 ⇒ 最优解退化为"交给 step-1、自己输出≈0"（§1 诊断的结构性缺口）。解法 = 把解码器改为**顺序循环**：step1 查询 = `query_base`（去掉 `A_t`），step t≥2 查询 = `query_base + fuse(上一步的输出)`；历史输出经循环显式携带 ⇒ 后步可基于"当前画到哪"做残差修正。**掩码侧**：跨步 `tgt_mask` 删除（其职责被循环状态 `h` 取代，单步内 N 行全双向自注意力自动等价 `blockdiag` 对角块）；读侧 `memory_mask` 保留、升为三档 `--recurrent_memory`（`block`/`prefix`/`open`，**open 需配 `--recurrent_step_embed`**——实测 open + zero-init + 无步信号时各步输出逐位相同）。代价 = 时间（步间顺序依赖，无法并行算完 T 步）。**并行路径与 `--recurrent`/`--query_mask_mode` 开关随后整块删除**（循环为唯一路径，`git log -- model_v2.py` 可找回），细节/自检/判据见 **`doc/2026-09-15/DESIGN_v2_recurrent.md`**（§2.5 掩码怎么变、§2.5.2 open 的步退化）。**损失侧**：该轮训练损失为**累加口径**（逐步深监督，`F_hat` 的 L1 只是监控量 `recon`）；该口径连同 `--loss_decouple` / `--loss_mode` 开关已于 2026-09-15 **整块删除**——现行口径 = 每步 `Y_t` 各自直接过 PixelHead 预测整图（`mean_t L1(PixelHead(Y_t), target)`），`F_hat = Y_pix[:, -1]`；旧口径细节见该 doc §2.7。
 
 **战略上下文**：渐进阶梯**不是** GOAL 验收项（`doc/2026-08-28/GOAL_compression_for_nlp.md`），Phase 2 一次性消费全部 K token；v4 单发（8.26）已是仓库最佳。除非"token 增量性"叙事本身成为目标，本条目可长期冻结，不挡主路线。
 

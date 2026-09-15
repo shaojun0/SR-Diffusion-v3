@@ -1,8 +1,9 @@
 """
 可视化（像素目标版, 2026-08-27）: 原图 vs 各采样步的像素重建。
 重建目标 = 原始像素 patch (B,N,588) → 反归一化回 0-255 → 直接显示。
-每行一张 test 图, 列 = 原图 + 各采样步的重建（2026-08-31 起为**累加**
-语义: 第 n 步 = 前 n 步预测之和, 累积步数越多重建越完整）。
+每行一张 test 图, 列 = 原图 + 各采样步的重建（2026-09-15 起为**直接预测**
+语义: 第 n 步 = 该步 Y_n 自己过 PixelHead 的整图预测, 无累加/集成;
+2026-08-31~09-15 为累加口径"第 n 步 = 前 n 步预测之和", 已随累加路径删除）。
 
 register 式（唯一路径）: specials(K) 进 DINO 输入序列, K = num_specials 由
 model_info.json（训练侧记录）优先对齐; 没有则 --num_specials（0=auto,
@@ -53,26 +54,8 @@ def parse_args():
                    help="分块切片起点(与训练 --slice_start 一致); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
                    help="分块切片终点(与训练 --slice_end 一致); 默认 None = 全部分块")
-    p.add_argument("--query_mask_mode", default=None,
-                   choices=("causal", "blockdiag"),
-                   help="解码器查询自注意力掩码模式(必须与训练一致)。默认取 "
-                        "model_info.json 记录值; 无记录(2026-09-10 之前的旧产物)则 "
-                        "causal(当时的历史行为)。本项不改权重形状 → 错了不报错, "
-                        "只会静默画错")
-    p.add_argument("--recurrent", action="store_true",
-                   help="循环架构(与训练一致)。默认取 model_info.json 记录值; "
-                        "无记录 = False(旧非循环产物)。改变权重形状 -> 错了 load 直接崩")
-    p.add_argument("--recurrent_state", default="cumulative",
-                   choices=("cumulative", "increment"),
-                   help="循环反馈状态(与训练一致); 默认取 model_info.json")
-    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
-                   help="循环反馈融合方式(与训练一致); 默认取 model_info.json")
-    p.add_argument("--recurrent_memory", default="block",
-                   choices=("block", "prefix", "open"),
-                   help="循环路径读窗口(与训练一致); 默认取 model_info.json")
-    p.add_argument("--recurrent_step_embed", action="store_true",
-                   help="逐采样步可学习偏置(与训练一致); 默认取 model_info.json。"
-                        "改变权重形状 -> 错了 load 直接崩")
+    # 注: 解码器是顺序循环（唯一路径）; 2026-09-15 之前并行路径的 --recurrent*
+    # 开关已删除, 结构超参一律以 model_info.json 为准。
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
@@ -122,24 +105,6 @@ def main():
               f"产物, K=N={num_patches}）: 若 strict load 形状不符, 请 "
               f"显式 --num_specials {num_patches}")
 
-    # query_mask_mode 对齐（与 num_specials 同理, 且**更隐蔽**）:
-    # 本项不改变任何权重形状 ⇒ 模式错了 strict load 不报错, 只会静默画错图。
-    # 训练侧默认自 2026-09-10 起为 blockdiag; 无该字段的产物一律是此前用
-    # causal 训的, 故 fallback 取 causal（历史行为）。
-    if train_info is not None and "query_mask_mode" in train_info:
-        qmm = str(train_info["query_mask_mode"])
-    elif args.query_mask_mode:
-        qmm = args.query_mask_mode
-    else:
-        qmm = "causal"
-        if train_info is not None:
-            print("[info] model_info.json 无 query_mask_mode 字段（2026-09-10 之前的"
-                  "旧产物）: 按当时的历史行为 causal 构造")
-        else:
-            print(f"[warn] 无 {info_path}: 无法判断训练时掩码模式, 按历史行为 causal "
-                  f"构造; 若该权重是 2026-09-10 之后训练的, 请显式传 "
-                  f"--query_mask_mode blockdiag")
-
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
@@ -157,24 +122,8 @@ def main():
     decoder_dropout = args.decoder_dropout
     if train_info is not None and "decoder_dropout" in train_info:
         decoder_dropout = float(train_info["decoder_dropout"])
-    # 循环架构对齐: model_info.json 优先; 无记录 = False(2026-09-15 之前的产物)。
-    # recurrent 改变权重形状 -> 判断错 strict load 直接崩; state/fuse 不改形状 -> 需对齐
-    recurrent = args.recurrent
-    recurrent_state = args.recurrent_state
-    recurrent_fuse = args.recurrent_fuse
-    recurrent_memory = args.recurrent_memory
-    recurrent_step_embed = args.recurrent_step_embed
-    if train_info is not None and "recurrent" in train_info:
-        recurrent = bool(train_info["recurrent"])
-        recurrent_state = str(train_info.get("recurrent_state", recurrent_state))
-        recurrent_fuse = str(train_info.get("recurrent_fuse", recurrent_fuse))
-        recurrent_memory = str(train_info.get("recurrent_memory", recurrent_memory))
-        recurrent_step_embed = bool(train_info.get("recurrent_step_embed",
-                                                   recurrent_step_embed))
-    if recurrent != args.recurrent:
-        print(f"[info] model_info.json 记录 recurrent={recurrent}"
-              f"(state={recurrent_state}, fuse={recurrent_fuse}, "
-              f"memory={recurrent_memory}): 以 model_info 为准")
+    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐（2026-09-15 之前的
+    # 并行产物缺 rec_* 参数 ⇒ strict load 必崩, 预期行为）。
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=heads,
@@ -182,14 +131,8 @@ def main():
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
                        num_specials=num_specials,
-                       query_mask_mode=qmm,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout,
-                       recurrent=recurrent,
-                       recurrent_state=recurrent_state,
-                       recurrent_fuse=recurrent_fuse,
-                       recurrent_memory=recurrent_memory,
-                       recurrent_step_embed=recurrent_step_embed)
+                       decoder_dropout=decoder_dropout)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -197,11 +140,9 @@ def main():
     T_steps = model.decoder.steps
     print(f"[model] N={num_patches}, K(num_specials)={model.num_specials}, "
           f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
-          f"recurrent={model.recurrent}"
-          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory}, step_embed={model.recurrent_step_embed})' if model.recurrent else ''}, "
           f"{len(T_steps)} 采样步 {T_steps}")
 
-    # 自动选展示步: 前/中/后均匀取 (含最后一步 = 全量累加结果)
+    # 自动选展示步: 前/中/后均匀取 (含最后一步 = F_hat 那一步的直接预测)
     if args.steps.strip():
         show_steps = [int(s) for s in args.steps.split(",") if s.strip()]
     else:
@@ -255,7 +196,7 @@ def main():
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.4 * n_cols, 3.0 * n_rows))
     if n_rows == 1:
         axes = axes[None, :]
-    titles = ["原图"] + [f"累积 {i + 1} 步 (t={t})" for i, t in enumerate(show_steps)]
+    titles = ["原图"] + [f"步 {i + 1} 直接预测 (t={t})" for i, t in enumerate(show_steps)]
     for b in range(n_rows):
         for c in range(n_cols):
             ax = axes[b, c]
@@ -266,7 +207,7 @@ def main():
             if b == 0:
                 ax.set_title(titles[c], fontsize=12, fontweight="bold")
             ax.set_xticks([]); ax.set_yticks([])
-    plt.suptitle("像素级重建可视化 — 原图 vs 各采样步累积重建 (分块掩码, 累加集成)\n"
+    plt.suptitle("像素级重建可视化 — 原图 vs 各采样步的直接预测 (顺序循环解码, 无累加)\n"
                  "目标 = 原始像素 (PixelHead), fp32 平权训练, register 式 "
                  f"(K={model.num_specials})",
                  fontsize=15, fontweight="bold")

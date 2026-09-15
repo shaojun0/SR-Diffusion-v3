@@ -9,8 +9,8 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     "不追", 而是追"K 压缩下活信息保真"（纹理级清晰度属死信息才不追）。
 架构（model_v2.py, register 式唯一路径）: DINOv2-large(参数不冻结) +
     register specials(K) 直接拼进输入序列 [cls; specials(K); patches(N)]
-    (1+K+N token, 全双向) → OutputQueryDecoder（输出查询注意力 + 分块掩码 +
-    平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
+    (1+K+N token, 全双向) → OutputQueryDecoder（**顺序循环**: 每步只读自己那块
+    z_s 切片, 平方采样计划）→ PixelHead → **像素 patch 预测**, 平权全覆盖 L1
     重建原始像素 pixel_values（非 DINO 特征）。无 TextDecoder、无 ReEncoder。
     register 数 K = num_specials 与 patch 数 N 解耦: 默认（--num_specials 0）
     由**最终生效采样步集**自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
@@ -49,27 +49,24 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     · model_info.json 记录 num_specials（推理/可视化按它对齐权重形状——
       K 错了 checkpoint 形状就对不上, strict load 即崩）与 decoder_steps。
 
-2026-09-15（新方案: 循环架构, `--recurrent`）:
-    · 针对"后步输出≈0、整图由 step-1 一肩扛"的零增量自锁, 把解码器从
-      "一次并行算完 T 步 + 输出累加"改成**顺序循环**: step1 查询 = query_base
-      （去掉原式里的 A_t）, step t≥2 查询 = query_base + fuse(上一步的输出)。
-      每步仍只读自己那块 z_s（memory_mask 不变）, 但历史输出经循环携带 ⇒
-      后期步可基于"当前画到哪"做残差修正, 信息流不再被块对角掩码切断。
-    · 代价 = 时间（步间顺序依赖, 无法并行算完 T 步）; 梯度默认沿整条循环
-      反传（BPTT）。默认关 ⇒ 并行路径逐位不变; 开启新增 rec_* 参数。
-    · 参数: --recurrent / --recurrent_state {cumulative,increment} /
-      --recurrent_fuse {proj,add} / --recurrent_memory {block,prefix,open} /
-      --recurrent_step_embed（open 时必需）/ --recurrent_detach /
-      --recurrent_gate_init; 详见 model_v2.py OutputQueryDecoder 的 recurrent 段
-      与 doc/2026-09-15/DESIGN_v2_recurrent.md（§2.5 掩码怎么变 / §2.5.2 open 步退化）。
+2026-09-15（顺序循环成为唯一解码路径; 循环 carry 截断梯度）:
+    · 针对"后步输出≈0、整图由 step-1 一肩扛"的零增量自锁, 解码器从"一次并行
+      算完 T 步 + 输出累加"改成**顺序循环**: step1 查询 = query_base, step t≥2
+      查询 = query_base + 上一步输出; 每步只读自己那块 z_s（读窗口 = 该步平方块
+      的 A 切片, 首步含 z_cls）, 历史输出经循环携带 ⇒ 后期步可基于"当前画到哪"
+      做残差修正。**并行路径已整块删除**（跨步 tgt_mask / query_mask_mode /
+      --recurrent* 一并消失; 复现并行时代产物请从 git 取回当时的 model_v2.py）。
+    · 循环 carry detach（当时 decode 侧还有一层"累加 carry detach", 现已随累加
+      口径删除）⇒ 每步 Y_t 恰从自己那一步的损失收 1 份梯度（步间无梯度回流）;
+      代价 = 时间（步间顺序依赖, 无法并行算完 T 步）。
 
-2026-09-15（损失口径确认 + 两个开关; 详见 DESIGN §2.7）:
-    · 训练 loss **一直是累加口径**（`mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)` = 全轨迹
-      深监督）, 不是"直接监督 F_hat"。`F_hat = Σ_t Y_t`, 它的 L1 只是监控量 `recon`。
-    · `--loss_mode {cumulative,final}`: final 才改成只监督 F_hat（可作对照臂）。
-    · `--loss_decouple {true,false}`: 累加 carry 是否 detach。**循环架构下值得试
-      false**——decouple=true 且 rec_proj zero-init 时, 累加恒等捷径被切断、循环通路
-      梯度又恰为 0 ⇒ 各步初始时独立受训; false 保留跨步恒等捷径（自检 §6.9 实测）。
+2026-09-15（损失口径 = 直接预测, 无累加）:
+    · 训练 loss = `mean_t L1(PixelHead(Y_t), target)`: 每个采样步的输出 Y_t
+      **各自直接**过 PixelHead 预测整图, 各步平权（全轨迹深监督）, **不做任何
+      累加/集成**。`F_hat = Y_pix[:, -1]`（最后一步的直接预测）, 监控量
+      `recon` = 它的 L1 = 训练 loss 的最后一项。
+    · 旧口径（`--loss_mode {cumulative,final}` + `--loss_decouple` 切"cumsum
+      累加结果"）已整块删除: 传这些开关直接 TypeError（不静默忽略）。
 
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
@@ -158,80 +155,10 @@ def parse_args():
                         "nhead(--heads) 须整除 stack_dim")
     p.add_argument("--decoder_dropout", type=float, default=0.0,
                    help="self.stack(nn.TransformerDecoderLayer) 的 dropout, 默认 0.0")
-    p.add_argument("--query_mask_mode", default="blockdiag",
-                   choices=("causal", "blockdiag"),
-                   help="解码器查询自注意力掩码语义。**默认 blockdiag**。"
-                        "blockdiag=块对角, 每步只 attend 自己那 N 行: 步间在自注意力上完全"
-                        "隔离, memory_mask 的『每步只见自己的 z_s 块』在整条前向路径上字面成立, "
-                        "跨步梯度回流切断(与 decode 的 carry.detach() 合起来 = 每步只从自己那一步"
-                        "的损失收梯度); 步间前向信息流动被移除(模型从『5 步串行共享权重的循环结构』"
-                        "变为『5 个共享权重的并行预测头 + 输出累加』)。"
-                        "causal=历史行为(3151bab 之前的全部产物), 块下三角: 步 t 可见步 ≤ t 的查询行, "
-                        "信息沿步前进单向流动, 但『前步→后步』泄露被允许 → 步 t 的实际依赖集是"
-                        "累积前缀(之前所有块的整块), 且 loss 跨步梯度回流存在。"
-                        "两者都不破坏渐进语义(渐进性由读侧 memory_mask 的列数单调递增提供)。"
-                        "**复现历史结果必须显式传 causal**。不改变任何权重形状 ⇒ 旧 checkpoint "
-                        "双向可载, 但模式错了不会报错、只会静默算错(消费方以 model_info.json 为准)")
-    # ── 模型（循环架构: 上一步的输出作为下一步的输入）──
-    p.add_argument("--recurrent", action="store_true",
-                   help="循环架构开关（默认关 = 原并行路径逐位不变）。开启后解码器不再一次"
-                        "并行算出全部采样步, 而是顺序循环: step1 查询 = query_base（去掉 "
-                        "A_t）; step t≥2 查询 = query_base + fuse(上一步输出)。每步仍只读"
-                        "自己的 z_s 块（memory_mask 不变）, 但跨步信息由循环携带 ⇒ 后期步"
-                        "能基于当前估计做残差修正。**代价 = 时间**: 步间顺序依赖, 无法并行"
-                        "算完 T 步, 同一 batch 的 wall-clock 变长。开启会新增 rec_* 参数 ⇒ "
-                        "与非循环 checkpoint 形状不兼容（strict load 会明确报错, 不会静默算错）")
-    p.add_argument("--recurrent_state", default="cumulative",
-                   choices=("cumulative", "increment"),
-                   help="循环反馈的状态（=『上一步的输出』指什么）: cumulative（默认）= "
-                        "h_{t-1}=Σ_{i<t}Y_i, 即上一步那个被监督的累积估计（迭代细化, 每步"
-                        "看着当前画到哪再做修正）; increment = 上一步的增量 Y_{t-1}（更字面"
-                        "的『上一步输出』）")
-    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
-                   help="反馈怎么进查询: proj（默认）= LayerNorm + **zero-init** "
-                        "Linear(dim→dim) ⇒ 初始化时反馈恰为 0, 起步等价于纯 query_base "
-                        "读出, 循环随训练长出（+dim² 参数）; add = 标量门控 × LayerNorm "
-                        "直接相加（更字面的 `上一步输出 + query_base`）")
-    p.add_argument("--recurrent_memory", default="block",
-                   choices=("block", "prefix", "open"),
-                   help="循环路径的**读窗口**（步 t 的 cross-attention 能读哪些 z_s）: "
-                        "block（默认）= 与并行路径**逐位同一个**分块掩码, 每步只读自己"
-                        "那块（保持每个 register 只被一个步读的分工压力, 历史信息全由循环"
-                        "状态 h 携带）; prefix = 步 t 读到'自己块末'为止的全部（累积前缀, "
-                        "每步可重读此前的键, 补偿 h 是有损摘要）; open = **删掉 memory_mask**, "
-                        "每步 cross-attention 都读全部 z_s ⇒ 退化为'对同一份键的迭代细化'"
-                        "（交叉注意力本身进入循环: cross-attn→Y→h→q→cross-attn）。"
-                        "注意: 旧的 memory-open 塌缩证据来自**并行**架构（各步同时算、键被 "
-                        "T 步共享摊薄）; 循环架构各步经 h 顺序化, 机制不同, 值得单跑一臂——"
-                        "但**必须配 --recurrent_step_embed**（否则各步逐位相同, 已实测）。"
-                        "不改权重形状 ⇒ 错了不报错、只静默算错, 消费方以 model_info 为准")
-    p.add_argument("--recurrent_step_embed", action="store_true",
-                   help="逐采样步可学习偏置 (|T|,D)（zero-init）加到查询上, 给每步一个"
-                        "显式身份信号。**recurrent_memory=open 时必需**: 实测 open + "
-                        "zero-init 循环 + 无步信号 ⇒ 各步查询形式与 memory 完全相同 ⇒ 各步"
-                        "输出逐位相同（模型起步 = 同一输出的 |T| 份拷贝）, 只能靠 LN 尺度"
-                        "不变性的一点二阶信号逃逸; step_embed 的梯度按步不同 ⇒ 第一次更新"
-                        "即一阶打破对称。block/prefix 因各步 memory 不同不退化, 可不加")
-    p.add_argument("--recurrent_detach", action="store_true",
-                   help="循环状态喂给下一步前 detach（截断 BPTT: 省显存/更稳, 但后期步的"
-                        "损失不再能推动早期步的 register）。默认关 = 整条循环反传")
-    p.add_argument("--recurrent_gate_init", type=float, default=0.0,
-                   help="--recurrent_fuse add 时标量门的初值（默认 0.0 = 同 proj, 起步无反馈）")
-    # ── 损失口径（不改变任何权重形状, 只改监督怎么施加）──
-    p.add_argument("--loss_mode", default="cumulative",
-                   choices=("cumulative", "final"),
-                   help="训练损失: cumulative（默认, 全历史行为）= 每个采样步的**累加结果**"
-                        "都监督成整图, L = mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)（全轨迹"
-                        "深监督, 平权）; final = **只监督最终集成 F_hat**（= Σ_t Y_t）, "
-                        "L = L1(F_hat, target)。注意: 监控量 recon 在任何模式下都等于 F_hat 的 "
-                        "L1, 别把它当成训练损失")
-    p.add_argument("--loss_decouple", default="true",
-                   choices=("true", "false"),
-                   help="累加路径的 carry 是否 detach（默认 true = 全历史行为, 每步恰从累加"
-                        "路径收 1 份梯度）。**循环架构下值得试 false**: decouple=true 且 "
-                        "rec_proj zero-init 时, 累加恒等捷径被切断、循环通路梯度又恰为 0 ⇒ "
-                        "各步初始时**独立受训**（末步损失推不动早期步, 自检实测恰 0）; "
-                        "false 保留朴素 cumsum 的跨步恒等捷径, 一开始就是耦合的 BPTT 深监督")
+    # ── 模型（解码器 = 顺序循环, 2026-09-15 起唯一路径）──
+    # 并行路径的 --recurrent* / --query_mask_mode 开关已随之删除。
+    # 损失口径的唯一性: 每步 Y 各自直接预测像素（无累加）⇒ 无 --loss_* 开关
+    # （旧 --loss_mode / --loss_decouple 已删除, 传进模型直接 TypeError）。
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -344,18 +271,8 @@ def main():
                        skip_steps=args.slice_start,
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
-                       query_mask_mode=args.query_mask_mode,
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout,
-                       recurrent=args.recurrent,
-                       recurrent_state=args.recurrent_state,
-                       recurrent_fuse=args.recurrent_fuse,
-                       recurrent_memory=args.recurrent_memory,
-                       recurrent_step_embed=args.recurrent_step_embed,
-                       recurrent_detach=args.recurrent_detach,
-                       recurrent_gate_init=args.recurrent_gate_init,
-                       loss_mode=args.loss_mode,
-                       loss_decouple=(args.loss_decouple == "true"))
+                       decoder_dropout=args.decoder_dropout)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -371,34 +288,16 @@ def main():
               f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
-    print(f"[model] 查询自注意力掩码 query_mask_mode={model.query_mask_mode} "
-          f"({'块对角, 步间自注意力隔离(默认)' if model.query_mask_mode == 'blockdiag' else '块下三角, 步间单向可见(历史行为)'})"
-          f"{'  ← 非默认: 复现历史结果用' if model.query_mask_mode != 'blockdiag' else ''}")
     print(f"[model] self.stack: d_model={model.decoder.stack_dim} "
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
           f"{'  ← 加宽: 前后 Linear 投影' if model.decoder.stack_dim != dino.config.hidden_size else '  (未加宽)'}")
-    if model.recurrent:
-        n_rec = sum(p.numel() for n, p in model.named_parameters()
-                    if ".rec_" in n)
-        print(f"[model] 循环架构 ON: 上一步输出→下一步输入; state="
-              f"{model.recurrent_state}, fuse={model.recurrent_fuse}, "
-              f"memory={model.recurrent_memory}, "
-              f"step_embed={model.recurrent_step_embed}, "
-              f"detach={model.recurrent_detach}, gate_init={args.recurrent_gate_init} "
-              f"(+{n_rec / 1e6:.3f}M 循环参数) —— 步间顺序依赖, "
-              f"wall-clock 比并行路径长（以时间换跨步信息流）")
-        if model.recurrent_memory == "open" and not model.recurrent_step_embed:
-            print("[warn] recurrent_memory=open 但未开 --recurrent_step_embed: "
-                  "实测各步在 zero-init 时会**逐位相同**（同一函数, 无步身份信号）"
-                  "⇒ 起步退化为'同一输出的 T 份拷贝'。强烈建议加 --recurrent_step_embed")
-    else:
-        print("[model] 循环架构 OFF（并行路径, 与原实现逐位一致; 需循环请加 --recurrent）")
-    print(f"[model] 损失: loss_mode={model.loss_mode} "
-          f"(cumulative=每步累加结果平权深监督 / final=只监督 F_hat), "
-          f"loss_decouple={model.loss_decouple} "
-          f"({'累加 carry detach, 每步恰 1 份梯度' if model.loss_decouple else '朴素 cumsum, 保留跨步恒等捷径'})"
-          f"{'  ← 非默认' if (model.loss_mode != 'cumulative' or not model.loss_decouple) else ''}")
+    print(f"[model] 解码器: 顺序循环（唯一路径）| 每步只读自己那块 z_s 切片, "
+          f"上一步输出（detach）喂回当下一步查询 ⇒ 步间无梯度回流, wall-clock "
+          f"长于旧并行路径（以时间换跨步信息流）")
+    print("[model] 损失: 直接预测 mean_t L1(PixelHead(Y_t), target) "
+          "（每个采样步各自直接预测整图, 无累加/集成; 各步平权深监督）"
+          " | F_hat = 最后一步的直接预测, recon = 其 L1 (= loss 最后一项)")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -475,16 +374,7 @@ def main():
                 "decoder_dropout": args.decoder_dropout,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
-                "query_mask_mode": raw.query_mask_mode,
-                "recurrent": bool(raw.decoder.recurrent),
-                "recurrent_state": raw.decoder.recurrent_state,
-                "recurrent_fuse": raw.decoder.recurrent_fuse,
-                "recurrent_memory": raw.decoder.recurrent_memory,
-                "recurrent_step_embed": bool(raw.decoder.recurrent_step_embed),
-                "recurrent_detach": bool(raw.decoder.recurrent_detach),
-                "recurrent_gate_init": args.recurrent_gate_init,
-                "loss_mode": raw.loss_mode,
-                "loss_decouple": bool(raw.loss_decouple),
+                "loss": "mean_t L1(PixelHead(Y_t), target)（直接预测, 无累加）",
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:

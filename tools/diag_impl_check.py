@@ -3,8 +3,9 @@
 
 检查项:
   [1] stack_dim=0 与 stack_dim=dim 的等价性（Identity 分支不引入差异）
-  [2] forward 语义核对: stack_in(Y)/stack_in(A) 各恰好 1 次, stack_out 1 次;
-      手写参考实现与 OutputQueryDecoder.forward 逐位一致; 掩码形状与基线一致
+  [2] forward 语义核对: stack_in 恰好 1+|T| 次（A 一次 + 每步查询一次）、
+      stack_out 恰好 |T| 次; 手写参考实现（顺序循环 + 块切片读窗口）与
+      OutputQueryDecoder.forward 逐位一致
   [3] 初始化输出统计: 同一 seed/同一 batch, 基线 vs 加宽 的
       z_s_within_std / Y 跨 patch std / Y_pix 跨 patch std / F_hat 跨 patch std / loss
   [4] 逐模块梯度范数: 同一 batch 前向+反向, 分组报告 grad norm（找"谁先死"）
@@ -17,14 +18,13 @@
      --ckpt /root/autodl-tmp/.../checkpoint-2000/model.safetensors \
      --out /root/train_logs/stack2x_impl_check.json
 """
-import argparse, copy, json, os
+import argparse, copy, json, math, os
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file as sf_load
 from transformers import Dinov2Model
 
 from data_v2 import ParquetImageDataset, V2Collator
-import model_v2 as M
 from model_v2 import SRPhase1V2
 
 W, H, N, PX = 448, 252, 576, 588
@@ -38,7 +38,7 @@ def build(dino, stack_dim, depth, heads, dropout, seed=42):
     return SRPhase1V2(dinov2=dino, num_patches=N, dim=DIM, heads=heads,
                       mlp_ratio=4.0, decoder_steps=STEPS, decoder_depth=depth,
                       skip_steps=0, max_steps=5, num_specials=K,
-                      query_mask_mode="blockdiag", stack_dim=stack_dim,
+                      stack_dim=stack_dim,
                       decoder_dropout=dropout)
 
 
@@ -110,7 +110,7 @@ def main():
     print(f"[1] identity equiv: keys={same_keys} wdiff={maxdiff} outdiff={eq}", flush=True)
     del m0b
 
-    # ---- [2] forward 语义: 计数 + 手写参考 ----
+    # ---- [2] forward 语义: 计数 + 手写参考（顺序循环, 2026-09-15 起唯一路径） ----
     m2 = build(copy.deepcopy(dino0), 2048, 4, 16, 0.05, seed=42).cuda().eval()
     calls = {"stack_in": 0, "stack_out": 0}
     hs = [m2.decoder.stack_in.register_forward_hook(
@@ -120,34 +120,39 @@ def main():
     with torch.no_grad():
         z_cls, z_s = m2.encode(x)
         Y_model = m2.decoder(z_cls, z_s)
-        # 手写参考（严格按 docstring 语义: 同一 stack_in 投影 Y 与 A, stack 一次, stack_out 一次）
+        calls_model = dict(calls)                        # 模型 forward 的调用次数
+        calls.update({"stack_in": 0, "stack_out": 0})    # 参考实现单独计数
+        # 手写参考（严格按 docstring 语义）: memory(A) 只投影一次; 每步查询投影
+        # 一次、stack 一次、投影回 dim 一次 ⇒ stack_in 调用 1+|T| 次, stack_out |T| 次。
+        # 读窗口 = 步 t 所在平方块（首步 lo=0 含 z_cls）; 循环 carry detach。
         A = torch.cat([z_cls, z_s], dim=1) + m2.decoder.pos_embed
-        A_t = A[:, m2.decoder.steps]
-        Yq = (A_t.unsqueeze(2) + m2.decoder.query_base).reshape(
-            x.shape[0], len(m2.decoder.steps) * N, DIM)
-        mask = M.build_block_mask(m2.decoder.num_specials, m2.decoder.steps,
-                                  num_queries=N, device=A.device)
-        tgt = M.build_causal_query_mask(len(m2.decoder.steps), N, device=A.device,
-                                        mode=m2.decoder.query_mask_mode)
-        Y_ref = m2.decoder.stack_out(m2.decoder.stack(
-            m2.decoder.stack_in(Yq), m2.decoder.stack_in(A),
-            memory_mask=mask, tgt_mask=tgt))
-        Y_ref = Y_ref.reshape(x.shape[0], len(m2.decoder.steps), N, DIM)
-    for h in hs:
-        h.remove()
+        base = m2.decoder.query_base.unsqueeze(0).expand(x.shape[0], N, DIM)
+        mem = m2.decoder.stack_in(A)
+        q, Ys, wins = base, [], []
+        for i, t in enumerate(m2.decoder.steps):
+            k = math.isqrt(int(t))
+            hi = min((k + 1) ** 2 - 1, m2.decoder.num_specials)
+            lo = 0 if i == 0 else max(k * k, 1)
+            y = m2.decoder.stack_out(m2.decoder.stack(
+                m2.decoder.stack_in(q), mem[:, lo:hi + 1]))
+            Ys.append(y)
+            wins.append([lo, hi])
+            q = (base + y).detach()
+        Y_ref = torch.stack(Ys, dim=1)
+    for h_ in hs:
+        h_.remove()
     res["forward_semantics"] = {
-        "stack_in_calls_per_forward": calls["stack_in"],
-        "stack_out_calls_per_forward": calls["stack_out"],
-        "expected": {"stack_in": 2, "stack_out": 1},
+        "stack_in_calls_per_forward": calls_model["stack_in"],
+        "stack_out_calls_per_forward": calls_model["stack_out"],
+        "expected": {"stack_in": 1 + len(STEPS), "stack_out": len(STEPS)},
+        "ref_stack_calls": dict(calls),          # 参考实现应与模型逐项相同
         "ref_vs_model_maxdiff": float((Y_model - Y_ref).abs().max().item()),
-        "memory_mask_shape": list(mask.shape),
-        "tgt_mask_shape": list(tgt.shape),
-        "tgt_mask_is_blockdiag": bool(tgt.abs().gt(1e8).any().item()),
+        "read_windows": wins,
         "Y_shape": list(Y_model.shape),
     }
-    print(f"[2] forward calls={calls} refdiff="
+    print(f"[2] forward calls={calls_model} (ref={dict(calls)}) refdiff="
           f"{res['forward_semantics']['ref_vs_model_maxdiff']:.3e} "
-          f"mask={list(mask.shape)} tgt={list(tgt.shape)}", flush=True)
+          f"windows={wins}", flush=True)
 
     # ---- [3] 初始化输出统计 ----
     with torch.no_grad():

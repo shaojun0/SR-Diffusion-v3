@@ -26,7 +26,7 @@ def build(dino, s, d, h, p, seed=42):
     torch.manual_seed(seed)
     return SRPhase1V2(dinov2=dino, num_patches=N, dim=DIM, heads=h, mlp_ratio=4.0,
                       decoder_steps=STEPS, decoder_depth=d, skip_steps=0,
-                      max_steps=5, num_specials=K, query_mask_mode="blockdiag",
+                      max_steps=5, num_specials=K,
                       stack_dim=s, decoder_dropout=p)
 
 

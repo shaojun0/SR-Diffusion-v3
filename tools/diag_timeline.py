@@ -140,7 +140,7 @@ def main():
     model = SRPhase1V2(dinov2=dino, num_patches=N, dim=DIM, heads=args.heads,
                        mlp_ratio=4.0, decoder_steps=STEPS,
                        decoder_depth=args.depth, skip_steps=0, max_steps=5,
-                       num_specials=K, query_mask_mode="blockdiag",
+                       num_specials=K,
                        stack_dim=args.stack_dim, decoder_dropout=args.dropout)
     model.cuda().train()
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -13,6 +13,9 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
 
 沿革: v2 曾含 ReEncoder 路径与"可学习前缀预算"机制, 均已按 YAGNI 整块
     移除（git 历史可找回）; register 式（2026-08-28 起）为唯一路径。
+    解码器侧: **并行路径**（|T| 步一次算完 + 跨步 tgt_mask + query_mask_mode
+    开关）自 2026-09-15 起被**循环架构**取代并整块删除; 需要复现旧结果时从
+    git 取回（`git log -- model_v2.py`, 最后一个含并行路径的提交 = 043ef2a）。
 
 架构（register 式, 无选择、无预算）:
     specials 作为额外 token 直接拼进 DINOv2 输入序列
@@ -20,10 +23,11 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     24 层直接算出 z_s（register token 式, Darcet et al.）——深层网络做
     "内容路由", 修 F1（special 无内容输入）与 F2（z_s 冗余全局摘要）。
     DINO 内全双向注意力（HF 无 token 级 mask API）; z_s[k] 依赖全部 patch
-    （含 j>k）, "前缀稳定性"不成立——渐进语义由解码器分块掩码提供: 读侧
-    memory_mask（每步只见自己的块）+ 查询侧 tgt_mask（默认块对角: 每步只
-    attend 自己那 N 行; 可切回历史块因果, 见 OutputQueryDecoder /
-    build_causal_query_mask 的 query_mask_mode）。
+    （含 j>k）, "前缀稳定性"不成立——渐进语义由解码器的**读窗口**提供:
+    第 i 个采样步 t 的 cross-attention 只吃自己那个平方块这一段 z_s
+    （memory = A[:, lo:hi+1], 块起止 k=⌊√t⌋, hi=min((k+1)²−1, K),
+    非首步 lo=max(k²,1); 首步 lo=0 ⇒ 额外含位置 0 = z_cls 及其前的全部元素,
+    口径与 build_block_mask 逐位一致）——切片即窗口, 无需显式掩码。
     无 ReEncoder（省 51.6M 参数）。
     register 数 K（num_specials）= 解码器实际读取的 z_s 范围: 默认由
     "最终生效采样步集"自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
@@ -33,40 +37,26 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     参与训练动力学并干扰读窗口的多余位置。全量默认（无 decoder_steps /
     skip/max 切片）时 steps = square_block_starts(N) ⇒ K=N（向后兼容）;
     例: N=576 切片 [4:9] ⇒ steps=[25,36,49,64,81] ⇒ K=99; steps=[64] ⇒ K=80。
-    OutputQueryDecoder: [z_cls; z_s] 为时序序列 A (S=K+1); 在采样时刻
-                    T_sub = steps（默认 square_block_starts, 自动适配任意
-                    上界; SRPhase1V2 里切片先于 K 推导, 上界 = N, 见
-                    select_steps）上输出 (N,D) = 全部 patch 的预测（输出
-                    查询注意力, 查询基行 k ↔ patch k, 行数 = N 不变）;
-                    分块掩码(memory_mask): 每步只 attend 自己的 z_s 块
-                    （掩码列数 = K+1）; 查询自注意力掩码（tgt_mask, 见
-                    query_mask_mode）: **默认块对角**（步间自注意力完全隔离,
-                    配合 memory_mask 使"每步只见自己的块"字面成立）,
-                    可切回历史块因果（步 t 只 attend 步 ≤ t 的查询行, 防后步
-                    查询内容泄露进前步输出）→ F_hat = Σ_t Y_t（第 n 步结果 = 前 n 步之和）
-    L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
-        （梯度按步解耦: carry 整体 detach + 自己的预测——每步恰收 1 份梯度,
-        避免"t=0 收 |T| 份梯度"的三角失衡; 见 SRPhase1V2.decode）
-        口径可切: loss_mode="final" ⇒ 只监督 Σ_t Y_t（= 监控量 recon）;
-        loss_decouple=False ⇒ 朴素 cumsum, 保留跨步恒等捷径（循环架构推荐试）
-
-    循环架构（recurrent=True, 2026-09-15 新增; 默认关 ⇒ 上述并行路径逐位不变）:
-        step1 查询 = query_base（**去掉 A_t**）; step t≥2 查询 =
-        query_base + fuse(state_{t-1}), state = 上一步的**输出**（"上一步的输出
-        作为下一步的输入"）:
-          · recurrent_state="cumulative"（默认）: state = h_{t-1} = Σ_{i<t}Y_i,
-            即上一步那个被监督的累积估计 ⇒ 迭代细化: 每步看着"当前画到哪",
-            再用自己那块 z_s 做残差修正;
-          · recurrent_state="increment": state = Y_{t-1}（上一步的增量）。
-        fuse: "proj"（默认）= LN + **zero-init** Linear(dim→dim)——初始化时反馈
-        恰为 0 ⇒ 起步等价于"纯 query_base 读出", 循环随训练长出; "add" = 标量
-        门控 LN 直接相加（更字面的 `输出 + query_base`）。
-        每步仍只读自己的 z_s 块（memory_mask 与并行路径完全相同; 可切
-        recurrent_memory="prefix"/"open" 放宽读窗口）, 且单步内 N
-        行查询全双向自注意力（无跨步 tgt_mask）。步间顺序依赖 ⇒ 无法像并行路径
-        那样一次算完 T 步, wall-clock 变长（**以时间换跨步信息流**）。
-        梯度默认沿整条循环反传（BPTT; 使后期步真能推动早期步的 register）,
-        可 recurrent_detach=True 截断。
+    OutputQueryDecoder（**顺序循环, 唯一路径**）: [z_cls; z_s] 为时序
+                    序列 A (S=K+1); 在采样时刻 T_sub = steps（默认
+                    square_block_starts, 自动适配任意上界; SRPhase1V2 里
+                    切片先于 K 推导, 上界 = N, 见 select_steps）上循环:
+                        Y = query_base                       ← step1 查询
+                        for t in steps:                      ← 每步读自己那块, |T| 步
+                            lo, hi = 步 t 的块起止（首步 lo=0, 含 z_cls）
+                            Y = stack(stack_in(Y), stack_in(A[:, lo:hi+1]))
+                            Y = stack_out(Y)
+                            Y = (query_base + Y).detach()     ← 喂给下一步当查询
+                    查询基行 k ↔ patch k（行数 = N 不变）; 单步内 N 行查询
+                    全双向自注意力。
+    L = mean_t L1(PixelHead(Y_t), patch)  ← **直接预测**口径: 每个采样步的输出
+        Y_t 自己过 PixelHead 直接预测整图, 各步平权全覆盖损失
+        （无累加/集成: 2026-09-15 前的 cumsum 累加口径已整块删除, 需要复现旧
+        结果时从 git 取回。梯度按步解耦: 解码器循环 carry detach + decode 侧
+        无累加 ⇒ 每步 Y_t 恰从自己那一步的损失收 1 份梯度, 见
+        OutputQueryDecoder.forward / SRPhase1V2.decode）
+        F_hat = Y_pix[:, -1]（最后一步的直接预测）; recon = L1(F_hat, patch)
+        = 监控量（数值上 = 训练 loss 的最后一项）
 
 踩坑记录（重要）:
     torch 2.x 的 bool 注意力掩码约定是 True=屏蔽（nn.TransformerEncoder
@@ -274,85 +264,25 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
     return torch.stack(rows).repeat_interleave(Q, dim=0)
 
 
-# ═══ build_recurrent_memory_mask — 循环路径的读侧掩码（block/prefix/open）═══
+# ═══ build_causal_query_mask — 查询自注意力掩码（块因果 / 块对角; 历史遗留）═══
 
-def build_recurrent_memory_mask(num_tokens: int, steps: Sequence[int],
-                                num_queries: Optional[int] = None,
-                                mode: str = "block",
-                                device: torch.device = None) -> Tensor:
-    """循环架构（recurrent=True）的 memory_mask（torch float, -inf=屏蔽, 0=允许）。
-
-    与并行路径的 build_block_mask 只差"读窗口有多宽":
-      · mode="block"（默认）: **逐位复用 build_block_mask** —— 每步只读自己那块
-        z_s（第一个采样步额外含 z_cls）; 与并行路径完全同一个掩码。
-      · mode="prefix": 步 t 读 z_cls + z_s[1..hi]（hi = 自己块的终点）——
-        累积前缀, 每步可重读此前所有键。
-      · mode="open"  : 每步读全部 z_s（+z_cls）。**已实测会塌缩**, 仅复现/诊断用。
-    返回 (|T|·Q, num_tokens+1), 行序 = (t,k) 展平（与 build_block_mask 同布局）。
-    """
-    assert mode in RECURRENT_MEMORY_MODES, \
-        f"未知 recurrent_memory={mode!r}, 合法值 {RECURRENT_MEMORY_MODES}"
-    if mode == "block":                     # 与并行路径逐位一致（不另写一份逻辑）
-        return build_block_mask(num_tokens, steps, num_queries, device)
-    S = num_tokens + 1                      # z_cls + K 个 z_s
-    Q = num_tokens if num_queries is None else int(num_queries)
-    rows = []
-    for t in steps:
-        k = math.isqrt(int(t))
-        hi = min((k + 1) * (k + 1) - 1, num_tokens)
-        row = torch.full((S,), float("-inf"), device=device)
-        if mode == "open":
-            row[:] = 0.0
-        else:                               # "prefix"
-            row[:hi + 1] = 0.0
-        rows.append(row)
-    return torch.stack(rows).repeat_interleave(Q, dim=0)
-
-
-# ═══ build_causal_query_mask — 查询自注意力掩码（块因果 / 块对角）═══
-
-# 查询自注意力掩码的合法模式（见 build_causal_query_mask / OutputQueryDecoder
-# 的 query_mask_mode）。**默认 = "blockdiag"（2026-09-10 起）**:
-#   "blockdiag" 默认: 块对角——每步只 attend 自己那 num_queries 行, 步间在自
-#               注意力上完全隔离。配合 memory_mask 使"每步只见自己的 z_s 块"在
-#               整条前向路径上字面成立, 并切断 loss 的跨步梯度回流（与 decode
-#               的 carry.detach() 合起来 = 每步只从自己那一步的损失收梯度）。
-#   "causal"    历史行为（3151bab 之前的全部训练/推理产物）: 块下三角（步 t 可见
-#               步 ≤ t）。信息沿步前进单向流动, 但"前步→后步"泄露被允许 → 步 t
-#               的实际依赖集是累积前缀。**复现历史结果必须显式传 "causal"**。
-# 两者不改变任何权重形状 ⇒ 旧 checkpoint 双向可载, 但**模式错了不会报错、只会
-# 静默算错**, 故 checkpoint 消费方（infer_v2_test.py / visualize_recon_pixel.py）
-# 一律以 model_info.json 记录的 query_mask_mode 为准。
+# 查询自注意力掩码的合法模式。**当前架构不消费它**: 解码器每步只跑自己那 N 行
+# 查询（单步内 N 行全双向自注意力）, 根本不存在"跨步查询自注意力"; 读窗口是
+# 直接切 A[:, lo:hi+1]（步 t 所在的平方块, 首步含 z_cls）当 memory, 也不需要显式掩码。此处保留
+# build_causal_query_mask 纯函数 + 模式常量, 仅供**诊断/可视化脚本**复现历史
+# 掩码形状（doc/2026-09-10/smoke_query_mask_mode.py、output/mask_viz/ 等）。
+#   "blockdiag"（默认）: 块对角——每步只 attend 自己那 num_queries 行。
+#   "causal"            : 块下三角（步 t 可见步 ≤ t）——并行路径的历史行为。
 QUERY_MASK_MODES = ("causal", "blockdiag")
 DEFAULT_QUERY_MASK_MODE = "blockdiag"
 
-# 循环架构（OutputQueryDecoder recurrent=True）的合法取值; 见 OutputQueryDecoder
-# 的 recurrent 段。**默认 recurrent=False ⇒ 并行路径逐位不变、不新增参数**。
-#   recurrent_state: 反馈什么当"上一步的输出"
-#     · "cumulative"（默认）: h_{t-1} = Σ_{i<t}Y_i（上一步被监督的累积估计）
-#     · "increment"           : Y_{t-1}（上一步的增量输出）
-#   recurrent_fuse: 反馈怎么进查询
-#     · "proj"（默认）: LN + zero-init Linear(dim→dim) ⇒ 初始化时反馈=0
-#     · "add"         : 标量门控 × LN（直接相加, 更字面）
-#   recurrent_memory: 循环路径里"步 t 的 cross-attention 能读哪些 z_s 列"
-#     · "block"（默认）: 与并行路径**完全相同**的分块掩码——每步只读自己那块
-#       （第一个采样步额外含 z_cls）。保持"每个 register 只被一个步读"的分工
-#       压力; 历史信息由循环状态 h 携带（这正是循环架构要替换掉的那条通路）。
-#     · "prefix": 步 t 可读到"自己块末"为止的全部（z_cls + z_s[1..hi]）——
-#       渐进读窗口, 每步可重新读之前的键（h 是有损摘要的补偿）。
-#     · "open"  : 每步可读全部 z_s。**已实测会塌缩**（REPORT_v2_slice05_memory_open:
-#       所有键被所有步摊薄 ⇒ 单键梯度占比 1/36 ⇒ 键趋同、解码器输出退化）,
-#       仅作复现/诊断, 不作训练推荐。
-RECURRENT_STATES = ("cumulative", "increment")
-RECURRENT_FUSES = ("proj", "add")
-RECURRENT_MEMORY_MODES = ("block", "prefix", "open")
-
-# 训练损失口径（SRPhase1V2.decode）。**不改变任何权重形状**, 只改监督怎么施加。
-#   "cumulative"（默认, 全历史行为）: 每个采样步的**累加结果**都监督成整图——
-#       L = mean_t L1(PixelHead(Σ_{i≤t}Y_i), target) = 全轨迹深监督。
-#   "final": 只监督**最终集成结果** F_hat = PixelHead(Σ_t Y_t):
-#       L = L1(F_hat, target)（= 监控量 recon 本身）, 中间步不再被直接约束。
-LOSS_MODES = ("cumulative", "final")
+# 训练损失口径（SRPhase1V2.decode）—— **唯一口径, 无开关**: 每个采样步的输出
+# Y_t 自己过 PixelHead **直接**预测整图（不做任何累加/集成）, 各步平权:
+#     L = mean_t L1(PixelHead(Y_t), target)
+# 历史遗留: 曾有 loss_mode="cumulative"/"final" + loss_decouple 两个开关切
+# "cumsum 累加结果"口径; 2026-09-15 起整块删除（连同模块级常量 LOSS_MODES）,
+# 需要复现旧产物时从 git 取回当时的 model_v2.py。
+# F_hat = Y_pix[:, -1]（最后一步的直接预测）, recon = L1(F_hat, target)。
 
 
 def build_causal_query_mask(num_steps: int, num_queries: int,
@@ -363,25 +293,30 @@ def build_causal_query_mask(num_steps: int, num_queries: int,
     （index = t*num_queries + k, 每采样步 num_queries 行 patch 查询连排;
     列 = 同一套查询行）。
 
-    函数名沿用历史名（既有文档/脚本按此名引用）; 两种语义由 mode 选择
-    （合法值见 QUERY_MASK_MODES）。**默认 mode 自 2026-09-10 起为
-    "blockdiag"**（原默认 "causal"）——要复现历史行为必须显式传 "causal"。
+    **历史遗留（当前架构不消费）**: 本函数是并行解码路径（|T| 步一次算完,
+    跨步查询自注意力）的 tgt_mask 构造器; 循环架构每步只跑自己那 N 行查询,
+    故训练/推理路径不再调用它。保留原因: 既有诊断/可视化脚本按此名引用,
+    且它精确记录了两代掩码语义，便于对照历史产物。mode="blockdiag" 恰等价于
+    循环路径"单步内 N 行全双向"的隐含语义。
+
+    函数名沿用历史名; 两种语义由 mode 选择（合法值见 QUERY_MASK_MODES）。
+    **默认 mode 自 2026-09-10 起为 "blockdiag"**（原默认 "causal"）。
 
     · mode="blockdiag"（**默认**）—— **块对角**: 步 t 的行只能 attend 自己
       那 num_queries 行。每步退化为一个独立的 num_queries×num_queries 稠密
       双向注意力, 步与步在自注意力上完全隔离。此时:
         - memory_mask 的"每步只见自己的 z_s 块"在整条前向路径上字面成立;
-        - loss 的跨步梯度回流被切断, 与 SRPhase1V2.decode 的
-          carry.detach()（累加路径按步解耦）合起来实现"每步只从自己那一步
-          的损失收梯度"（该意图见 decode 的 docstring）。
+        - loss 的跨步梯度回流被切断（decode 侧现无累加, 跨步梯度只可能来自
+          循环 carry）, 与 OutputQueryDecoder.forward 的 carry.detach() 合起来
+          实现"每步只从自己那一步的损失收梯度"（该意图见 decode 的 docstring）。
       **渐进语义不依赖本掩码**: 它来自 memory_mask 侧的信息量递增（每步只
       读自己块, 允许列数随步单调增 4→5→7→9→11）, 故 blockdiag 不破坏渐进性。
       **局限（实测）**: 对 register 塌缩**中性**——块内非种子成员的梯度差在
       两种模式下都恰为 0（该对称性只由"自己的 cross-attn + 块内 pos"决定,
       与跨步自注意力无关）, 故它不是塌缩的修复手段。
       **架构含义**: 步间前向的信息流动被移除——模型从"5 步串行、共享权重的
-      循环结构"变成"5 个共享权重的并行预测头 + 输出累加"。参数效率不降
-      （权重仍共享）, 但每步的有效输入从累积前缀缩回自己那一块。
+      循环结构"变成"5 个共享权重的并行预测头"（各步输出各自直接预测整图）。
+      参数效率不降（权重仍共享）, 但每步的有效输入从累积前缀缩回自己那一块。
 
     · mode="causal"（历史行为, 3151bab 之前的全部产物）—— **块下三角**:
       步 t 的行可 attend 步 ≤ t 的所有行（同步内全双向, patch 间可交换信息;
@@ -436,66 +371,35 @@ class PixelHead(nn.Module):
 
 class OutputQueryDecoder(nn.Module):
     """把 [z_cls; z_s] 当时序序列 A=(S,D), S=num_specials+1=K+1, 在采样时刻
-    T_sub 上每步输出 (N,D) = 全部 patch 的预测, 沿时刻累加得 F_hat (B,N,D)。
+    T_sub 上每步输出 (N,D) = 该步对全部 patch 的**直接**预测（每步各自过
+    PixelHead 成像素, 无累加/集成; F_hat = 最后一步, 在 decode 做）。
 
-    机制: A = [z_cls; z_s] + pos_embed; 查询 = A_t + 查询基 E（行 k↔patch k,
-    BLIP-2 同源）→ 标准 nn.TransformerDecoder 堆叠（自注意力 + 交叉注意力
-    (memory=A) + FFN）→ reshape (B,|T|,N,D), 返回 Y。
+    **机制（顺序循环——用户的原始写法）**:
+    A = [z_cls; z_s] + pos_embed; 读窗口用**切片**给出: 第 i 个采样步 t 的
+    memory = A[:, lo:hi+1], 块起止 k=⌊√t⌋, hi=min((k+1)²−1, K), 非首步
+    lo=max(k²,1)（只读自己那块）, 首步 lo=0（含 z_cls 及其前的全部元素）——
+    与 build_block_mask 的块口径逐位一致; 默认平方块计划（含其连续切片）下
+    位置 1..K 全被某个步读到（无花瓶 register）。查询 = query_base（step1）或
+    query_base + 上一步输出（喂回自己当下一步查询）; 循环按 steps 逐个走,
+    **|T| = len(steps)**（每个采样步读自己那块, 不再丢尾步）。
     · num_specials（K）= z_s 长度; None = num_patches（历史 K==N 行为）。
       num_patches（N）只决定查询基行数 = 输出 patch 预测数, 两者解耦后
       不再恒等——pos_embed 尺寸 (1,K+1,D), query_base 行数 = N。
-    · 分块掩码走 memory_mask（加法浮点, -inf=屏蔽; 见 build_block_mask）,
-      列数 = K+1（每步只见自己的 z_s 块）
-    · 查询自注意力走 tgt_mask（见 build_causal_query_mask, 加法浮点,
-      -inf=屏蔽）, 查询行序 = (t,k) 展平; 语义由 query_mask_mode 选择
-      （**默认 "blockdiag"**）:
-        - "blockdiag"（默认）: **块对角**——每步只 attend 自己那 N 行, 步间在
-          自注意力上完全隔离, 使 memory_mask 的"每步只见自己的 z_s 块"在整条
-          前向路径上字面成立, 并切断 loss 的跨步梯度回流（与 decode 的
-          carry.detach() 合起来 = 每步只从自己那一步的损失收梯度）;
-        - "causal"（历史行为, 3151bab 之前的产物; 复现旧结果须显式传）:
-          **块下三角**——步 t 的行可 attend 步 ≤ t 的所有行（同步内全双向）,
-          未来步屏蔽, 后步查询内容不再经查询自注意力影响前步输出。**注意**:
-          该模式允许"前步 → 后步"的泄露, 故步 t 的实际依赖集是**累积前缀**
-          （之前所有块的整块 + 自己块）。
-      渐进语义由 memory_mask（读侧, 列数随步单调增）负责, **不**依赖
-      本掩码; 两种模式都不破坏渐进性。
-    · 结果沿采样步累加; **梯度按步解耦**（carry detach + 自己的预测, 见
-      SRPhase1V2.decode）——每步 Y_t 只从自己那一步的损失收 1 份梯度
-    · 时刻采样（显存优化, 默认开启）: 查询只对 T_sub 构造——采样计划 =
+    · 每步跑一次 nn.TransformerDecoder 堆叠（自注意力 + 交叉注意力(memory=该步
+      块切片) + FFN）; 单步内 N 行查询全双向自注意力。
+    · 返回 (B,|T|,N,D) = 每步全部 patch 的**直接**预测（每步各自过 PixelHead;
+      F_hat = 最后一步, 都在 decode 做）。
+      **梯度按步解耦**: 循环本体把 carry detach（喂给下一步的 (query_base + 上一步
+      输出) 不带梯度）, decode 侧无累加 ⇒ 每步 Y_t 恰从自己那一步的损失收 1 份
+      梯度, 跨步梯度结构性为 0（前向仍是顺序循环、数值逐位不变, 但梯度上等价于
+      |T| 个共享权重的独立预测头 + 前向递归输入）
+    · 时刻采样（显存优化, 默认开启）: 采样计划 =
       select_steps(num_specials, steps, skip_steps, max_steps): 默认计划 =
       square_block_starts(K); skip_steps/max_steps 可选切片挑选; steps= 可
-      自定义（原样不切片）。未采样时刻不参与损失, 也不出现在 F_hat 累加里。
-      注意: SRPhase1V2 会先按 N 计划选好步再以显式 steps 传入（两处结果
-      一致, 见 select_steps 的 docstring）
-    · 覆盖语义: 每个采样时刻都预测全部 N 个 patch, 其累加结果都被监督
-      还原全部 patch
-
-    循环架构（recurrent=True, 2026-09-15 新增; 默认 False = 上面全部行为逐位
-    不变, 且不新增任何参数/state_dict 键）:
-        step1  查询 = query_base                      （A_t 项被去掉）
-        step t≥2 查询 = query_base + fuse(state_{t-1}) （上一步的输出作下一步输入）
-        其中 state = recurrent_state 指定的"上一步输出"
-          · "cumulative"（默认）= h_{t-1} = Σ_{i<t}Y_i（迭代细化的累积估计）
-          · "increment"           = Y_{t-1}
-        fuse = recurrent_fuse 指定的注入方式
-          · "proj"（默认）= self.rec_proj(self.rec_norm(state)),
-            rec_proj 为 **zero-init** Linear(dim→dim) ⇒ 初始时反馈恰为 0,
-            全体步 = 纯 query_base 读出, 循环随训练长出（+dim² 参数）;
-          · "add" = self.rec_gate * self.rec_norm(state), rec_gate 为标量
-            Parameter（init=recurrent_gate_init, 默认 0.0）。
-        每步只跑自己的 N 行查询（单步 TransformerDecoder; 同步内 N 行全双向自
-        注意力 ⇒ 无跨步 tgt_mask, self.tgt_mask=None）, memory 仍为 A + 该步
-        memory_mask——读窗口由 recurrent_memory 决定:
-          · "block"（默认）= 与并行路径**同一个**分块掩码（每步只读自己那块
-            z_s, 第一个采样步额外含 z_cls）⇒ "每步只读自己那块键, 但通过循环
-            看到全部历史输出"; 保持每 register 只被一个步读的分工压力。
-          · "prefix" = 步 t 读 z_cls + z_s[1..自己块末]（累积前缀, 每步可重读
-            此前所有键——补偿 h 是有损摘要）。
-          · "open" = 每步读全部 z_s（**已实测会塌缩**, 仅复现/诊断）。
-        步间顺序依赖 ⇒ 不能一次并行算完 T 步, wall-clock 变长。
-        梯度默认沿整条循环反传（BPTT）, recurrent_detach=True 时把喂给下一步的
-        状态 detach（截断 BPTT: 省显存, 但失去长程信用分配）。
+      自定义（原样不切片）。注意: SRPhase1V2 会先按 N 计划选好步再以显式
+      steps 传入（两处结果一致, 见 select_steps 的 docstring）
+    · 覆盖语义: 每个采样时刻都**直接**预测全部 N 个 patch, 每步的直接预测
+      都被监督还原全部 patch（平权, 无累加）
     """
 
     def __init__(self, dim: int = 768, num_patches: int = 256,
@@ -504,26 +408,8 @@ class OutputQueryDecoder(nn.Module):
                  depth: int = 2, skip_steps: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  num_specials: Optional[int] = None,
-                 query_mask_mode: str = DEFAULT_QUERY_MASK_MODE,
-                 stack_dim: Optional[int] = None, dropout: float = 0.0,
-                 recurrent: bool = False,
-                 recurrent_state: str = "cumulative",
-                 recurrent_fuse: str = "proj",
-                 recurrent_memory: str = "block",
-                 recurrent_step_embed: bool = False,
-                 recurrent_detach: bool = False,
-                 recurrent_gate_init: float = 0.0):
+                 stack_dim: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
-        assert query_mask_mode in QUERY_MASK_MODES, \
-            f"未知 query_mask_mode={query_mask_mode!r}, 合法值 {QUERY_MASK_MODES}"
-        assert recurrent_state in RECURRENT_STATES, \
-            f"未知 recurrent_state={recurrent_state!r}, 合法值 {RECURRENT_STATES}"
-        assert recurrent_fuse in RECURRENT_FUSES, \
-            f"未知 recurrent_fuse={recurrent_fuse!r}, 合法值 {RECURRENT_FUSES}"
-        assert recurrent_memory in RECURRENT_MEMORY_MODES, \
-            f"未知 recurrent_memory={recurrent_memory!r}, " \
-            f"合法值 {RECURRENT_MEMORY_MODES}"
-        self.query_mask_mode = query_mask_mode   # 查询自注意力掩码语义; 见 build_causal_query_mask
         self.num_patches = num_patches                 # 查询基行数 = N（输出 N 个 patch 预测, 不变）
         self.num_specials = num_patches if num_specials is None else int(num_specials)
         # 采样计划: 与 SRPhase1V2 共用 select_steps; 独立使用时默认计划
@@ -541,7 +427,7 @@ class OutputQueryDecoder(nn.Module):
         #   · 显式放大（如 2×dim=2048）⇒ 模型其余部分（pos_embed / query_base /
         #     PixelHead / DINO 输出）仍是 dim 维, 故在 self.stack 前后各加一层
         #     Linear: dim→stack_dim（输入侧, 查询 Y 与 memory A 共用同一投影）
-        #     与 stack_dim→dim（输出侧, 交回 PixelHead / 累加损失）。
+        #     与 stack_dim→dim（输出侧, 交回 PixelHead / 直接预测损失）。
         # dim_feedforward 随 stack_dim 等比缩放（mlp_ratio 语义不变）。
         self.stack_dim = int(dim if not stack_dim else stack_dim)
         self.stack = nn.TransformerDecoder(
@@ -558,112 +444,39 @@ class OutputQueryDecoder(nn.Module):
                           else nn.Linear(self.stack_dim, dim))
         self.pos_embed = nn.Parameter(torch.randn(1, S, dim) * 0.02)
 
-        # 循环架构（默认关）: 关闭时**不建任何子模块/参数** ⇒ state_dict 键与
-        # 历史实现完全一致（旧 checkpoint strict load 必须继续成立）。
-        self.recurrent = bool(recurrent)
-        self.recurrent_state = str(recurrent_state)
-        self.recurrent_fuse = str(recurrent_fuse)
-        self.recurrent_memory = str(recurrent_memory)
-        self.recurrent_step_embed = bool(recurrent_step_embed)
-        self.recurrent_detach = bool(recurrent_detach)
-        self.recurrent_gate_init = float(recurrent_gate_init)
-        if self.recurrent:
-            self.rec_norm = nn.LayerNorm(dim)          # 反馈状态的尺度归一（h 随步增长）
-            if self.recurrent_fuse == "proj":
-                self.rec_proj = nn.Linear(dim, dim)    # dim→dim, zero-init
-                nn.init.zeros_(self.rec_proj.weight)
-                nn.init.zeros_(self.rec_proj.bias)
-            else:                                       # "add": 标量门控
-                self.rec_gate = nn.Parameter(
-                    torch.tensor(self.recurrent_gate_init))
-            if self.recurrent_step_embed:
-                # 逐采样步可学习偏置 (|T|,D), **zero-init**: 起步不改变任何步,
-                # 但梯度按步不同 ⇒ 第一次更新即一阶打破"各步同函数"的对称。
-                # 对 recurrent_memory="open"（删掉 memory_mask）是**必需**的:
-                # 此时各步查询形式与 memory 完全相同, 没有它各步会逐位相同。
-                self.rec_step_embed = nn.Parameter(
-                    torch.zeros(len(self.steps), dim))
-
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
-        B, N, D = z_s.shape[0], self.num_patches, z_s.shape[-1]
+        assert z_cls.dim() == 3 and z_s.dim() == 3, \
+            f"z_cls/z_s 须为 (B,·,D), got {tuple(z_cls.shape)}/{tuple(z_s.shape)}"
         assert z_cls.shape[1] == 1, f"z_cls 应为 1 列, got {z_cls.shape[1]}"
         assert z_s.shape[1] == self.num_specials, \
             f"z_s 列数 {z_s.shape[1]} != num_specials(K)={self.num_specials}"
+        assert z_cls.shape[0] == z_s.shape[0], \
+            f"batch 不一致: z_cls {z_cls.shape[0]} vs z_s {z_s.shape[0]}"
+        B = z_cls.shape[0]
         A = torch.cat([z_cls, z_s], dim=1) + self.pos_embed      # (B,S,D)
-        if self.recurrent:
-            return self._forward_recurrent(A, B, N, D)
-        # 分块掩码: 每步只见自己的 z_s 块（-inf=屏蔽, 0=允许）; 列数 =
-        # K+1 = num_specials+1, 每步 N 行查询共享同一掩码行
-        mask = build_block_mask(self.num_specials, self.steps,
-                                num_queries=N, device=A.device)  # (|T|·N, K+1)
-        self.attn_mask = mask                                    # 供自检
-        A_t = A[:, self.steps]                                   # (B,|T|,D) 采样时刻
-        Y = (A_t.unsqueeze(2) + self.query_base) \
-            .reshape(B, len(self.steps) * N, D)                  # 展平 (t,k), t∈T_sub
-        # 查询自注意力掩码（块因果 / 块对角, 见 query_mask_mode 与
-        # build_causal_query_mask）: 行序 = (t,k) 展平
-        tgt_mask = build_causal_query_mask(len(self.steps), N,
-                                           device=A.device,
-                                           mode=self.query_mask_mode)  # (L,L)
-        self.tgt_mask = tgt_mask
-        # stack_dim == dim 时 stack_in/out 为 Identity（零额外开销）;
-        # 放大时输入侧投影 Y 与 memory A, 输出侧投影回 dim
-        Y = self.stack(self.stack_in(Y), self.stack_in(A),
-                       memory_mask=mask, tgt_mask=tgt_mask)     # (B,|T|·N,stack_dim)
-        Y = self.stack_out(Y)                                   # → (B,|T|·N,D=dim)
-        Y = Y.reshape(B, len(self.steps), N, D)                  # (B,|T|,N,D)
+        A_in = self.stack_in(A)                                  # 投影一次, 循环里只切片
+        # step1 查询 = query_base; (N,D) 必须补 batch 维成 (B,N,D)——否则
+        # TransformerDecoder 会把 2-D tgt 当 unbatched, 与 3-D memory 冲突
+        Y = self.query_base.unsqueeze(0).expand(B, -1, -1)       # (B,N,D)
+        Y_total = []
+        for i, t in enumerate(self.steps):
+            # 读窗口 = 步 t 所在平方块（与 build_block_mask 的块口径逐位一致）:
+            # k=⌊√t⌋, hi=min((k+1)²−1, K); 首步 lo=0 ⇒ 含 z_cls 与其前全部元素,
+            # 其余步 lo=max(k²,1) ⇒ 只读自己那块（位置 0 = z_cls 屏蔽）
+            k = math.isqrt(int(t))
+            hi = min((k + 1) ** 2 - 1, self.num_specials)
+            lo = 0 if i == 0 else max(k * k, 1)
+            assert lo <= hi, \
+                f"步 {t} 的读窗口 [{lo},{hi}] 为空 (K={self.num_specials})"
+            Y = self.stack(self.stack_in(Y), A_in[:, lo:hi + 1])
+            Y = self.stack_out(Y)
+            Y_total.append(Y)                                    # 该步全部 patch 预测
+            # carry detach: 步间不反传 ⇒ 每步 Y_t 只从自己那一步的损失收 1 份梯度
+            # （decode 侧无累加, 不存在跨步恒等捷径 ⇒ 全局按步解耦）。前向数值与
+            # 不 detach 逐位相同 ⇒ 各步预测 / loss 数值不变, 只是梯度图被切断。
+            Y = (self.query_base + Y).detach()                    # 喂给下一步当查询
+        Y = torch.stack(Y_total, dim=1)                          # (B,|T|,N,D) 沿步
         self.last_Y = Y                                          # 采样步全部 patch 预测
-        return Y
-
-    def _forward_recurrent(self, A: Tensor, B: int, N: int, D: int) -> Tensor:
-        """循环读出（recurrent=True）: 上一步的输出作为下一步查询的一部分。
-
-        step1 查询 = query_base（A_t 项去掉）; step t≥2 查询 =
-        query_base + fuse(state_{t-1})。state 见 recurrent_state（"cumulative"
-        = Σ_{i<t}Y_i 累积估计 / "increment" = Y_{t-1}）, fuse 见 recurrent_fuse
-        （"proj" = zero-init Linear(LN(·)) / "add" = 标量门控 × LN(·)）。
-        每步 memory 仍是整条 A, 但用该步的 memory_mask 行（读窗口由
-        recurrent_memory 决定: "block" 只读自己那块 / "prefix" 读累积前缀 /
-        "open" 全读）; 单步内 N 行查询全双向自注意力, 故不构造跨步 tgt_mask。
-
-        **这是真的顺序循环**: 第 i 步的 self.stack 吃第 i-1 步的 Y, 步间有数据
-        依赖 ⇒ 无法像并行路径那样把 |T| 折进 batch 维一次算完（wall-clock 变长
-        即代价）。"并行化"只发生在**单步内部**（N 行查询一次前向）。
-        """
-        # 读窗口: block 与并行路径逐位同一掩码; prefix/open 见函数 docstring
-        mask = build_recurrent_memory_mask(self.num_specials, self.steps,
-                                           num_queries=N,
-                                           mode=self.recurrent_memory,
-                                           device=A.device)       # (|T|·N, K+1)
-        self.attn_mask = mask
-        stack_in = self.stack_in                                 # Identity 或 Linear
-        mem = stack_in(A)                                        # (B,S,stack_dim) 只算一次
-        h = torch.zeros(B, N, D, device=A.device, dtype=A.dtype)  # 累积状态 Σ_{i<t}Y_i
-        last = None                                              # 上一步增量 Y_{t-1}
-        Ys = []
-        for i in range(len(self.steps)):
-            q = self.query_base.unsqueeze(0).expand(B, N, D)     # (B,N,D) 行 k↔patch k
-            if self.recurrent_step_embed:                        # 步身份（破 open 的步对称）
-                q = q + self.rec_step_embed[i]
-            if i > 0:                                            # step1 无反馈
-                state = h if self.recurrent_state == "cumulative" else last
-                if self.recurrent_fuse == "proj":
-                    q = q + self.rec_proj(self.rec_norm(state))
-                else:
-                    q = q + self.rec_gate * self.rec_norm(state)
-            row = mask[i * N:(i + 1) * N]                        # (N,S) 该步读窗口
-            y = self.stack(stack_in(q), mem, memory_mask=row)    # (B,N,stack_dim)
-            y = self.stack_out(y)                                # (B,N,D)
-            Ys.append(y)
-            if self.recurrent_detach:                            # 截断 BPTT
-                last = y.detach()
-                h = (h + y).detach()
-            else:                                                # 默认: 整条循环反传
-                last = y
-                h = h + y
-        self.tgt_mask = None                                     # 循环路径无跨步查询自注意力
-        Y = torch.stack(Ys, dim=1)                               # (B,|T|,N,D)
-        self.last_Y = Y
         return Y
 
 
@@ -684,27 +497,18 @@ class SRPhase1V2(nn.Module):
     K=N（默认全量）序列 = [cls; specials(N); patches(N)] = 2N+1 token, 与
     历史一致; K<N 时序列 = 1+K+N token, register 1..K 全被解码器读（无
     "花瓶 register", 见 derive_num_specials / DESIGN doc）。
-    解码器查询自注意力语义由 query_mask_mode 选择（见
-    OutputQueryDecoder / build_causal_query_mask）: **"blockdiag"（默认）**
-    = 块对角, 每步只 attend 自己那 N 行, 步间在自注意力上完全隔离（memory_mask
-    的"每步只见自己的 z_s 块"在整条前向路径上字面成立, 跨步梯度回流切断）;
-    "causal"（历史行为, 3151bab 之前的产物; 复现旧结果须显式传）= 块下三角,
-    步 t 可 attend 步 ≤ t 的查询行（同步内全双向）, 后步查询内容不泄露进前步,
-    但"前步→后步"泄露被允许 ⇒ 步 t 的实际依赖集是累积前缀。
-    渐进语义由 memory_mask（读侧, 列数随步单调增）负责, 两种模式都不破坏渐进性。
-    本参数不改任何权重形状 ⇒ 旧 checkpoint 双向可载, 但模式错了不报错、只会静默
-    算错, 故一律以 model_info.json 记录的 query_mask_mode 为准。
 
-    循环架构（recurrent=True, 2026-09-15 新增; 默认 False = 全历史行为逐位不变）:
-    解码器改为**顺序循环**——step1 查询 = query_base（去掉 A_t）, step t≥2 查询
-    = query_base + fuse(state_{t-1})（state = 上一步输出; 见 OutputQueryDecoder
-    的 recurrent 段）。每步的读窗口由 recurrent_memory 决定（默认 "block" =
-    与并行路径同一分块掩码; "prefix"/"open" 放宽）, 历史输出经循环携带 ⇒ 后期步
-    可基于当前估计做残差修正。代价: 步间顺序依赖, 无法并行算完 T 步（wall-clock
-    变长）。recurrent_state / recurrent_fuse / recurrent_memory / recurrent_detach
-    只在 recurrent=True 时有意义; recurrent=True 会新增 rec_* 参数 ⇒ 与非循环
-    checkpoint 形状不兼容（strict load 会明确报错, 不会静默算错）。消费方一律以
-    model_info.json 为准。
+    解码器 = **顺序循环**（用户原始写法）: `Y = query_base` → 对每个采样步 t 循环
+    `Y = stack(stack_in(Y), stack_in(A[:, lo:hi+1]))` → `Y = stack_out(Y)` →
+    `Y = (query_base + Y).detach()`（喂回自己当下一步查询; 循环 carry 截断梯度,
+    故步间无梯度回流, 见 OutputQueryDecoder.forward）, lo/hi = 步 t 那块 z_s 的
+    起止（首步 lo=0 含 z_cls）; 返回 (B,|T|,N,D)。
+    **并行路径**（|T| 步一次算完 + 跨步 tgt_mask + query_mask_mode）与循环的
+    那些开关（recurrent_state/fuse/memory/step_embed/detach）都已整块删除。
+    损失 = **直接预测**口径（无开关）: 每步 Y_t 各自过 PixelHead 预测整图,
+    L = mean_t L1(PixelHead(Y_t), target); F_hat = 最后一步的直接预测
+    （Y_pix[:, -1]）。旧的 loss_mode / loss_decouple（cumsum 累加口径）开关
+    已一并删除, 传它们直接 TypeError（不静默忽略）。
     """
 
     def __init__(
@@ -720,24 +524,10 @@ class SRPhase1V2(nn.Module):
         skip_steps: Optional[int] = None,
         max_steps: Optional[int] = None,
         num_specials: Optional[int] = None,
-        query_mask_mode: str = DEFAULT_QUERY_MASK_MODE,
         stack_dim: int = 0,
         decoder_dropout: float = 0.0,
-        recurrent: bool = False,
-        recurrent_state: str = "cumulative",
-        recurrent_fuse: str = "proj",
-        recurrent_memory: str = "block",
-        recurrent_step_embed: bool = False,
-        recurrent_detach: bool = False,
-        recurrent_gate_init: float = 0.0,
-        loss_mode: str = "cumulative",
-        loss_decouple: bool = True,
     ):
         super().__init__()
-        assert loss_mode in LOSS_MODES, \
-            f"未知 loss_mode={loss_mode!r}, 合法值 {LOSS_MODES}"
-        self.loss_mode = str(loss_mode)
-        self.loss_decouple = bool(loss_decouple)
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
@@ -767,24 +557,8 @@ class SRPhase1V2(nn.Module):
                                           steps=steps_selected,
                                           depth=decoder_depth,
                                           num_specials=K,
-                                          query_mask_mode=query_mask_mode,
                                           stack_dim=stack_dim,
-                                          dropout=decoder_dropout,
-                                          recurrent=recurrent,
-                                          recurrent_state=recurrent_state,
-                                          recurrent_fuse=recurrent_fuse,
-                                          recurrent_memory=recurrent_memory,
-                                          recurrent_step_embed=recurrent_step_embed,
-                                          recurrent_detach=recurrent_detach,
-                                          recurrent_gate_init=recurrent_gate_init)
-        self.query_mask_mode = self.decoder.query_mask_mode
-        # 循环架构开关/语义透传（供 train/infer/model_info 读取; 见 decoder）
-        self.recurrent = self.decoder.recurrent
-        self.recurrent_state = self.decoder.recurrent_state
-        self.recurrent_fuse = self.decoder.recurrent_fuse
-        self.recurrent_memory = self.decoder.recurrent_memory
-        self.recurrent_step_embed = self.decoder.recurrent_step_embed
-        self.recurrent_detach = self.decoder.recurrent_detach
+                                          dropout=decoder_dropout)
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     # ── encode: 输入 → 解码器输入 z_cls, z_s ──
@@ -819,25 +593,21 @@ class SRPhase1V2(nn.Module):
 
     # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
-        """解码器 + 像素头 + 像素 L1（口径由 loss_mode / loss_decouple 决定）。
+        """解码器 + 像素头 + 像素 L1（**直接预测口径**, 无累加）。
 
-        **累加语义**: Y_cum[:, n] = Σ_{t≤n} Y_t（特征空间累加再统一过
-        PixelHead——PixelHead 含 bias, 先投影再累加会重复加 bias）。
-        **loss_mode**（默认 "cumulative"）:
-          · "cumulative"（全历史行为）: 每个采样步的**累加结果**都监督成整图,
-            L = mean_t L1(Y_pix[:,t], target)（全轨迹深监督, 平权）;
-          · "final": 只监督最终集成 F_hat = Σ_t Y_t, L = L1(F_hat, target)
-            （= 监控量 recon 本身; 中间步不再被直接约束）。
-        **loss_decouple**（默认 True）: 累加 carry 是否 detach。
-          · True: carry = [0, cumsum(Y)[:-1]] 整体 detach + 自己的预测 ⇒ 每步恰从
-            **累加路径**收 1 份梯度（数值上 Y_cum 仍 = cumsum(Y), F_hat 不变）。
-            循环架构下要注意: 此时跨步梯度只剩解码器循环那一条（q_t ← h_{t-1}）,
-            而 rec_proj zero-init 使它在初始化时恰为 0 ⇒ 各步**独立**受训。
-          · False: Y_cum = 朴素 cumsum ⇒ 保留跨步恒等捷径, 一开始就是耦合的 BPTT
-            深监督（循环架构推荐试这一档）。
+        **直接预测**: 每个采样步的输出 Y_t 自己就过 PixelHead 预测整图
+        （Y_pix[:, t] = PixelHead(Y_t)）, 训练损失 = 各步直接预测的平权像素 L1:
+            L = mean_t L1(PixelHead(Y_t), target)
+        步间不做任何累加/集成——F_hat = Y_pix[:, -1]（最后一步的直接预测）,
+        recon = L1(F_hat, target)（监控量; 数值上 = 训练 loss 的最后一项）。
+        旧口径（cumsum 累加 + loss_mode/loss_decouple 开关）已整块删除。
 
-        dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步累加
-        像素 B,|T|,N,588), "target_pix"(B,N,588)}——训练取 loss; 推理取
+        **梯度**: 每步 Y_t 只从自己那一步的损失收 1/|T| 份梯度（解码器循环
+        carry 的 detach 见 OutputQueryDecoder.forward; decode 侧无累加 ⇒ 不存在
+        跨步恒等捷径）⇒ 跨步梯度结构性为 0。
+
+        dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步的**直接**
+        预测像素 B,|T|,N,588), "target_pix"(B,N,588)}——训练取 loss; 推理取
         F_hat / Y_pix / target_pix（全量 L1、渐进曲线、可视化同一路径）。
         """
         x = pixel_values
@@ -849,28 +619,14 @@ class SRPhase1V2(nn.Module):
         target_pix = x.reshape(B, C, H // 14, 14, W // 14, 14) \
                       .permute(0, 2, 4, 1, 3, 5) \
                       .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
-        # 特征空间累加 → 统一过 PixelHead（bias 只加一次）。
-        # loss_decouple=True（默认, 全历史行为）: carry[n] = Σ_{t<n} Y_t（detach）;
-        #   + Y[n] ⇒ 每步恰从**累加路径**收 1 份梯度（数值上 Y_cum[n] 仍 = Σ_{t≤t} Y_t,
-        #   F_hat 不变）。**注意（循环架构）**: detach 掉的是"累加恒等捷径"; 跨步梯度
-        #   仍可经解码器循环（q_t ← h_{t-1}）回流——但 zero-init rec_proj 下该通路在
-        #   初始化时恰为 0 ⇒ 各步会**独立**受训。要一开始就有跨步耦合的 BPTT, 传
-        #   loss_decouple=False（Y_cum = 朴素 cumsum, 恒等捷径保留）。
-        if self.loss_decouple:
-            Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
-                               Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y
-        else:
-            Y_cum = Y.cumsum(dim=1)                     # 朴素累加（不 detach carry）
-        Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
-        F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
-        # 每步累加结果的像素 L1（两个 loss_mode 都要, 便于监控/自检）
+        # 直接预测: 每步 Y_t 各自过 PixelHead（无累加/集成 ⇒ F_hat = 最后一步）
+        Y_pix = self.pixel_head(Y)                      # (B,|T|,N,588) 每步直接预测
+        F_pix = Y_pix[:, -1]                            # (B,N,588) 最终输出 = 最后一步
+        # 每步直接预测的像素 L1（平权深监督）
         per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
                              reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
-        recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
-        if self.loss_mode == "cumulative":              # 默认: 全轨迹深监督, 平权
-            loss = per_step.mean()
-        else:                                           # "final": 只监督 F_hat
-            loss = recon
+        recon = F.l1_loss(F_pix, target_pix)            # = 最后一步（监控用, 归一化空间）
+        loss = per_step.mean()                          # 各步直接预测平权
         return {"loss": loss, "recon": recon, "F_hat": F_pix,
                 "Y_pix": Y_pix, "target_pix": target_pix}
 
@@ -881,9 +637,9 @@ class SRPhase1V2(nn.Module):
 
         监督**原始像素**而非 DINO patch 特征（特征目标退化: 工地图特征
         空间近常数, 学质心即低 L1 是假收敛）。H,W 须为 14 的倍数。
-        损失: 每个采样步的**累加结果**都监督还原全部 patch —— 平权全覆盖
-        L = mean_n L1(cumsum_n Y_pix, target_pix)。F_hat = Σ_t Y_t → 像素;
-        recon 仅作监控。
+        损失: 每个采样步的输出 Y_t 各自**直接**过 PixelHead 预测整图, 平权
+        全覆盖 L = mean_t L1(PixelHead(Y_t), target_pix)（无累加/集成）。
+        F_hat = 最后一步的直接预测（Y_pix[:, -1]）; recon = L1(F_hat, target_pix)。
         """
         x = pixel_values                                # (B,3,H,W)
         B, C, H, W = x.shape
@@ -898,7 +654,7 @@ class SRPhase1V2(nn.Module):
 # ═══ 自检（python model_v2.py）═══
 #   1. 形状正确性（register 式全路径）
 #   2. OutputQueryDecoder 分块采样计划 + 分块掩码结构
-#   3. 梯度流向（整模型可训）+ 梯度按步解耦（Y_cum 数值==cumsum, 每步只收
+#   3. 梯度流向（整模型可训）+ 梯度按步解耦（直接预测口径: 每步只收
 #      自己那一步的梯度）
 #   4. eval 同路径
 
@@ -974,8 +730,7 @@ if __name__ == "__main__":
     N, D = 16, 64
     dino = FakeDino(dim=D, num_patches=N)
     model = SRPhase1V2(dino, num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N),  # 显式传完整分块计划(不切片)
-                       query_mask_mode="causal")   # §2 校验历史掩码语义, 故显式 pin
+                       decoder_steps=square_block_starts(N))  # 显式传完整分块计划(不切片)
     # 像素目标绑定输入尺寸: N=16 patches ⇒ 输入须为 4×4 patch = 56×56 (14 的倍数)
     x = torch.randn(2, 3, 56, 56)
     B, C, H, W = x.shape
@@ -993,53 +748,27 @@ if __name__ == "__main__":
     print(f"[ok] shapes: F_hat{tuple(out['F_hat'].shape)} (像素 {PATCH_PX}D) "
           f"loss={out['loss'].item():.4f}")
 
-    # ── 2. OutputQueryDecoder: 分块采样计划 + 分块掩码(读侧 memory_mask)
-    #    + 查询自注意力块因果(tgt_mask) + 累加结果损失 ──
+    # ── 2. OutputQueryDecoder: 采样计划 + 顺序循环(块切片当 memory) ──
+    # 注: 解码器现在**没有** attn_mask / tgt_mask（读窗口是 A[:, lo:hi+1] 块切片,
+    # 每步一个采样步、|T| = len(steps); 单步内 N 行全双向自注意力）, 故本段只钉
+    # 采样计划与循环形状。
     T_steps = model.decoder.steps
     assert T_steps == square_block_starts(N), T_steps       # N=16 → [1,4,9,16]
     assert len(model.decoder.stack.layers) == 2, "默认 decoder_depth=2"
-    am = model.decoder.attn_mask                             # (|T|·N, N+1) float
-    assert am is not None and am.shape == (len(T_steps) * N, N + 1), am.shape
-    # 分块掩码: 第一个步可见 0..hi（自己块 + 前面所有元素, 含位置 0 z_cls）;
-    # 其余步只允许自己的块 [⌊√t⌋², min((⌊√t⌋+1)²-1, N)], 位置 0 屏蔽
-    for ti, t in enumerate(T_steps):
-        k = math.isqrt(t)
-        hi = min((k + 1) * (k + 1) - 1, N)
-        row = am[ti * N]
-        if ti == 0:
-            assert (row[:hi + 1] == 0).all()                 # 前面所有 + 自己块
-            assert (row[hi + 1:] == float("-inf")).all()
-        else:
-            lo = max(k * k, 1)
-            assert row[0] == float("-inf")                   # 其余步 z_cls 屏蔽
-            assert (row[:lo] == float("-inf")).all()         # 块前屏蔽
-            assert (row[lo:hi + 1] == 0).all()               # 块内允许
-            assert (row[hi + 1:] == float("-inf")).all()     # 块后屏蔽
-    # 查询自注意力块因果: tgt_mask (L,L), 行序 = (t,k) 展平, 步 ti 的行只
-    # 允许步 ≤ ti 的列（同步内全双向 + 之前步）, 未来步 -inf
-    tg = model.decoder.tgt_mask
-    assert tg is not None, "tgt_mask 不应为 None（查询自注意力块因果）"
-    assert tg.shape == (len(T_steps) * N, len(T_steps) * N), tg.shape
-    for ti in range(len(T_steps)):
-        qrow = tg[ti * N]
-        assert (qrow[:(ti + 1) * N] == 0).all(), \
-            f"步 {ti} 应可见步 ≤{ti} 的查询行"
-        assert (qrow[(ti + 1) * N:] == float("-inf")).all(), \
-            f"步 {ti} 不应见未来步查询行"
+    assert not hasattr(model.decoder, "attn_mask"), \
+        "切片式读窗口 ⇒ 不应再有 attn_mask"
+    assert not hasattr(model.decoder, "tgt_mask"), \
+        "单步内全双向自注意力 ⇒ 不应再有 tgt_mask"
 
-    # ── 2b. query_mask_mode: 默认 "blockdiag" / 显式 "causal" ──
-    # 注: 上面的 §2 断言用 model(query_mask_mode="causal") 校验**历史**掩码语义;
-    # 本段校验默认值已翻转为 blockdiag, 且两种模式都正确。
-    # 本段会另跑 model.decoder（B=1）, 先存下上面的 last_Y 供后续断言复用
-    _last_Y_saved = model.decoder.last_Y
-    # 掩码层: 默认 mode 必须是 blockdiag; 显式 "causal" 必须与历史块下三角**逐位相同**
+    # ── 2b. build_causal_query_mask: **历史遗留纯函数**回归 ──
+    # 当前架构不消费它（见函数 docstring）, 但它精确记录了两代掩码语义, 是复现/
+    # 对照旧产物与诊断可视化的工具, 故仍须保证语义不被改坏。
     T3, Q3 = 3, 4
-    tm_def = build_causal_query_mask(T3, Q3)
-    assert DEFAULT_QUERY_MASK_MODE == "blockdiag", DEFAULT_QUERY_MASK_MODE
-    assert torch.equal(tm_def, build_causal_query_mask(T3, Q3, mode="blockdiag")), \
-        "默认 mode 应为 'blockdiag'"
     tm_bd = build_causal_query_mask(T3, Q3, mode="blockdiag")
     tm_ca = build_causal_query_mask(T3, Q3, mode="causal")
+    assert DEFAULT_QUERY_MASK_MODE == "blockdiag", DEFAULT_QUERY_MASK_MODE
+    assert torch.equal(build_causal_query_mask(T3, Q3), tm_bd), \
+        "默认 mode 应为 'blockdiag'"
     assert tm_bd.shape == (T3 * Q3, T3 * Q3), tm_bd.shape
     for ti in range(T3):
         row = tm_bd[ti * Q3]
@@ -1048,8 +777,6 @@ if __name__ == "__main__":
         rest = torch.cat([row[:ti * Q3], row[(ti + 1) * Q3:]])
         assert (rest == float("-inf")).all(), \
             f"blockdiag 步 {ti} 不应见其它步的查询行"
-    # causal 仍必须是历史块下三角（回归: 复现旧结果的能力不能被破坏）
-    for ti in range(T3):
         row = tm_ca[ti * Q3]
         assert (row[:(ti + 1) * Q3] == 0).all(), f"causal 步 {ti} 应见步 ≤{ti}"
         assert (row[(ti + 1) * Q3:] == float("-inf")).all(), \
@@ -1066,65 +793,30 @@ if __name__ == "__main__":
             raise AssertionError(f"mode={bad!r} 应被拒绝")
         except AssertionError as e:
             assert "未知查询掩码 mode" in str(e), f"mode={bad!r}: {e}"
-    # 解码器/主模型层: 默认必须透传为 blockdiag, 且形状与 causal 完全一致
-    # （权重形状不变 ⇒ 旧 checkpoint 仍可双向载）
-    d_def = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps, num_specials=N)
-    assert d_def.query_mask_mode == "blockdiag", \
-        f"OutputQueryDecoder 默认应为 blockdiag, 实为 {d_def.query_mask_mode}"
-    d_bd = d_def                                             # 默认即 blockdiag
-    assert model.decoder.query_mask_mode == "causal", \
-        "§2 用的 model 应显式 pin 成 causal（历史语义回归）"
-    Y_bd = d_bd(torch.randn(1, 1, D), torch.randn(1, N, D))
-    assert Y_bd.shape == (1, len(T_steps), N, D), Y_bd.shape
-    assert torch.equal(d_bd.tgt_mask,
-                       build_causal_query_mask(len(T_steps), N, mode="blockdiag"))
-    # 隔离性（本模式的核心语义）: 只改"块 1"的**非种子** register 内容
-    #   causal    : 步 1 变 + 后续步也变（累积前缀泄露, 实测 N=576/K=35 时步
-    #               4/9/16/25 变化为其自身尺度 ~5.7%/3.9%/3.0%/1.7%）
-    #   blockdiag : 后续步**逐位不变（恰好 0）**
-    zc = torch.randn(1, 1, D)
-    z_s0 = torch.randn(1, N, D)
-    z_s1 = z_s0.clone()
-    z_s1[:, 1:3] += 5.0                     # 位置 2,3 = 块 1 的非种子成员
-    with torch.no_grad():
-        Yc0, Yc1 = model.decoder(zc, z_s0), model.decoder(zc, z_s1)
-    d_bd.load_state_dict(model.decoder.state_dict())        # 同权重, 只换掩码
-    with torch.no_grad():
-        Yb0, Yb1 = d_bd(zc, z_s0), d_bd(zc, z_s1)
-    assert (Yc1[0, 0] - Yc0[0, 0]).abs().max() > 0, "causal: 改块1 应影响步1(自己块)"
-    for ti in range(1, len(T_steps)):
-        assert (Yb1[0, ti] - Yb0[0, ti]).abs().max().item() == 0.0, \
-            f"blockdiag: 改块1 不应影响步 {T_steps[ti]}（应恰好 0）"
-    assert (Yc1[0, -1] - Yc0[0, -1]).abs().max() > 0, \
-        "causal: 改块1 应经累积前缀影响最后一步（本模式的已知泄露）"
-    # 梯度侧: blockdiag 下最后一步的损失**推不动**块1 的 register（跨步回流被切断）
-    zg_bd = z_s0.clone().requires_grad_(True)
-    g_bd = torch.autograd.grad(d_bd(zc, zg_bd)[0, -1].pow(2).sum(), zg_bd)[0]
-    assert g_bd[0, 1].abs().max().item() == 0.0, \
-        "blockdiag: 最后一步损失不应推动块1 register（应恰好 0）"
-    zg_ca = z_s0.clone().requires_grad_(True)
-    g_ca = torch.autograd.grad(model.decoder(zc, zg_ca)[0, -1].pow(2).sum(),
-                               zg_ca)[0]
-    assert g_ca[0, 1].abs().max() > 0, \
-        "causal: 最后一步损失会推动块1 register（累积前缀 = 跨步梯度回流）"
-    model.decoder.last_Y = _last_Y_saved                    # 复原, 不影响后续断言
-    print("[ok] query_mask_mode: 默认 blockdiag(块对角, 步间自注意力隔离, "
-          "跨步梯度回流切断) / 可选 causal(历史块下三角, 需显式传)")
+    # 模型层: query_mask_mode 旋钮已随并行路径删除 ⇒ 传它必须**报错**而不是被
+    # 静默忽略（否则消费方以为自己在切掩码语义, 实际什么都没发生）。
+    for kw in ({"query_mask_mode": "causal"}, {"recurrent": True}):
+        try:
+            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D, **kw)
+            raise AssertionError(f"{kw} 应被拒绝（该接口已删除）")
+        except TypeError as e:
+            assert "unexpected keyword" in str(e), e
+    print("[ok] query_mask_mode / recurrent 开关已删除: 传它们直接 TypeError"
+          "（不静默忽略）; build_causal_query_mask 作为历史遗留纯函数语义不变")
 
     Y = model.decoder.last_Y                                 # (B,|T|,N,D) 特征
     assert Y.shape == (2, len(T_steps), N, D)
-    # 与模型 decode 相同的梯度解耦构造: carry 无梯度 + 自己的预测
-    Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
-                       Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y
-    Y_pix = model.pixel_head(Y_cum)                          # (B,|T|,N,588) 累加像素
+    # 直接预测: 每步 Y_t 各自过 PixelHead（无累加/集成）
+    Y_pix = model.pixel_head(Y)                              # (B,|T|,N,588) 每步直接预测
     assert Y_pix.shape == (2, len(T_steps), N, PATCH_PX)
-    # 数值不变性: 与朴素 cumsum 只差 float32 求和顺序噪声（<1e-4 级）
-    assert torch.allclose(Y_cum, Y.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
-        "梯度解耦构造数值上应≈原 cumsum（float32 求和顺序噪声内）"
-    assert torch.isclose(out["F_hat"], Y_pix[:, -1]).all(), "F_hat 应为各步像素累加和"
+    assert torch.isclose(Y_pix, out["Y_pix"]).all(), \
+        "Y_pix 应为每步 Y 的直接像素预测（与 decode 同路径、逐位一致）"
+    assert torch.isclose(out["F_hat"], Y_pix[:, -1]).all(), \
+        "F_hat 应为最后一步的直接预测（不再有累加）"
     per = F.l1_loss(Y_pix, target.unsqueeze(1).expand_as(Y_pix),
-                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步累加结果
-    assert torch.isclose(out["loss"], per.mean()), "loss 应为累加结果平权 L1"
+                    reduction="none").mean(dim=(0, 2, 3))    # (|T|,) 每步直接预测
+    assert torch.isclose(out["loss"], per.mean()), "loss 应为各步直接预测的平权 L1"
+    assert torch.isclose(out["recon"], per[-1]), "recon 应等于最后一步的直接预测 L1"
     # 计划自动适配任意 N（可扩展性）: 12→3 块, 256→16 块, 512→22 块
     assert square_block_starts(12) == [1, 4, 9], square_block_starts(12)
     assert len(square_block_starts(256)) == 16
@@ -1140,27 +832,16 @@ if __name__ == "__main__":
     d_slice = OutputQueryDecoder(num_patches=256, dim=D, skip_steps=4, max_steps=9)
     assert d_slice.steps == square_block_starts(256)[4:9], d_slice.steps
     assert d_slice.steps == [25, 36, 49, 64, 81], d_slice.steps
-    # 切片后: 第一个步 t=25 可见 0..35; 其余步只允许自己的块（t=81 → [81..99]）
-    d_slice(torch.randn(1, 1, D), torch.randn(1, 256, D))
-    sm = d_slice.attn_mask                                  # (5·256, 257)
-    assert sm.shape == (5 * 256, 257), sm.shape
-    r_s1, r_s5 = sm[0], sm[4 * 256]                         # t=25 (第一个) / t=81 首查询行
-    assert (r_s1[0:36] == 0).all() and (r_s1[36:] == float("-inf")).all()
-    assert (r_s5[81:100] == 0).all() and (r_s5[:81] == float("-inf")).all() \
-        and (r_s5[100:] == float("-inf")).all()
-    # 默认 None = 全部分块（等价不切片）; 验收: 第一个步 t=1 能看到 [0,1]
+    d_slice(torch.randn(1, 1, D), torch.randn(1, 256, D))   # 循环跑得通
+    # 默认 None = 全部分块（等价不切片）
     d_full = OutputQueryDecoder(num_patches=256, dim=D)
     assert d_full.steps == square_block_starts(256), "默认 None 应为全部分块"
     assert d_full.steps[0] == 1, "默认计划第一个步应为 t=1"
     d_full(torch.randn(1, 1, D), torch.randn(1, 256, D))
-    r_def1 = d_full.attn_mask[0]                            # 默认计划第一个步 (t=1)
-    assert (r_def1[0:4] == 0).all(), "第一个步应可见位置 0 (z_cls)"
-    assert (r_def1[1] == 0).all(), "第一个步应可见位置 1"
     print(f"[ok] OutputQueryDecoder: {len(model.decoder.stack.layers)} 层 "
-          f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps} "
-          f"+ 分块掩码(示例核对, 第一个步可见[0,1]) + 可选挑选 [4:9]={d_slice.steps} "
-          f"+ 查询自注意力块因果(query_mask_mode=causal, 步 t 只见步 ≤t) "
-          f"+ 累加结果像素损失正确")
+          f"TransformerDecoder, 分块采样 {len(T_steps)} 步 {T_steps}, "
+          f"可选挑选 [4:9]={d_slice.steps}, 默认全量 {len(d_full.steps)} 步, "
+          f"循环体 = 用户原始写法（切片当 memory; 无 attn_mask/tgt_mask）")
 
     # ── 2b. num_specials(K) 与 N 解耦: K 由最终采样步集自动推导（无花瓶）──
     # derive_num_specials 公式核对（权威示例）
@@ -1180,14 +861,6 @@ if __name__ == "__main__":
     out_k = m_k(x)                                        # 同 x: (2,3,56,56)
     z_s_k = m_k.encode(x)[1]
     assert z_s_k.shape == (2, 15, D), z_s_k.shape         # 编码器只生成 K=15 个 register
-    am_k = m_k.decoder.attn_mask                          # (|T|·N, K+1) = (2·16, 16)
-    assert am_k.shape == (2 * N, 16), am_k.shape
-    # 覆盖断言: register 位置 1..K 每个位置至少被一个步允许（square 切片成立
-    # ——首步前缀规则覆盖开头, 各块连续铺满, 无花瓶）; 列 0 = z_cls 不算
-    allowed = torch.zeros(m_k.num_specials, dtype=torch.bool, device=am_k.device)
-    for ti in range(len([4, 9])):
-        allowed |= am_k[ti * N][1:] == 0                  # 位置 1..K ↔ allowed[0..K-1]
-    assert allowed.all(), "square 切片下 register 1..K 应全覆盖（无花瓶）"
     # 梯度仍全通: 显式 K<N 模型的键侧 / 查询侧 / 像素头都要收梯度
     out_k["loss"].backward()
     for name, p in [("m_k.special_bank.pos", m_k.special_bank.pos),
@@ -1197,10 +870,7 @@ if __name__ == "__main__":
         g = p.grad
         assert g is not None and g.abs().sum() > 0, f"{name} 收不到梯度"
     print(f"[ok] num_specials 自动推导: N={N} slice[1:3] → steps=[4,9], "
-          f"K={m_k.num_specials}, z_s{z_s_k.shape} 形状对, "
-          f"掩码 {tuple(am_k.shape)} "
-          f"(每步 {N} 行查询 × K+1 列), register 1..K 全覆盖(无花瓶), "
-          f"梯度全通")
+          f"K={m_k.num_specials}, z_s{z_s_k.shape} 形状对, 梯度全通")
 
     # ── 2c. 显式 num_specials（旧 checkpoint 复现/手动指定路径）──
     dino_e = FakeDino(dim=D, num_patches=N)
@@ -1212,7 +882,6 @@ if __name__ == "__main__":
     assert z_s_e.shape == (2, 8, D), z_s_e.shape
     out_e = m_e(x)
     assert out_e["F_hat"].shape == (2, N, PATCH_PX)
-    assert m_e.decoder.attn_mask.shape == (1 * N, 9), m_e.decoder.attn_mask.shape
     # 显式 K 过小 → 清晰报错（max(steps) > K）
     try:
         SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
@@ -1245,18 +914,13 @@ if __name__ == "__main__":
     print(f"[ok] 梯度: DINO 嵌入/层 + OutputQueryDecoder({len(model.decoder.stack.layers)}×"
           f"TransformerDecoderLayer,query_base)/SpecialTokenBank/PixelHead 全部可训")
 
-    # ── 3b. 梯度按步解耦 ──
-    # 数值上 Y_cum == cumsum(Y)（F_hat/损失语义不变）; 但 dL/dY_t 只来自
-    # 第 t 步自己的损失项——每步平权 1 份梯度, 不再有"t=0 收 |T| 份"的
-    # 三角失衡。校验: (a) 数值恒等; (b) 全量梯度在位置 n == 仅第 n 步损失
-    # 的梯度(÷|T|); (c) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）。
+    # ── 3b. 梯度按步解耦（直接预测口径）──
+    # 无累加 ⇒ dL/dY_t 只来自第 t 步自己的损失项（每步平权 1 份梯度）, 跨步恒等
+    # 捷径不存在。校验: (a) 全量梯度在位置 n == 仅第 n 步损失的梯度(÷|T|);
+    # (b) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）。
     out_b = model(x)
     Y_b = model.decoder.last_Y                              # (B,|T|,N,D)
     Tb = Y_b.shape[1]
-    Y_cum_b = torch.cat([torch.zeros_like(Y_b[:, :1]),
-                         Y_b.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y_b
-    assert torch.allclose(Y_cum_b, Y_b.cumsum(dim=1), atol=1e-4, rtol=1e-4), \
-        "梯度解耦后 Y_cum 数值上应≈原 cumsum（float32 求和顺序噪声内）"
     assert torch.isclose(out_b["F_hat"], out_b["Y_pix"][:, -1]).all()
     per_b = F.l1_loss(out_b["Y_pix"],
                       out_b["target_pix"].unsqueeze(1).expand_as(out_b["Y_pix"]),
@@ -1268,11 +932,11 @@ if __name__ == "__main__":
         others = [m for m in range(Tb) if m != n]
         assert torch.allclose(g_n[:, others],
                               torch.zeros_like(g_n[:, others]), atol=1e-5), \
-            f"step {n} 的损失不应给其他步的预测梯度"
+            f"step {n} 的损失不应给其他步的预测梯度（无累加）"
         assert torch.allclose(g_total[:, n], g_n[:, n], atol=1e-5), \
             f"step {n} 的 Y 梯度应只来自自己那一步的损失（平权 1/{Tb}）"
-    print(f"[ok] 梯度按步解耦: Y_cum 数值==cumsum(F_hat 不变), "
-          f"每步 Y_t 恰收 1/{Tb} 份梯度（不再三角失衡）")
+    print(f"[ok] 梯度按步解耦: 直接预测（无累加）→ 每步 Y_t 恰收 1/{Tb} 份梯度, "
+          f"跨步恒为 0")
 
     # ── 4. 推理: 同一 forward（eval + no_grad）──
     model.eval()
@@ -1282,20 +946,20 @@ if __name__ == "__main__":
     print(f"[ok] eval 同路径: loss={out_e['loss'].item():.4f}")
 
     # ── 5. self.stack 加宽（stack_dim ≠ dim, 前后 Linear 投影）+ dropout ──
-    # 默认（stack_dim=0 ⇒ stack_dim==dim）必须与原实现完全同构: 不新增任何
-    # 参数、state_dict 键不变（旧 checkpoint 仍可 strict load）。
+    # 默认（stack_dim=0 ⇒ stack_dim==dim）不加任何投影: 不新增 stack_in/out 参数
+    # （与 stack_dim=0 的循环实现同构; 注意循环架构本身始终带 rec_* 参数 ⇒ 与
+    # 并行时代的 checkpoint 形状不兼容, 这是本轮架构切换的既定代价）。
     assert model.decoder.stack_dim == D
     assert isinstance(model.decoder.stack_in, nn.Identity), \
         "默认 stack_dim=dim 时输入侧应为 Identity（零额外参数）"
     assert isinstance(model.decoder.stack_out, nn.Identity)
     assert not [k for k in model.state_dict()
                 if "stack_in" in k or "stack_out" in k], \
-        "默认路径不应出现投影层参数（旧权重 strict load 必须继续成立）"
+        "默认路径不应出现投影层参数"
     # 显式加宽: dim → stack_dim → dim; FFN 随 stack_dim 等比（mlp_ratio 不变）
     m_wide = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
                         decoder_steps=square_block_starts(N), heads=4,
-                        decoder_depth=4, stack_dim=2 * D, decoder_dropout=0.05,
-                        query_mask_mode="causal")
+                        decoder_depth=4, stack_dim=2 * D, decoder_dropout=0.05)
     dec = m_wide.decoder
     assert dec.stack_dim == 2 * D, dec.stack_dim
     assert isinstance(dec.stack_in, nn.Linear) and dec.stack_in.in_features == D \
@@ -1316,266 +980,33 @@ if __name__ == "__main__":
           f"depth={len(dec.stack.layers)}, dropout=0.05, "
           f"投影 {tuple(dec.stack_in.weight.shape)}→{tuple(dec.stack_out.weight.shape)}")
 
-    # ── 6. 循环架构（recurrent）: step1 查询=query_base, step t≥2=上一步输出+query_base ──
-    # 6.0 默认关闭: 不得新增任何参数/state_dict 键（旧 checkpoint strict load 必须
-    #     继续成立; 非循环路径的全部断言已在 §1~§5 跑过 = 逐位不变回归）
-    assert not model.decoder.recurrent, "默认必须是非循环（并行）路径"
-    assert not [k for k in model.state_dict() if ".rec_" in k], \
-        "默认路径不应出现任何 rec_* 参数/键"
-    # 6.1 构造 + 形状 + 零初始化（起步 = 纯 query_base 读出, 循环随训练长出）
-    m_rc = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                      decoder_steps=square_block_starts(N), recurrent=True)
-    dec_rc = m_rc.decoder
-    assert dec_rc.recurrent and dec_rc.recurrent_state == "cumulative" \
-        and dec_rc.recurrent_fuse == "proj" and not dec_rc.recurrent_detach
-    assert dec_rc.recurrent_memory == "block", dec_rc.recurrent_memory
-    assert [k for k in m_rc.state_dict() if ".rec_" in k], "循环路径应有 rec_* 参数"
-    assert torch.count_nonzero(dec_rc.rec_proj.weight).item() == 0, \
-        "rec_proj 必须 zero-init（初始化时反馈恰为 0）"
-    assert torch.count_nonzero(dec_rc.rec_proj.bias).item() == 0
-    out_rc = m_rc(x)
-    assert out_rc["F_hat"].shape == (2, N, PATCH_PX), out_rc["F_hat"].shape
-    assert out_rc["loss"].shape == ()
-    Y_rc = dec_rc.last_Y
-    assert Y_rc.shape == (2, len(T_steps), N, D), Y_rc.shape
-    assert dec_rc.tgt_mask is None, "循环路径无跨步查询自注意力 ⇒ tgt_mask=None"
-    assert dec_rc.attn_mask.shape == (len(T_steps) * N, N + 1), dec_rc.attn_mask.shape
-    assert len(T_steps) >= 2, "本自检需要 ≥2 个采样步"
-
-    # 6.2 step1 无反馈 / step≥2 走反馈: 把 rec_proj 从 0 改成随机后, 第 1 步输出
-    #     必须**逐位不变**（它根本不看 h）, 第 ≥2 步必须改变
-    m_rc.eval()
-    zc_r, zs_r = (t.detach() for t in m_rc.encode(x))
-    with torch.no_grad():
-        Y_off = dec_rc(zc_r, zs_r).clone()
-        dec_rc.rec_proj.weight.normal_(0.0, 0.05)
-        dec_rc.rec_proj.bias.normal_(0.0, 0.05)
-        Y_on = dec_rc(zc_r, zs_r).clone()
-    assert (Y_on[:, 0] - Y_off[:, 0]).abs().max().item() == 0.0, \
-        "step1 查询=query_base（无 A_t/无反馈）⇒ 改 rec_proj 不应动第 1 步（恰 0）"
-    for ti in range(1, len(T_steps)):
-        assert (Y_on[:, ti] - Y_off[:, ti]).abs().max().item() > 0.0, \
-            f"step {T_steps[ti]} 应经循环反馈改变（查询含上一步输出）"
-
-    # 6.3 核心: 跨步信息流. 扰动步 1 的 z_s 块（位置 1,2）——并行 blockdiag 路径
-    #     后期步**逐位不变**（§2b 已断言）; 循环路径后期步必须经反馈改变
-    zs_a, zs_b = zs_r.clone(), zs_r.clone()
-    zs_b[:, 1:3] += 5.0
-    with torch.no_grad():
-        Ya, Yb = dec_rc(zc_r, zs_a), dec_rc(zc_r, zs_b)
-    assert (Yb[:, 0] - Ya[:, 0]).abs().max() > 0, "步1 读自己的块, 应受扰动影响"
-    for ti in range(1, len(T_steps)):
-        assert (Yb[:, ti] - Ya[:, ti]).abs().max().item() > 0.0, \
-            f"循环: 扰动步1 应经反馈影响步 {T_steps[ti]}（跨步信息流）"
-
-    # 6.4 反向: 末步损失也能经循环推动步 1 的 register（BPTT; 并行 blockdiag 恰为 0）
-    zg = zs_r.clone().requires_grad_(True)
-    g_rc = torch.autograd.grad(dec_rc(zc_r, zg)[:, -1].pow(2).sum(), zg)[0]
-    assert g_rc[:, 1].abs().max().item() > 0.0, \
-        "循环: 末步损失应经反馈推动步1 register（跨步梯度回流）"
-    # 截断 BPTT: recurrent_detach=True 时同一末步损失**不再**回到步1 register（恰 0）
-    dec_det = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                         decoder_steps=square_block_starts(N), recurrent=True,
-                         recurrent_detach=True).decoder
-    with torch.no_grad():
-        dec_det.rec_proj.weight.normal_(0.0, 0.05)
-        dec_det.rec_proj.bias.normal_(0.0, 0.05)
-    zg_d = zs_r.clone().requires_grad_(True)
-    g_det = torch.autograd.grad(dec_det(zc_r, zg_d)[:, -1].pow(2).sum(), zg_d)[0]
-    assert g_det[:, 1].abs().max().item() == 0.0, \
-        "recurrent_detach=True: 末步损失不应回到步1 register（BPTT 已截断, 应恰 0）"
-
-    # 6.5 zero-init rec_proj 必须收得到非零梯度（否则循环永远打不开 = 死开关）。
-    #     注意 rec_norm 在 zero-init 时**故意**收不到梯度（W=0 ⇒ ∂L/∂(W·LN(h))=0,
-    #     LN 的梯度要等 rec_proj 先迈出第一步才通）, 故不列入本断言。
-    m_rc0 = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N), recurrent=True)
-    m_rc0(x)["loss"].backward()
-    for name, p in [("decoder.rec_proj.weight", m_rc0.decoder.rec_proj.weight),
-                    ("decoder.query_base", m_rc0.decoder.query_base),
-                    ("special_bank.pos", m_rc0.special_bank.pos),
-                    ("pixel_head.net", m_rc0.pixel_head.net[0].weight)]:
-        g = p.grad
-        assert g is not None and g.abs().sum().item() > 0, f"{name} 收不到梯度"
-
-    # 6.6 另两种循环配置（increment / add）能跑 + 非法值立刻报错
-    m_inc = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N), recurrent=True,
-                       recurrent_state="increment")
-    assert m_inc(x)["loss"].shape == ()
-    m_add = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N), recurrent=True,
-                       recurrent_fuse="add", recurrent_gate_init=0.1)
-    assert torch.isclose(m_add.decoder.rec_gate.detach(), torch.tensor(0.1)), \
-        "add 融合的标量门应按 recurrent_gate_init 初始化"
-    assert m_add(x)["loss"].shape == ()
-    for bad in ("", "cum", "state"):
-        try:
-            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       recurrent=True, recurrent_state=bad)
-            raise AssertionError(f"recurrent_state={bad!r} 应被拒绝")
-        except AssertionError as e:
-            assert "recurrent_state" in str(e), e
-    for bad in ("", "linear", "mul"):
-        try:
-            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       recurrent=True, recurrent_fuse=bad)
-            raise AssertionError(f"recurrent_fuse={bad!r} 应被拒绝")
-        except AssertionError as e:
-            assert "recurrent_fuse" in str(e), e
-
-    # 6.7 读窗口 recurrent_memory: block(=并行同掩码) / prefix / open
-    #     block 必须与并行路径的 build_block_mask **逐位相同**（不另写一份逻辑）
-    mm_block = build_recurrent_memory_mask(N, T_steps, N, mode="block")
-    assert torch.equal(mm_block, build_block_mask(N, T_steps, num_queries=N)), \
-        "recurrent_memory='block' 应与并行路径的 build_block_mask 逐位相同"
-    # prefix: 步 t 允许 [:hi+1]（z_cls + 到自己块末）, 其后全屏蔽
-    mm_pre = build_recurrent_memory_mask(N, T_steps, N, mode="prefix")
-    assert mm_pre.shape == (len(T_steps) * N, N + 1), mm_pre.shape
-    for ti, t in enumerate(T_steps):
-        hi = min((math.isqrt(t) + 1) ** 2 - 1, N)
-        r = mm_pre[ti * N]
-        assert (r[:hi + 1] == 0).all() and (r[hi + 1:] == float("-inf")).all(), \
-            f"prefix: 步 {t} 应读到 [0..{hi}]"
-        if ti > 0:                                   # 比 block 宽: 能看到此前的块
-            r_b = mm_block[ti * N]
-            assert int((r_b == float("-inf")).sum()) > int((r == float("-inf")).sum()), \
-                f"prefix 步 {t} 的读窗口应严格宽于 block"
-    # open: 全允许
-    mm_open = build_recurrent_memory_mask(N, T_steps, N, mode="open")
-    assert (mm_open == 0).all(), "open 应允许所有列"
-    # 三种模式在整模型上都跑得通; 非法值立刻报错
-    for mode in ("block", "prefix", "open"):
-        m_mm = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                          decoder_steps=square_block_starts(N), recurrent=True,
-                          recurrent_memory=mode)
-        out_mm = m_mm(x)
-        assert out_mm["F_hat"].shape == (2, N, PATCH_PX), (mode, out_mm["F_hat"].shape)
-        assert m_mm.decoder.attn_mask.shape == (len(T_steps) * N, N + 1)
-    for bad in ("", "blockdiag", "full"):
-        try:
-            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       recurrent=True, recurrent_memory=bad)
-            raise AssertionError(f"recurrent_memory={bad!r} 应被拒绝")
-        except AssertionError as e:
-            assert "recurrent_memory" in str(e), e
-
-    # 6.8 删掉 memory_mask（open）的**步退化** + step_embed 修复
-    #     实测: open + zero-init 循环 + 无步信号 ⇒ 各步查询形式与 memory 完全相同
-    #     ⇒ 各步输出**逐位相同**（模型起步 = 同一输出的 |T| 份拷贝）。这是"删掩码"
-    #     必须配步身份的原因; block/prefix 因为各步 memory 不同而不退化。
-    d_open = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps, num_specials=N,
-                                recurrent=True, recurrent_memory="open")
-    d_open.eval()
-    assert not [k for k in d_open.state_dict() if "rec_step_embed" in k], \
-        "未开 step_embed 时 decoder 不应有该参数"
-    with torch.no_grad():
-        Y_open = d_open(zc_r, zs_r)
-    for ti in range(1, len(T_steps)):
-        assert (Y_open[:, ti] - Y_open[:, 0]).abs().max().item() == 0.0, \
-            "open + zero-init 循环 + 无步信号: 各步应逐位相同（同一函数, 已实测）"
-    # 对照: block 各步 memory 不同 ⇒ 不退化
-    d_blk = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps, num_specials=N,
-                               recurrent=True, recurrent_memory="block")
-    d_blk.eval()
-    with torch.no_grad():
-        Y_blk = d_blk(zc_r, zs_r)
-    assert (Y_blk[:, 1] - Y_blk[:, 0]).abs().max().item() > 0.0, \
-        "block 各步 memory 不同, 不应退化"
-    # step_embed 修复: |T|×D zero-init 参数; 起步各步仍相同, 但**梯度按步不同**
-    #   ⇒ 第一次更新即一阶打破对称（不依赖 LN 的尺度不变性那点二阶信号）
-    m_se = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                      decoder_steps=square_block_starts(N), recurrent=True,
-                      recurrent_memory="open", recurrent_step_embed=True)
-    se = m_se.decoder.rec_step_embed
-    assert se.shape == (len(T_steps), D), se.shape
-    assert torch.count_nonzero(se).item() == 0, "step_embed 必须 zero-init"
-    m_se(x)["loss"].backward()
-    gse = se.grad
-    assert gse is not None and gse.abs().sum().item() > 0, "step_embed 收不到梯度"
-    for ti in range(1, len(T_steps)):
-        assert (gse[ti] - gse[0]).abs().max().item() > 0.0, \
-            f"step_embed 步 {ti} 的梯度应与步 0 不同（一阶破对称, 否则 open 打不开）"
-    with torch.no_grad():                                   # 让 step_embed 真生效后各步必须不同
-        se.normal_(0.0, 0.05)
-        Y_se = m_se.decoder(zc_r, zs_r)
-    for ti in range(1, len(T_steps)):
-        assert (Y_se[:, ti] - Y_se[:, 0]).abs().max().item() > 0.0, \
-            f"open + step_embed: 步 {ti} 输出应与步 0 不同"
-    # step_embed 默认关: 不新增参数/键
-    assert not [k for k in model.state_dict() if "rec_step_embed" in k], \
-        "非循环/未开 step_embed 时不应出现 rec_step_embed 键"
-
-    # ── 6.9 损失口径: cumulative(默认, 深监督每步累加) vs final(只监督 F_hat) ──
-    # 6.9.0 默认必须还是 cumulative + 按步解耦（全历史行为逐位不变）
-    assert model.loss_mode == "cumulative" and model.loss_decouple, \
-        (model.loss_mode, model.loss_decouple)
+    # ── 6. 损失口径: **直接预测**（每步 Y 各自过 PixelHead, 无累加）──
+    # 注: 原 §6 的循环开关自检（rec_proj zero-init / 跨步信息流 / BPTT 截断 /
+    # 读窗口三档 / open 步退化 + step_embed）随那些开关整块删除;
+    # 循环体现在就是 forward 里那 4 行。
+    # 6.9.0 唯一口径: loss = 各步直接预测的平权 L1（无 loss_mode/loss_decouple）
     _per = F.l1_loss(out["Y_pix"],
                      out["target_pix"].unsqueeze(1).expand_as(out["Y_pix"]),
                      reduction="none").mean(dim=(0, 2, 3))
-    assert torch.isclose(out["loss"], _per.mean()), "默认 loss 应为各步累加 L1 的均值"
-    # 6.9.1 final: loss 就是 F_hat(=Σ_t Y_t) 的 L1（= 监控量 recon 本身）
-    m_fin = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N), loss_mode="final")
-    o_fin = m_fin(x)
-    assert torch.isclose(o_fin["loss"], o_fin["recon"]), \
-        "loss_mode='final': loss 应 == recon（同为 F_hat 的 L1）"
-    assert o_fin["F_hat"].shape == (2, N, PATCH_PX)
-    # 6.9.2 loss_decouple=False: 数值上 Y_cum/F_hat/loss 与 True 相同（只是图不同）
-    m_nd = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                      decoder_steps=square_block_starts(N), recurrent=True,
-                      loss_decouple=False)
-    o_nd = m_nd(x)
-    _per_nd = F.l1_loss(o_nd["Y_pix"],
-                        o_nd["target_pix"].unsqueeze(1).expand_as(o_nd["Y_pix"]),
-                        reduction="none").mean(dim=(0, 2, 3))
-    assert torch.isclose(o_nd["loss"], _per_nd.mean()), \
-        "loss_decouple 只改梯度图, 不应改 loss 数值"
-    # 6.9.3 循环下"跨步梯度"的结构差异:
-    #   decouple=True(默认) + rec_proj=0 ⇒ 后期步损失对早期 Y **结构性无梯度**(恰 0)
-    #   （累加恒等捷径被 detach; 循环通路在 rec_proj=0 时也为 0 ⇒ 各步独立受训）
-    m_dc = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                      decoder_steps=square_block_starts(N), recurrent=True)
-    o_dc = m_dc(x)
-    Y_dc = m_dc.decoder.last_Y
-    per_dc = F.l1_loss(o_dc["Y_pix"],
-                       o_dc["target_pix"].unsqueeze(1).expand_as(o_dc["Y_pix"]),
-                       reduction="none").mean(dim=(0, 2, 3))
-    g_dc = torch.autograd.grad(per_dc[-1], Y_dc)[0]
-    assert g_dc[:, :-1].abs().max().item() == 0.0, \
-        "decouple=True + rec_proj=0: 末步损失不应给早期步梯度（应恰 0）"
-    assert g_dc[:, -1].abs().max().item() > 0.0, "末步自己的梯度应非零"
-    #   decouple=False ⇒ 同一末步损失**能**推到步 0（朴素累加的恒等捷径回来了）
-    m_nd2 = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       decoder_steps=square_block_starts(N), recurrent=True,
-                       loss_decouple=False)
-    o_nd2 = m_nd2(x)
-    Y_nd2 = m_nd2.decoder.last_Y
-    per_nd2 = F.l1_loss(o_nd2["Y_pix"],
-                        o_nd2["target_pix"].unsqueeze(1).expand_as(o_nd2["Y_pix"]),
-                        reduction="none").mean(dim=(0, 2, 3))
-    g_nd2 = torch.autograd.grad(per_nd2[-1], Y_nd2)[0]
-    assert g_nd2[:, 0].abs().max().item() > 0.0, \
-        "decouple=False: 末步损失应能经累加恒等捷径推动步 0"
-    # 6.9.4 loss_mode 非法值立刻报错
-    for bad in ("", "cum", "mean"):
+    assert torch.isclose(out["loss"], _per.mean()), "loss 应为各步直接预测 L1 的均值"
+    assert not hasattr(model, "loss_mode") and not hasattr(model, "loss_decouple"), \
+        "旧口径属性应已删除（消费方别再从模型上读 loss_mode/loss_decouple）"
+    assert "LOSS_MODES" not in globals(), "模块级常量 LOSS_MODES 应已删除"
+    # 6.9.1 F_hat = 最后一步的直接预测; recon = 其 L1 = 训练 loss 的最后一项
+    assert torch.isclose(out["F_hat"], out["Y_pix"][:, -1]).all(), \
+        "F_hat 应为最后一步的直接预测"
+    assert torch.isclose(out["recon"], _per[-1]), "recon 应等于最后一步直接预测的 L1"
+    # 6.9.2 旧开关传即 TypeError（不静默忽略: 否则消费方以为在切口径, 实际什么都没发生）
+    for kw in ({"loss_mode": "cumulative"}, {"loss_mode": "final"},
+               {"loss_decouple": True}, {"loss_decouple": False}):
         try:
-            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
-                       loss_mode=bad)
-            raise AssertionError(f"loss_mode={bad!r} 应被拒绝")
-        except AssertionError as e:
-            assert "loss_mode" in str(e), e
+            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D, **kw)
+            raise AssertionError(f"{kw} 应被拒绝（累加口径已删除）")
+        except TypeError as e:
+            assert "unexpected keyword" in str(e), e
 
-    n_rec = sum(p.numel() for k, p in m_rc.named_parameters() if ".rec_" in k)
-    print(f"[ok] 循环架构: step1 查询=query_base(无 A_t), step t≥2=上一步输出+query_base; "
-          f"state={dec_rc.recurrent_state}/fuse={dec_rc.recurrent_fuse}/"
-          f"memory={dec_rc.recurrent_memory} "
-          f"(rec_proj zero-init, +{n_rec} 参数); 跨步信息流与跨步梯度回流实测成立, "
-          f"detach 截断后恰为 0; 读窗口 block/prefix/open 三档; open 无步信号会"
-          f"步退化(实测逐位相同), recurrent_step_embed 一阶破对称; 默认关闭不新增任何键")
-    print(f"[ok] 损失口径: loss_mode={model.loss_mode}(默认, 每步累加结果平权深监督) / "
-          f"final(只监督 F_hat, =监控量 recon); loss_decouple=True(默认, 累加 carry "
-          f"detach) / False(朴素 cumsum)——循环下 decouple=True+rec_proj=0 时早期步对"
-          f"后期损失**无梯度**(实测恰 0, 各步独立受训), False 则保留跨步恒等捷径")
+    print("[ok] 损失口径: 直接预测 mean_t L1(PixelHead(Y_t), target)（无累加/cumsum）; "
+          "F_hat = 最后一步的直接预测, recon = 其 L1（= loss 最后一项）; "
+          "旧 loss_mode/loss_decouple 传即 TypeError, LOSS_MODES 常量已删除")
 
     print("\nALL CHECKS PASSED")

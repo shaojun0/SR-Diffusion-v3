@@ -2,24 +2,25 @@
 SR-Diffusion Phase 1 v2 — register 式推理测试（像素目标版, 2026-08-27 起）
 =================================================
 架构（model_v2.py, register 式唯一路径）: DINOv2-large + register
-    specials(K) 直接拼进输入序列 → OutputQueryDecoder（输出查询注意力,
-    分块掩码: 每采样步只 attend 自己的 z_s 块）→ PixelHead → 像素 patch
-    预测。K = num_specials 与 N = num_patches 解耦（K 由训练侧最终采样
-    步集推导/显式指定, 见 train_v2.py 与 model_v2.py derive_num_specials）。
+    specials(K) 直接拼进输入序列 → OutputQueryDecoder（**顺序循环**: 每采样步
+    只读自己那块 z_s 切片）→ PixelHead → 像素 patch 预测。K = num_specials 与
+    N = num_patches 解耦（K 由训练侧最终采样步集推导/显式指定, 见 train_v2.py
+    与 model_v2.py derive_num_specials）。
 
 测试项（像素目标 = 最终判据）:
     1) 全量重建像素 L1（归一化空间 + 反归一化 0-255 空间双口径）——
        对照: 全图平均色 baseline / 每 patch 平均色 baseline。
        像素 L1 必须显著优于"平均色"才有还原意义（特征空间 L1 是假象,
        已证实特征目标退化）。
-    2) 渐进重建曲线（2026-08-31 用户需求: 结果沿采样步累加）——
-       第 n 步预测的结果 = 第 n-1 步的结果 + 第 n 步的预测, 即
-       Y_pix[:, n] = Σ_{t≤n} Y_t。对每步 n 度量像素 L1(Y_pix[:, n],
+    2) 渐进重建曲线（2026-08-31 用户需求; 2026-09-15 起口径 = **直接预测**）——
+        每个采样步的输出 Y_t **各自直接**过 PixelHead 预测整图（无累加/集成;
+        旧的累加口径 Σ_{t≤n} Y_t 已随 model_v2.py 的累加路径一并删除）:
+       Y_pix[:, n] = PixelHead(Y_n)。对每步 n 度量像素 L1(Y_pix[:, n],
        target_pix), 得到"累积步数越多重建越精"的渐进曲线。
 
-2026-08-31（分块掩码改造 + 边界实验对齐）:
-    · decoder 掩码从 KV 因果前缀改为**分块掩码**: 步 t 只 attend 自己所在的
-      z_s 块（块号 ⌊√t⌋）; 默认采样计划 = square_block_starts
+2026-08-31（分块读窗口 + 边界实验对齐）:
+    · decoder 读窗口从 KV 因果前缀改为**分块**: 步 t 只读自己那块 z_s
+      （块号 ⌊√t⌋）; 默认采样计划 = square_block_starts
       （块起点 = 平方数, 每块一步, 步数 = ⌊√N⌋）;
     · --slice_start/--slice_end 可选挑选分块子区间（默认 None = 全部分块）;
     · --decoder_steps 越界校验: 0 <= s <= N（K 的最终校验交给模型）。
@@ -84,33 +85,8 @@ def parse_args():
                    help="可选挑选分块终点索引(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
-    p.add_argument("--query_mask_mode", default=None,
-                   choices=("causal", "blockdiag"),
-                   help="解码器查询自注意力掩码模式(必须与训练一致)。默认取 "
-                        "model_info.json 记录值; 无记录(2026-09-10 之前的旧产物)则 "
-                        "causal=当时的历史行为。注意本项**不改变任何权重形状** → "
-                        "不一致时 strict load 不会崩, 只会静默产生不同输出, 故务必对齐")
-    # ── 循环架构（2026-09-15; 与训练一致）──
-    p.add_argument("--recurrent", action="store_true",
-                   help="循环架构(与训练 --recurrent 一致)。默认取 model_info.json 记录值; "
-                        "无记录 = False(历史非循环产物)。**改变权重形状**(新增 rec_*) ⇒ "
-                        "不一致时 strict load 会直接崩, 不会静默算错")
-    p.add_argument("--recurrent_state", default="cumulative",
-                   choices=("cumulative", "increment"),
-                   help="循环反馈状态(与训练一致); 默认取 model_info.json")
-    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
-                   help="循环反馈融合方式(与训练一致); 默认取 model_info.json")
-    p.add_argument("--recurrent_memory", default="block",
-                   choices=("block", "prefix", "open"),
-                   help="循环路径读窗口(与训练一致); 默认取 model_info.json。"
-                        "不改权重形状 → 不一致时 load 不崩、只会静默算错")
-    p.add_argument("--recurrent_step_embed", action="store_true",
-                   help="逐采样步可学习偏置(与训练一致; open 读窗口必需); "
-                        "默认取 model_info.json。**改变权重形状** → 不一致时 load 直接崩")
-    p.add_argument("--recurrent_detach", action="store_true",
-                   help="循环状态 detach(BPTT 截断; 只影响训练梯度, 推理不用传)")
-    p.add_argument("--recurrent_gate_init", type=float, default=0.0,
-                   help="add 融合的标量门初值(只影响训练初始化, 推理不用传)")
+    # 注: 解码器是顺序循环（唯一路径, 见 model_v2.py OutputQueryDecoder）;
+    # 2026-09-15 之前并行路径的 --recurrent* 开关已删除。
     return p.parse_args()
 
 
@@ -143,11 +119,9 @@ def main():
 
     # ── model_info.json: **结构超参一律以训练侧记录为准** ──
     # 训练侧把 num_specials / decoder_depth / heads / mlp_ratio / slice_start /
-    # slice_end / decoder_steps / stack_dim / decoder_dropout / query_mask_mode /
-    # recurrent/recurrent_state/recurrent_fuse/recurrent_detach 写在
-    # output_dir/model_info.json。其中 heads / mlp_ratio / query_mask_mode /
-    # recurrent_state / recurrent_fuse 不改变权重形状 ⇒ 传错时 strict load 不报错、
-    # 只会静默算错; decoder_depth / stack_dim / recurrent 传错则形状不符直接崩。
+    # slice_end / decoder_steps / stack_dim / decoder_dropout 写在
+    # output_dir/model_info.json。其中 heads / mlp_ratio 不改变权重形状 ⇒ 传错时
+    # strict load 不报错只会静默算错; decoder_depth / stack_dim 传错则形状不符直接崩。
     # 故构造模型前先用 model_info 覆盖 CLI。
     info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
     train_info = None
@@ -197,44 +171,9 @@ def main():
     if getattr(dino.config, "use_mask_token", False):
         dino.config.use_mask_token = False
         del dino.embeddings.mask_token
-    # query_mask_mode 解析: ① model_info.json 优先; ② --query_mask_mode CLI;
-    # ③ 都没有 → "causal"。注意 ③ 是**故意的**: 训练侧默认自 2026-09-10 起为
-    #    "blockdiag", 但**没有该字段的产物一律是 blockdiag 之前用 causal 训的**
-    #    （3151bab 之前的全部 checkpoint）。若这里跟着默认走 blockdiag, 旧产物会被
-    #    静默用错掩码推理 —— 本项不改权重形状 ⇒ strict load 不报错, 只会算错。
-    if train_info is not None and "query_mask_mode" in train_info:
-        qmm = str(train_info["query_mask_mode"])
-        if args.query_mask_mode and args.query_mask_mode != qmm:
-            print(f"[warn] model_info.json 记录 query_mask_mode={qmm}, 与 "
-                  f"--query_mask_mode={args.query_mask_mode} 不一致: 以 model_info 为准")
-    elif args.query_mask_mode:
-        qmm = args.query_mask_mode
-    else:
-        qmm = "causal"
-        if train_info is not None:
-            print("[info] model_info.json 无 query_mask_mode 字段（2026-09-10 之前的"
-                  "旧产物）: 按当时的历史行为 causal 构造（**不是**新默认 blockdiag）")
-        else:
-            print(f"[warn] 无 {info_path}: 无法判断训练时掩码模式, 按历史行为 causal "
-                  f"构造; 若该权重是 2026-09-10 之后训练的, 请显式传 "
-                  f"--query_mask_mode blockdiag")
-    # 循环架构解析: model_info.json 优先; 无记录(2026-09-15 之前的产物)= False。
-    # recurrent 会新增 rec_* 参数 ⇒ 判断错时 strict load 直接崩（不会静默算错）,
-    # 但 state/fuse 不改形状 ⇒ 这两个仍须以 model_info 为准, 传错只会静默算错。
-    recurrent = bool(_pick("recurrent", args.recurrent, False))
-    recurrent_state = str(_pick("recurrent_state", args.recurrent_state,
-                                "cumulative"))
-    recurrent_fuse = str(_pick("recurrent_fuse", args.recurrent_fuse, "proj"))
-    recurrent_memory = str(_pick("recurrent_memory", args.recurrent_memory, "block"))
-    recurrent_step_embed = bool(_pick("recurrent_step_embed",
-                                      args.recurrent_step_embed, False))
-    recurrent_detach = bool(_pick("recurrent_detach", args.recurrent_detach, False))
-    recurrent_gate_init = float(_pick("recurrent_gate_init",
-                                      args.recurrent_gate_init, 0.0))
-    if train_info is not None and "recurrent" not in train_info and recurrent:
-        print("[warn] 显式 --recurrent 但 model_info.json 无该字段（旧非循环产物）: "
-              "strict load 大概率因缺少 rec_* 参数而崩")
-    # self.stack 形状对齐: model_info.json 优先（形状不符 strict load 直接崩）
+    # 解码器: 当前架构只有顺序循环一条路径, 没有开关可对齐。2026-09-15 之前的
+    # 并行产物缺 rec_* 参数 ⇒ strict load 必崩（预期行为; 复现并行时代权重请从
+    # git 取回当时的 model_v2.py）。
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=heads, mlp_ratio=mlp_ratio,
@@ -243,16 +182,8 @@ def main():
                        skip_steps=slice_start,
                        max_steps=slice_end,
                        num_specials=num_specials,
-                       query_mask_mode=qmm,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout,
-                       recurrent=recurrent,
-                       recurrent_state=recurrent_state,
-                       recurrent_fuse=recurrent_fuse,
-                       recurrent_memory=recurrent_memory,
-                       recurrent_step_embed=recurrent_step_embed,
-                       recurrent_detach=recurrent_detach,
-                       recurrent_gate_init=recurrent_gate_init)
+                       decoder_dropout=decoder_dropout)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -260,9 +191,6 @@ def main():
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
-          f"query_mask_mode={model.query_mask_mode}, "
-          f"recurrent={model.recurrent}"
-          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory}, step_embed={model.recurrent_step_embed})' if model.recurrent else ''}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
@@ -276,23 +204,6 @@ def main():
                 and list(train_info["decoder_steps"]) != T_steps):
             mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
                         f"!= 推理 {T_steps}")
-        if ("query_mask_mode" in train_info
-                and str(train_info["query_mask_mode"]) != model.query_mask_mode):
-            mism.append(f"query_mask_mode: 训练 {train_info['query_mask_mode']} "
-                        f"!= 推理 {model.query_mask_mode}（不崩但会静默算错!）")
-        if ("recurrent" in train_info
-                and bool(train_info["recurrent"]) != model.recurrent):
-            mism.append(f"recurrent: 训练 {train_info['recurrent']} "
-                        f"!= 推理 {model.recurrent}（形状不同, 本应 load 就崩!）")
-        if model.recurrent:
-            for key, got in (("recurrent_state", model.recurrent_state),
-                             ("recurrent_fuse", model.recurrent_fuse),
-                             ("recurrent_memory", model.recurrent_memory),
-                             ("recurrent_step_embed", model.recurrent_step_embed),
-                             ("recurrent_detach", model.recurrent_detach)):
-                if key in train_info and train_info[key] != got:
-                    mism.append(f"{key}: 训练 {train_info[key]} != 推理 {got}"
-                                f"（不崩但会静默算错!）")
         if mism:
             print(f"[warn] 推理参数与训练侧 model_info.json 不一致 ({info_path}):")
             for m in mism:
@@ -320,7 +231,7 @@ def main():
             x = batch["pixel_values"].cuda()            # (B,3,H,W) 归一化
             B, C, Hh, Ww = x.shape
             out = model(x)                              # 同一 forward（两种模式通用）
-            F_pix = out["F_hat"]                        # (B,N,588) 采样步平均
+            F_pix = out["F_hat"]                        # (B,N,588) 最后一步的直接预测
             Y_pix = out["Y_pix"]                        # (B,|T|,N,588) 每采样步
             target = out["target_pix"]                  # (B,N,588)
             # 归一化空间 L1
@@ -352,13 +263,13 @@ def main():
     print(f"\n[full] 全量重建像素 L1 (归一化空间) = {norm_mean:.6f}")
     print(f"[full] 全量重建像素 L1 (0-255 空间) = {pix_mean:.2f} ± {pix_std:.2f}")
     print(f"       参照(旧实验): 全图平均色≈61, 每patch平均色≈?, 质心基线见 pixel_recon_check")
-    print(f"[steps] 渐进曲线 ({len(T_steps)} 步, 0-255 像素 L1, 累积结果):")
+    print(f"[steps] 渐进曲线 ({len(T_steps)} 步, 0-255 像素 L1, 每步的直接预测):")
     for i, t in enumerate(T_steps):
-        print(f"    步 {i + 1:2d} (块起点 {t:4d}, 前 {i + 1:3d} 步累积) L1 = {step_pix_mean[i]:.2f} ± {step_pix_std[i]:.2f}")
+        print(f"    步 {i + 1:2d} (块起点 {t:4d}) L1 = {step_pix_mean[i]:.2f} ± {step_pix_std[i]:.2f}")
     head = step_pix_mean[:min(4, len(step_pix_mean))]
     tail = step_pix_mean[max(0, len(step_pix_mean) - 4):]
-    print(f"[steps] 前段(少步累积) {head.mean():.2f} | 后段(多步累积) {tail.mean():.2f} | "
-          f"最少/最多步累积 = {step_pix_mean[0]:.2f}/{step_pix_mean[-1]:.2f}")
+    print(f"[steps] 前段(早步) {head.mean():.2f} | 后段(晚步) {tail.mean():.2f} | "
+          f"首步/末步 = {step_pix_mean[0]:.2f}/{step_pix_mean[-1]:.2f}")
     print(f"[time] {(time.time() - t0):.0f}s | {n} 图")
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
