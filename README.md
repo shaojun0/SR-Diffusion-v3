@@ -40,6 +40,7 @@ register 式（2026-08-28 起唯一路径，`model_v2.py` 头部 docstring 是�
 - 实验开关：`query_mask_mode`（`train_v2.py --query_mask_mode`，默认 **`blockdiag`**）——查询自注意力语义。`blockdiag` = 块对角，步间自注意力完全隔离（`memory_mask` 的"每步只见自己的块"在整条前向路径上字面成立，跨步梯度回流切断）；`causal` = 历史行为（块下三角，3151bab 之前全部产物的口径，**复现历史结果须显式传**）。详见 `doc/2026-09-10/DESIGN_query_mask_mode.md`。
   - 本项**不改任何权重形状** ⇒ 旧 checkpoint 双向可载，但模式错了 `strict load` 不报错、只会静默算错；消费方（`infer_v2_test.py` / `visualize_recon_pixel.py`）一律以 `model_info.json` 记录值为准，无该字段的旧产物 fallback 到 `causal`。
   - 早期文档提到的 `SRV2_MEMORY_OPEN`（读侧掩码总开关）**已不在代码里**（`0a1ee45` 回滚时移除），勿再使用。
+- 实验开关（2026-09-15）：`recurrent`（`train_v2.py --recurrent`，默认**关**）——把解码器从"一次并行算完 T 步"改成**顺序循环**：step1 查询 = `query_base`（去掉 `A_t`），step t≥2 查询 = `query_base + fuse(上一步的输出)`；`memory_mask` 不变（每步仍只读自己那块 `z_s`），历史输出经循环显式携带 ⇒ 后期步可基于当前估计做残差修正。**代价 = 时间**（步间顺序依赖）。子开关 `--recurrent_state {cumulative,increment}`（反馈的是累积估计还是上一步增量）、`--recurrent_fuse {proj,add}`（zero-init Linear / 标量门控）、`--recurrent_detach`（截断 BPTT）。默认关时并行路径**逐位不变**；开启新增 `rec_*` 参数 ⇒ 与非循环 checkpoint 形状不兼容（`strict load` 会明确报错）。详见 `doc/2026-09-15/DESIGN_v2_recurrent.md`。
 
 ## 2. 快速开始
 
@@ -114,6 +115,8 @@ P1 曾实现并通过本地自检 + 服务器数值冒烟（`doc/2026-09-07/DESI
 **2026-09-10 补充证据（掩码侧已排除）**：`query_mask_mode` 默认翻转为 `blockdiag` 后按 slice[0:5] K=35 单卡 bs=32 复跑，`eval_recon` 0.3584→**0.3318**（`doc/2026-09-10/REPORT_v2_blockdiag_slice05.md`）；但同尺探针（`doc/2026-09-10/PROBE_v2_step_collapse_blockdiag.md`）实测 `step_px_scale` = `[1.0273, 0.0395, 0.0349, 0.0342, 0.0335]`（causal 对照 `[1.0072, 0.0630, 0.0584, 0.0572, 0.0563]`）——
 **step1~5 仍然坍缩，且 blockdiag 下后步相对量级从 5.6–6.3% 降到 3.3–3.8%**，区域×步矩阵两臂都是五行逐位相同。⇒ 上述增益来自**单发通路收敛更好**，不是后步分工被激活；**掩码开关不是本条的杠杆**，与 `ANALYSIS_k3` §5 预判一致。附带一条判据层实证：blockdiag 的逐块 register cos 从 `[0.619, 0.854, 0.990, 0.998, 0.999]` 变"健康"到 `[0.734, 0.876, 0.918, 0.916, 0.926]`、`within-std` 0.054→0.095，而后步输出反而**更接近零**——实测支持本节"键相似度既不必要也不充分"的判据修正。
 
+**2026-09-15 新尝试：循环架构（代码已就位，待服务器训练）**：旧架构在 `blockdiag` 下"步 t 的查询行看不到其它步、`memory_mask` 又只给它自己那块 `z_s`"⇒ 每步的可用信息只有一块键 + 静态 `query_base`，用一块键重建整图不成立 ⇒ 最优解退化为"交给 step-1、自己输出≈0"（§1 诊断的结构性缺口）。新方案把解码器改为**顺序循环**：step1 查询 = `query_base`（去掉 `A_t`），step t≥2 查询 = `query_base + fuse(上一步的输出)`；`memory_mask` 不变（每步仍只读自己那块），但历史输出经循环显式携带 ⇒ 后步可基于"当前画到哪"做残差修正。代价 = 时间（步间顺序依赖，无法并行算完 T 步）。开关 `--recurrent`（默认关 ⇒ 旧并行路径逐位不变），细节/自检/判据见 **`doc/2026-09-15/DESIGN_v2_recurrent.md`**。
+
 **战略上下文**：渐进阶梯**不是** GOAL 验收项（`doc/2026-08-28/GOAL_compression_for_nlp.md`），Phase 2 一次性消费全部 K token；v4 单发（8.26）已是仓库最佳。除非"token 增量性"叙事本身成为目标，本条目可长期冻结，不挡主路线。
 
-> 相关文档：`doc/2026-09-07/ANALYSIS_k3_why_later_steps_zero.md`（主分析）、`doc/2026-09-07/ANALYSIS_k3_slice_infodiff.md` / `doc/2026-09-07/REPORT_v2_E1_probe.md`（信息侧证据）、`doc/2026-09-07/DESIGN_v2_region_loss.md`（P1 设计与实现记录）
+> 相关文档：`doc/2026-09-07/ANALYSIS_k3_why_later_steps_zero.md`（主分析）、`doc/2026-09-07/ANALYSIS_k3_slice_infodiff.md` / `doc/2026-09-07/REPORT_v2_E1_probe.md`（信息侧证据）、`doc/2026-09-07/DESIGN_v2_region_loss.md`（P1 设计与实现记录）、`doc/2026-09-15/DESIGN_v2_recurrent.md`（循环架构）

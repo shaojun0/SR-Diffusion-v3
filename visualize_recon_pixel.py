@@ -59,6 +59,14 @@ def parse_args():
                         "model_info.json 记录值; 无记录(2026-09-10 之前的旧产物)则 "
                         "causal(当时的历史行为)。本项不改权重形状 → 错了不报错, "
                         "只会静默画错")
+    p.add_argument("--recurrent", action="store_true",
+                   help="循环架构(与训练一致)。默认取 model_info.json 记录值; "
+                        "无记录 = False(旧非循环产物)。改变权重形状 -> 错了 load 直接崩")
+    p.add_argument("--recurrent_state", default="cumulative",
+                   choices=("cumulative", "increment"),
+                   help="循环反馈状态(与训练一致); 默认取 model_info.json")
+    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
+                   help="循环反馈融合方式(与训练一致); 默认取 model_info.json")
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
@@ -143,6 +151,18 @@ def main():
     decoder_dropout = args.decoder_dropout
     if train_info is not None and "decoder_dropout" in train_info:
         decoder_dropout = float(train_info["decoder_dropout"])
+    # 循环架构对齐: model_info.json 优先; 无记录 = False(2026-09-15 之前的产物)。
+    # recurrent 改变权重形状 -> 判断错 strict load 直接崩; state/fuse 不改形状 -> 需对齐
+    recurrent = args.recurrent
+    recurrent_state = args.recurrent_state
+    recurrent_fuse = args.recurrent_fuse
+    if train_info is not None and "recurrent" in train_info:
+        recurrent = bool(train_info["recurrent"])
+        recurrent_state = str(train_info.get("recurrent_state", recurrent_state))
+        recurrent_fuse = str(train_info.get("recurrent_fuse", recurrent_fuse))
+    if recurrent != args.recurrent:
+        print(f"[info] model_info.json 记录 recurrent={recurrent}"
+              f"(state={recurrent_state}, fuse={recurrent_fuse}): 以 model_info 为准")
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
                        heads=heads,
@@ -152,7 +172,10 @@ def main():
                        num_specials=num_specials,
                        query_mask_mode=qmm,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout)
+                       decoder_dropout=decoder_dropout,
+                       recurrent=recurrent,
+                       recurrent_state=recurrent_state,
+                       recurrent_fuse=recurrent_fuse)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -160,6 +183,8 @@ def main():
     T_steps = model.decoder.steps
     print(f"[model] N={num_patches}, K(num_specials)={model.num_specials}, "
           f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
+          f"recurrent={model.recurrent}"
+          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse})' if model.recurrent else ''}, "
           f"{len(T_steps)} 采样步 {T_steps}")
 
     # 自动选展示步: 前/中/后均匀取 (含最后一步 = 全量累加结果)

@@ -49,6 +49,19 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     · model_info.json 记录 num_specials（推理/可视化按它对齐权重形状——
       K 错了 checkpoint 形状就对不上, strict load 即崩）与 decoder_steps。
 
+2026-09-15（新方案: 循环架构, `--recurrent`）:
+    · 针对"后步输出≈0、整图由 step-1 一肩扛"的零增量自锁, 把解码器从
+      "一次并行算完 T 步 + 输出累加"改成**顺序循环**: step1 查询 = query_base
+      （去掉原式里的 A_t）, step t≥2 查询 = query_base + fuse(上一步的输出)。
+      每步仍只读自己那块 z_s（memory_mask 不变）, 但历史输出经循环携带 ⇒
+      后期步可基于"当前画到哪"做残差修正, 信息流不再被块对角掩码切断。
+    · 代价 = 时间（步间顺序依赖, 无法并行算完 T 步）; 梯度默认沿整条循环
+      反传（BPTT）。默认关 ⇒ 并行路径逐位不变; 开启新增 rec_* 参数。
+    · 参数: --recurrent / --recurrent_state {cumulative,increment} /
+      --recurrent_fuse {proj,add} / --recurrent_detach /
+      --recurrent_gate_init; 详见 model_v2.py OutputQueryDecoder 的 recurrent 段
+      与 doc/2026-09-15/DESIGN_v2_recurrent.md。
+
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
       transformers.Trainer + TrainingArguments（lr_scheduler_type="cosine"
@@ -150,6 +163,31 @@ def parse_args():
                         "两者都不破坏渐进语义(渐进性由读侧 memory_mask 的列数单调递增提供)。"
                         "**复现历史结果必须显式传 causal**。不改变任何权重形状 ⇒ 旧 checkpoint "
                         "双向可载, 但模式错了不会报错、只会静默算错(消费方以 model_info.json 为准)")
+    # ── 模型（循环架构: 上一步的输出作为下一步的输入）──
+    p.add_argument("--recurrent", action="store_true",
+                   help="循环架构开关（默认关 = 原并行路径逐位不变）。开启后解码器不再一次"
+                        "并行算出全部采样步, 而是顺序循环: step1 查询 = query_base（去掉 "
+                        "A_t）; step t≥2 查询 = query_base + fuse(上一步输出)。每步仍只读"
+                        "自己的 z_s 块（memory_mask 不变）, 但跨步信息由循环携带 ⇒ 后期步"
+                        "能基于当前估计做残差修正。**代价 = 时间**: 步间顺序依赖, 无法并行"
+                        "算完 T 步, 同一 batch 的 wall-clock 变长。开启会新增 rec_* 参数 ⇒ "
+                        "与非循环 checkpoint 形状不兼容（strict load 会明确报错, 不会静默算错）")
+    p.add_argument("--recurrent_state", default="cumulative",
+                   choices=("cumulative", "increment"),
+                   help="循环反馈的状态（=『上一步的输出』指什么）: cumulative（默认）= "
+                        "h_{t-1}=Σ_{i<t}Y_i, 即上一步那个被监督的累积估计（迭代细化, 每步"
+                        "看着当前画到哪再做修正）; increment = 上一步的增量 Y_{t-1}（更字面"
+                        "的『上一步输出』）")
+    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
+                   help="反馈怎么进查询: proj（默认）= LayerNorm + **zero-init** "
+                        "Linear(dim→dim) ⇒ 初始化时反馈恰为 0, 起步等价于纯 query_base "
+                        "读出, 循环随训练长出（+dim² 参数）; add = 标量门控 × LayerNorm "
+                        "直接相加（更字面的 `上一步输出 + query_base`）")
+    p.add_argument("--recurrent_detach", action="store_true",
+                   help="循环状态喂给下一步前 detach（截断 BPTT: 省显存/更稳, 但后期步的"
+                        "损失不再能推动早期步的 register）。默认关 = 整条循环反传")
+    p.add_argument("--recurrent_gate_init", type=float, default=0.0,
+                   help="--recurrent_fuse add 时标量门的初值（默认 0.0 = 同 proj, 起步无反馈）")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -264,7 +302,12 @@ def main():
                        num_specials=(args.num_specials or None),
                        query_mask_mode=args.query_mask_mode,
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout)
+                       decoder_dropout=args.decoder_dropout,
+                       recurrent=args.recurrent,
+                       recurrent_state=args.recurrent_state,
+                       recurrent_fuse=args.recurrent_fuse,
+                       recurrent_detach=args.recurrent_detach,
+                       recurrent_gate_init=args.recurrent_gate_init)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -287,6 +330,16 @@ def main():
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
           f"{'  ← 加宽: 前后 Linear 投影' if model.decoder.stack_dim != dino.config.hidden_size else '  (未加宽)'}")
+    if model.recurrent:
+        n_rec = sum(p.numel() for n, p in model.named_parameters()
+                    if ".rec_" in n)
+        print(f"[model] 循环架构 ON: 上一步输出→下一步输入; state="
+              f"{model.recurrent_state}, fuse={model.recurrent_fuse}, "
+              f"detach={model.recurrent_detach}, gate_init={args.recurrent_gate_init} "
+              f"(+{n_rec / 1e6:.3f}M 循环参数) —— 步间顺序依赖, "
+              f"wall-clock 比并行路径长（以时间换跨步信息流）")
+    else:
+        print("[model] 循环架构 OFF（并行路径, 与原实现逐位一致; 需循环请加 --recurrent）")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -364,6 +417,11 @@ def main():
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
                 "query_mask_mode": raw.query_mask_mode,
+                "recurrent": bool(raw.decoder.recurrent),
+                "recurrent_state": raw.decoder.recurrent_state,
+                "recurrent_fuse": raw.decoder.recurrent_fuse,
+                "recurrent_detach": bool(raw.decoder.recurrent_detach),
+                "recurrent_gate_init": args.recurrent_gate_init,
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:

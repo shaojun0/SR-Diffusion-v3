@@ -90,6 +90,20 @@ def parse_args():
                         "model_info.json 记录值; 无记录(2026-09-10 之前的旧产物)则 "
                         "causal=当时的历史行为。注意本项**不改变任何权重形状** → "
                         "不一致时 strict load 不会崩, 只会静默产生不同输出, 故务必对齐")
+    # ── 循环架构（2026-09-15; 与训练一致）──
+    p.add_argument("--recurrent", action="store_true",
+                   help="循环架构(与训练 --recurrent 一致)。默认取 model_info.json 记录值; "
+                        "无记录 = False(历史非循环产物)。**改变权重形状**(新增 rec_*) ⇒ "
+                        "不一致时 strict load 会直接崩, 不会静默算错")
+    p.add_argument("--recurrent_state", default="cumulative",
+                   choices=("cumulative", "increment"),
+                   help="循环反馈状态(与训练一致); 默认取 model_info.json")
+    p.add_argument("--recurrent_fuse", default="proj", choices=("proj", "add"),
+                   help="循环反馈融合方式(与训练一致); 默认取 model_info.json")
+    p.add_argument("--recurrent_detach", action="store_true",
+                   help="循环状态 detach(BPTT 截断; 只影响训练梯度, 推理不用传)")
+    p.add_argument("--recurrent_gate_init", type=float, default=0.0,
+                   help="add 融合的标量门初值(只影响训练初始化, 推理不用传)")
     return p.parse_args()
 
 
@@ -122,10 +136,12 @@ def main():
 
     # ── model_info.json: **结构超参一律以训练侧记录为准** ──
     # 训练侧把 num_specials / decoder_depth / heads / mlp_ratio / slice_start /
-    # slice_end / decoder_steps / stack_dim / decoder_dropout / query_mask_mode
-    # 写在 output_dir/model_info.json。其中 heads / mlp_ratio / query_mask_mode
-    # 不改变权重形状 ⇒ 传错时 strict load 不报错、只会静默算错; decoder_depth /
-    # stack_dim 传错则形状不符直接崩。故构造模型前先用 model_info 覆盖 CLI。
+    # slice_end / decoder_steps / stack_dim / decoder_dropout / query_mask_mode /
+    # recurrent/recurrent_state/recurrent_fuse/recurrent_detach 写在
+    # output_dir/model_info.json。其中 heads / mlp_ratio / query_mask_mode /
+    # recurrent_state / recurrent_fuse 不改变权重形状 ⇒ 传错时 strict load 不报错、
+    # 只会静默算错; decoder_depth / stack_dim / recurrent 传错则形状不符直接崩。
+    # 故构造模型前先用 model_info 覆盖 CLI。
     info_path = os.path.join(os.path.dirname(args.final_model), "model_info.json")
     train_info = None
     if os.path.exists(info_path):
@@ -195,6 +211,19 @@ def main():
             print(f"[warn] 无 {info_path}: 无法判断训练时掩码模式, 按历史行为 causal "
                   f"构造; 若该权重是 2026-09-10 之后训练的, 请显式传 "
                   f"--query_mask_mode blockdiag")
+    # 循环架构解析: model_info.json 优先; 无记录(2026-09-15 之前的产物)= False。
+    # recurrent 会新增 rec_* 参数 ⇒ 判断错时 strict load 直接崩（不会静默算错）,
+    # 但 state/fuse 不改形状 ⇒ 这两个仍须以 model_info 为准, 传错只会静默算错。
+    recurrent = bool(_pick("recurrent", args.recurrent, False))
+    recurrent_state = str(_pick("recurrent_state", args.recurrent_state,
+                                "cumulative"))
+    recurrent_fuse = str(_pick("recurrent_fuse", args.recurrent_fuse, "proj"))
+    recurrent_detach = bool(_pick("recurrent_detach", args.recurrent_detach, False))
+    recurrent_gate_init = float(_pick("recurrent_gate_init",
+                                      args.recurrent_gate_init, 0.0))
+    if train_info is not None and "recurrent" not in train_info and recurrent:
+        print("[warn] 显式 --recurrent 但 model_info.json 无该字段（旧非循环产物）: "
+              "strict load 大概率因缺少 rec_* 参数而崩")
     # self.stack 形状对齐: model_info.json 优先（形状不符 strict load 直接崩）
     model = SRPhase1V2(dinov2=dino, num_patches=num_patches,
                        dim=dino.config.hidden_size,
@@ -206,7 +235,12 @@ def main():
                        num_specials=num_specials,
                        query_mask_mode=qmm,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout)
+                       decoder_dropout=decoder_dropout,
+                       recurrent=recurrent,
+                       recurrent_state=recurrent_state,
+                       recurrent_fuse=recurrent_fuse,
+                       recurrent_detach=recurrent_detach,
+                       recurrent_gate_init=recurrent_gate_init)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -215,6 +249,8 @@ def main():
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
           f"query_mask_mode={model.query_mask_mode}, "
+          f"recurrent={model.recurrent}"
+          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse})' if model.recurrent else ''}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
@@ -232,6 +268,17 @@ def main():
                 and str(train_info["query_mask_mode"]) != model.query_mask_mode):
             mism.append(f"query_mask_mode: 训练 {train_info['query_mask_mode']} "
                         f"!= 推理 {model.query_mask_mode}（不崩但会静默算错!）")
+        if ("recurrent" in train_info
+                and bool(train_info["recurrent"]) != model.recurrent):
+            mism.append(f"recurrent: 训练 {train_info['recurrent']} "
+                        f"!= 推理 {model.recurrent}（形状不同, 本应 load 就崩!）")
+        if model.recurrent:
+            for key, got in (("recurrent_state", model.recurrent_state),
+                             ("recurrent_fuse", model.recurrent_fuse),
+                             ("recurrent_detach", model.recurrent_detach)):
+                if key in train_info and train_info[key] != got:
+                    mism.append(f"{key}: 训练 {train_info[key]} != 推理 {got}"
+                                f"（不崩但会静默算错!）")
         if mism:
             print(f"[warn] 推理参数与训练侧 model_info.json 不一致 ({info_path}):")
             for m in mism:
