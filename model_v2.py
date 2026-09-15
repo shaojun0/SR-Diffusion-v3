@@ -59,7 +59,8 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
         fuse: "proj"（默认）= LN + **zero-init** Linear(dim→dim)——初始化时反馈
         恰为 0 ⇒ 起步等价于"纯 query_base 读出", 循环随训练长出; "add" = 标量
         门控 LN 直接相加（更字面的 `输出 + query_base`）。
-        每步仍只读自己的 z_s 块（memory_mask 与并行路径完全相同）, 且单步内 N
+        每步仍只读自己的 z_s 块（memory_mask 与并行路径完全相同; 可切
+        recurrent_memory="prefix"/"open" 放宽读窗口）, 且单步内 N
         行查询全双向自注意力（无跨步 tgt_mask）。步间顺序依赖 ⇒ 无法像并行路径
         那样一次算完 T 步, wall-clock 变长（**以时间换跨步信息流**）。
         梯度默认沿整条循环反传（BPTT; 使后期步真能推动早期步的 register）,
@@ -271,6 +272,41 @@ def build_block_mask(num_tokens: int, steps: Sequence[int],
     return torch.stack(rows).repeat_interleave(Q, dim=0)
 
 
+# ═══ build_recurrent_memory_mask — 循环路径的读侧掩码（block/prefix/open）═══
+
+def build_recurrent_memory_mask(num_tokens: int, steps: Sequence[int],
+                                num_queries: Optional[int] = None,
+                                mode: str = "block",
+                                device: torch.device = None) -> Tensor:
+    """循环架构（recurrent=True）的 memory_mask（torch float, -inf=屏蔽, 0=允许）。
+
+    与并行路径的 build_block_mask 只差"读窗口有多宽":
+      · mode="block"（默认）: **逐位复用 build_block_mask** —— 每步只读自己那块
+        z_s（第一个采样步额外含 z_cls）; 与并行路径完全同一个掩码。
+      · mode="prefix": 步 t 读 z_cls + z_s[1..hi]（hi = 自己块的终点）——
+        累积前缀, 每步可重读此前所有键。
+      · mode="open"  : 每步读全部 z_s（+z_cls）。**已实测会塌缩**, 仅复现/诊断用。
+    返回 (|T|·Q, num_tokens+1), 行序 = (t,k) 展平（与 build_block_mask 同布局）。
+    """
+    assert mode in RECURRENT_MEMORY_MODES, \
+        f"未知 recurrent_memory={mode!r}, 合法值 {RECURRENT_MEMORY_MODES}"
+    if mode == "block":                     # 与并行路径逐位一致（不另写一份逻辑）
+        return build_block_mask(num_tokens, steps, num_queries, device)
+    S = num_tokens + 1                      # z_cls + K 个 z_s
+    Q = num_tokens if num_queries is None else int(num_queries)
+    rows = []
+    for t in steps:
+        k = math.isqrt(int(t))
+        hi = min((k + 1) * (k + 1) - 1, num_tokens)
+        row = torch.full((S,), float("-inf"), device=device)
+        if mode == "open":
+            row[:] = 0.0
+        else:                               # "prefix"
+            row[:hi + 1] = 0.0
+        rows.append(row)
+    return torch.stack(rows).repeat_interleave(Q, dim=0)
+
+
 # ═══ build_causal_query_mask — 查询自注意力掩码（块因果 / 块对角）═══
 
 # 查询自注意力掩码的合法模式（见 build_causal_query_mask / OutputQueryDecoder
@@ -296,8 +332,18 @@ DEFAULT_QUERY_MASK_MODE = "blockdiag"
 #   recurrent_fuse: 反馈怎么进查询
 #     · "proj"（默认）: LN + zero-init Linear(dim→dim) ⇒ 初始化时反馈=0
 #     · "add"         : 标量门控 × LN（直接相加, 更字面）
+#   recurrent_memory: 循环路径里"步 t 的 cross-attention 能读哪些 z_s 列"
+#     · "block"（默认）: 与并行路径**完全相同**的分块掩码——每步只读自己那块
+#       （第一个采样步额外含 z_cls）。保持"每个 register 只被一个步读"的分工
+#       压力; 历史信息由循环状态 h 携带（这正是循环架构要替换掉的那条通路）。
+#     · "prefix": 步 t 可读到"自己块末"为止的全部（z_cls + z_s[1..hi]）——
+#       渐进读窗口, 每步可重新读之前的键（h 是有损摘要的补偿）。
+#     · "open"  : 每步可读全部 z_s。**已实测会塌缩**（REPORT_v2_slice05_memory_open:
+#       所有键被所有步摊薄 ⇒ 单键梯度占比 1/36 ⇒ 键趋同、解码器输出退化）,
+#       仅作复现/诊断, 不作训练推荐。
 RECURRENT_STATES = ("cumulative", "increment")
 RECURRENT_FUSES = ("proj", "add")
+RECURRENT_MEMORY_MODES = ("block", "prefix", "open")
 
 
 def build_causal_query_mask(num_steps: int, num_queries: int,
@@ -431,7 +477,13 @@ class OutputQueryDecoder(nn.Module):
             Parameter（init=recurrent_gate_init, 默认 0.0）。
         每步只跑自己的 N 行查询（单步 TransformerDecoder; 同步内 N 行全双向自
         注意力 ⇒ 无跨步 tgt_mask, self.tgt_mask=None）, memory 仍为 A + 该步
-        分块 memory_mask——即"每步只读自己那块 z_s, 但通过循环看到全部历史输出"。
+        memory_mask——读窗口由 recurrent_memory 决定:
+          · "block"（默认）= 与并行路径**同一个**分块掩码（每步只读自己那块
+            z_s, 第一个采样步额外含 z_cls）⇒ "每步只读自己那块键, 但通过循环
+            看到全部历史输出"; 保持每 register 只被一个步读的分工压力。
+          · "prefix" = 步 t 读 z_cls + z_s[1..自己块末]（累积前缀, 每步可重读
+            此前所有键——补偿 h 是有损摘要）。
+          · "open" = 每步读全部 z_s（**已实测会塌缩**, 仅复现/诊断）。
         步间顺序依赖 ⇒ 不能一次并行算完 T 步, wall-clock 变长。
         梯度默认沿整条循环反传（BPTT）, recurrent_detach=True 时把喂给下一步的
         状态 detach（截断 BPTT: 省显存, 但失去长程信用分配）。
@@ -448,6 +500,7 @@ class OutputQueryDecoder(nn.Module):
                  recurrent: bool = False,
                  recurrent_state: str = "cumulative",
                  recurrent_fuse: str = "proj",
+                 recurrent_memory: str = "block",
                  recurrent_detach: bool = False,
                  recurrent_gate_init: float = 0.0):
         super().__init__()
@@ -457,6 +510,9 @@ class OutputQueryDecoder(nn.Module):
             f"未知 recurrent_state={recurrent_state!r}, 合法值 {RECURRENT_STATES}"
         assert recurrent_fuse in RECURRENT_FUSES, \
             f"未知 recurrent_fuse={recurrent_fuse!r}, 合法值 {RECURRENT_FUSES}"
+        assert recurrent_memory in RECURRENT_MEMORY_MODES, \
+            f"未知 recurrent_memory={recurrent_memory!r}, " \
+            f"合法值 {RECURRENT_MEMORY_MODES}"
         self.query_mask_mode = query_mask_mode   # 查询自注意力掩码语义; 见 build_causal_query_mask
         self.num_patches = num_patches                 # 查询基行数 = N（输出 N 个 patch 预测, 不变）
         self.num_specials = num_patches if num_specials is None else int(num_specials)
@@ -497,6 +553,7 @@ class OutputQueryDecoder(nn.Module):
         self.recurrent = bool(recurrent)
         self.recurrent_state = str(recurrent_state)
         self.recurrent_fuse = str(recurrent_fuse)
+        self.recurrent_memory = str(recurrent_memory)
         self.recurrent_detach = bool(recurrent_detach)
         self.recurrent_gate_init = float(recurrent_gate_init)
         if self.recurrent:
@@ -515,13 +572,13 @@ class OutputQueryDecoder(nn.Module):
         assert z_s.shape[1] == self.num_specials, \
             f"z_s 列数 {z_s.shape[1]} != num_specials(K)={self.num_specials}"
         A = torch.cat([z_cls, z_s], dim=1) + self.pos_embed      # (B,S,D)
+        if self.recurrent:
+            return self._forward_recurrent(A, B, N, D)
         # 分块掩码: 每步只见自己的 z_s 块（-inf=屏蔽, 0=允许）; 列数 =
         # K+1 = num_specials+1, 每步 N 行查询共享同一掩码行
         mask = build_block_mask(self.num_specials, self.steps,
                                 num_queries=N, device=A.device)  # (|T|·N, K+1)
         self.attn_mask = mask                                    # 供自检
-        if self.recurrent:
-            return self._forward_recurrent(A, B, N, D, mask)
         A_t = A[:, self.steps]                                   # (B,|T|,D) 采样时刻
         Y = (A_t.unsqueeze(2) + self.query_base) \
             .reshape(B, len(self.steps) * N, D)                  # 展平 (t,k), t∈T_sub
@@ -540,17 +597,27 @@ class OutputQueryDecoder(nn.Module):
         self.last_Y = Y                                          # 采样步全部 patch 预测
         return Y
 
-    def _forward_recurrent(self, A: Tensor, B: int, N: int, D: int,
-                           mask: Tensor) -> Tensor:
+    def _forward_recurrent(self, A: Tensor, B: int, N: int, D: int) -> Tensor:
         """循环读出（recurrent=True）: 上一步的输出作为下一步查询的一部分。
 
         step1 查询 = query_base（A_t 项去掉）; step t≥2 查询 =
         query_base + fuse(state_{t-1})。state 见 recurrent_state（"cumulative"
         = Σ_{i<t}Y_i 累积估计 / "increment" = Y_{t-1}）, fuse 见 recurrent_fuse
         （"proj" = zero-init Linear(LN(·)) / "add" = 标量门控 × LN(·)）。
-        每步 memory 仍是整条 A, 但用该步的分块 memory_mask 行（只读自己那块
-        z_s）; 单步内 N 行查询全双向自注意力, 故不构造跨步 tgt_mask。
+        每步 memory 仍是整条 A, 但用该步的 memory_mask 行（读窗口由
+        recurrent_memory 决定: "block" 只读自己那块 / "prefix" 读累积前缀 /
+        "open" 全读）; 单步内 N 行查询全双向自注意力, 故不构造跨步 tgt_mask。
+
+        **这是真的顺序循环**: 第 i 步的 self.stack 吃第 i-1 步的 Y, 步间有数据
+        依赖 ⇒ 无法像并行路径那样把 |T| 折进 batch 维一次算完（wall-clock 变长
+        即代价）。"并行化"只发生在**单步内部**（N 行查询一次前向）。
         """
+        # 读窗口: block 与并行路径逐位同一掩码; prefix/open 见函数 docstring
+        mask = build_recurrent_memory_mask(self.num_specials, self.steps,
+                                           num_queries=N,
+                                           mode=self.recurrent_memory,
+                                           device=A.device)       # (|T|·N, K+1)
+        self.attn_mask = mask
         stack_in = self.stack_in                                 # Identity 或 Linear
         mem = stack_in(A)                                        # (B,S,stack_dim) 只算一次
         h = torch.zeros(B, N, D, device=A.device, dtype=A.dtype)  # 累积状态 Σ_{i<t}Y_i
@@ -611,11 +678,13 @@ class SRPhase1V2(nn.Module):
     循环架构（recurrent=True, 2026-09-15 新增; 默认 False = 全历史行为逐位不变）:
     解码器改为**顺序循环**——step1 查询 = query_base（去掉 A_t）, step t≥2 查询
     = query_base + fuse(state_{t-1})（state = 上一步输出; 见 OutputQueryDecoder
-    的 recurrent 段）。每步仍只读自己那块 z_s, 但历史输出经循环携带 ⇒ 后期步可
-    基于当前估计做残差修正。代价: 步间顺序依赖, 无法并行算完 T 步（wall-clock
-    变长）。recurrent_state / recurrent_fuse / recurrent_detach 只在 recurrent=True
-    时有意义; recurrent=True 会新增 rec_* 参数 ⇒ 与非循环 checkpoint 形状不兼容
-    （strict load 会明确报错, 不会静默算错）。消费方一律以 model_info.json 为准。
+    的 recurrent 段）。每步的读窗口由 recurrent_memory 决定（默认 "block" =
+    与并行路径同一分块掩码; "prefix"/"open" 放宽）, 历史输出经循环携带 ⇒ 后期步
+    可基于当前估计做残差修正。代价: 步间顺序依赖, 无法并行算完 T 步（wall-clock
+    变长）。recurrent_state / recurrent_fuse / recurrent_memory / recurrent_detach
+    只在 recurrent=True 时有意义; recurrent=True 会新增 rec_* 参数 ⇒ 与非循环
+    checkpoint 形状不兼容（strict load 会明确报错, 不会静默算错）。消费方一律以
+    model_info.json 为准。
     """
 
     def __init__(
@@ -637,6 +706,7 @@ class SRPhase1V2(nn.Module):
         recurrent: bool = False,
         recurrent_state: str = "cumulative",
         recurrent_fuse: str = "proj",
+        recurrent_memory: str = "block",
         recurrent_detach: bool = False,
         recurrent_gate_init: float = 0.0,
     ):
@@ -676,6 +746,7 @@ class SRPhase1V2(nn.Module):
                                           recurrent=recurrent,
                                           recurrent_state=recurrent_state,
                                           recurrent_fuse=recurrent_fuse,
+                                          recurrent_memory=recurrent_memory,
                                           recurrent_detach=recurrent_detach,
                                           recurrent_gate_init=recurrent_gate_init)
         self.query_mask_mode = self.decoder.query_mask_mode
@@ -683,6 +754,7 @@ class SRPhase1V2(nn.Module):
         self.recurrent = self.decoder.recurrent
         self.recurrent_state = self.decoder.recurrent_state
         self.recurrent_fuse = self.decoder.recurrent_fuse
+        self.recurrent_memory = self.decoder.recurrent_memory
         self.recurrent_detach = self.decoder.recurrent_detach
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
@@ -1208,6 +1280,7 @@ if __name__ == "__main__":
     dec_rc = m_rc.decoder
     assert dec_rc.recurrent and dec_rc.recurrent_state == "cumulative" \
         and dec_rc.recurrent_fuse == "proj" and not dec_rc.recurrent_detach
+    assert dec_rc.recurrent_memory == "block", dec_rc.recurrent_memory
     assert [k for k in m_rc.state_dict() if ".rec_" in k], "循环路径应有 rec_* 参数"
     assert torch.count_nonzero(dec_rc.rec_proj.weight).item() == 0, \
         "rec_proj 必须 zero-init（初始化时反馈恰为 0）"
@@ -1303,10 +1376,47 @@ if __name__ == "__main__":
         except AssertionError as e:
             assert "recurrent_fuse" in str(e), e
 
+    # 6.7 读窗口 recurrent_memory: block(=并行同掩码) / prefix / open
+    #     block 必须与并行路径的 build_block_mask **逐位相同**（不另写一份逻辑）
+    mm_block = build_recurrent_memory_mask(N, T_steps, N, mode="block")
+    assert torch.equal(mm_block, build_block_mask(N, T_steps, num_queries=N)), \
+        "recurrent_memory='block' 应与并行路径的 build_block_mask 逐位相同"
+    # prefix: 步 t 允许 [:hi+1]（z_cls + 到自己块末）, 其后全屏蔽
+    mm_pre = build_recurrent_memory_mask(N, T_steps, N, mode="prefix")
+    assert mm_pre.shape == (len(T_steps) * N, N + 1), mm_pre.shape
+    for ti, t in enumerate(T_steps):
+        hi = min((math.isqrt(t) + 1) ** 2 - 1, N)
+        r = mm_pre[ti * N]
+        assert (r[:hi + 1] == 0).all() and (r[hi + 1:] == float("-inf")).all(), \
+            f"prefix: 步 {t} 应读到 [0..{hi}]"
+        if ti > 0:                                   # 比 block 宽: 能看到此前的块
+            r_b = mm_block[ti * N]
+            assert int((r_b == float("-inf")).sum()) > int((r == float("-inf")).sum()), \
+                f"prefix 步 {t} 的读窗口应严格宽于 block"
+    # open: 全允许
+    mm_open = build_recurrent_memory_mask(N, T_steps, N, mode="open")
+    assert (mm_open == 0).all(), "open 应允许所有列"
+    # 三种模式在整模型上都跑得通; 非法值立刻报错
+    for mode in ("block", "prefix", "open"):
+        m_mm = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                          decoder_steps=square_block_starts(N), recurrent=True,
+                          recurrent_memory=mode)
+        out_mm = m_mm(x)
+        assert out_mm["F_hat"].shape == (2, N, PATCH_PX), (mode, out_mm["F_hat"].shape)
+        assert m_mm.decoder.attn_mask.shape == (len(T_steps) * N, N + 1)
+    for bad in ("", "blockdiag", "full"):
+        try:
+            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                       recurrent=True, recurrent_memory=bad)
+            raise AssertionError(f"recurrent_memory={bad!r} 应被拒绝")
+        except AssertionError as e:
+            assert "recurrent_memory" in str(e), e
+
     n_rec = sum(p.numel() for k, p in m_rc.named_parameters() if ".rec_" in k)
     print(f"[ok] 循环架构: step1 查询=query_base(无 A_t), step t≥2=上一步输出+query_base; "
-          f"state={dec_rc.recurrent_state}/fuse={dec_rc.recurrent_fuse} "
+          f"state={dec_rc.recurrent_state}/fuse={dec_rc.recurrent_fuse}/"
+          f"memory={dec_rc.recurrent_memory} "
           f"(rec_proj zero-init, +{n_rec} 参数); 跨步信息流与跨步梯度回流实测成立, "
-          f"detach 截断后恰为 0; 默认关闭不新增任何键")
+          f"detach 截断后恰为 0; 读窗口 block/prefix/open 三档; 默认关闭不新增任何键")
 
     print("\nALL CHECKS PASSED")

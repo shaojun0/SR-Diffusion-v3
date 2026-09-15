@@ -70,9 +70,26 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 - `recurrent_detach=True`：喂给下一步前 detach ⇒ 截断 BPTT（省显存/更稳），末步损失回到步 1 register 的梯度**恰为 0**（自检 §6.4 实测 `== 0`）。
 - `decode` 的 `carry.detach()`（累加损失路径）**保持不变**：它只切"损失→更早 Y"的直接通路；循环内部 `q_t ← h_{t-1}` 的通路不受影响。因此"每步直接损失仍平权 1/|T|"的性质保留，同时多了 BPTT 的长程信用分配。这一条在循环模式下**不再**满足旧的 §3b 恒等式（`g_total[:,n] == 仅第 n 步损失的梯度`）——那是有意为之，自检 §3b 只在非循环模型上跑。
 
-### 2.5 查询自注意力与 `query_mask_mode`
+### 2.5 掩码在循环架构下怎么变（**关键，容易误解**）
 
-循环路径单步内只有该步的 N 行查询，**同步内 N 行全双向自注意力**，没有跨步查询行 ⇒ 不构造 `tgt_mask`（`self.tgt_mask = None`）。因此 `query_mask_mode` 在循环模式下**不参与前向**（保留参数只为构造兼容/记录）；循环模式也不再有"块间泄露"的歧义——信息流是显式的 `h`。
+循环架构下**两张掩码的命运不同**——一张被"删掉"，一张保留但语义升级：
+
+| 掩码 | 旧架构（并行）作用 | 循环架构 | 为什么 |
+|---|---|---|---|
+| `tgt_mask`（查询自注意力, 跨步） | `blockdiag` = 步间查询行互不可见; `causal` = 步 t 可见步 ≤t（后步靠这个"累积前缀泄露"拿到历史） | **删除**（`self.tgt_mask = None`） | 循环路径每次只把**一步**的 N 行送进 stack，张量里根本没有其它步的查询行 ⇒ 跨步 `tgt_mask` 无从谈起。**跨步信息改由循环状态 `h` 显式携带**——这正是本方案的核心替换。`blockdiag` 的效果自动成立（单步内 N 行全双向自注意力 = 原来 blockdiag 的对角块） |
+| `memory_mask`（cross-attn 读哪些 `z_s` 列） | 每步只读自己那块 `z_s`（第一个采样步额外含 `z_cls`） | **保留**，但升为可配的三档读窗口 `recurrent_memory` | 它管的是"键的信息怎么分给步"，与并行/循环无关。旧架构"每步瞎"是因为**读窗口窄 + 跨步自注意力又被切断**（两块键看不到整图）；循环补上了后一半，前一半按需可放宽 |
+
+**所以"掩码要不要改"的准确答案**：跨步那张**必须改**（改成循环状态，等价于删掉 `tgt_mask`）；读窗口那张**不必改**，但值得试——它是本方案唯一的读侧自由度，故实现成 `recurrent_memory`：
+
+- `"block"`（默认）：与并行路径**逐位复用 `build_block_mask`**（自检里直接 `torch.equal` 校验）。保持"每个 register 只被一个步读"的分工压力（`REPORT_v2_slice05_memory_open` 的结论：键被多步共享会摊薄梯度、导致趋同塌缩）。此时循环仍是**真顺序循环**：步 t 读自己那块 + 通过 `h` 看全部历史输出。
+- `"prefix"`：步 t 读 `z_cls + z_s[1..自己块末]`（累积前缀）。每步可**重读**此前的键，补偿 `h` 只是 D 维有损摘要。代价是前面块的键被后面所有步共享 ⇒ 分工压力下降（走向 `open` 那一侧的中间档）。
+- `"open"`：每步读全部 `z_s`。**仓库已实测会塌缩**（`REPORT_v2_slice05_memory_open`），仅复现/诊断，不推荐训练使用。
+
+> 关于"是不是偷偷并行化了"：**没有**。`_forward_recurrent` 是 Python `for` 循环，第 i 步的 `self.stack(stack_in(q), mem, memory_mask=row)` 里 `q` 依赖第 i−1 步的 `Y`（即 `h`），步间是硬数据依赖，无法把 `|T|` 折进 batch 维一次算完。**并行只发生在单步内部**（该步 N 行查询一次前向）。`--recurrent_detach` 也不把它变并行——它只切梯度，不切前向依赖。
+
+### 2.5.1 `query_mask_mode` 在循环模式下的地位
+
+不参与前向（保留参数只为构造兼容 / `model_info.json` 记录）。循环模式不再有"块间泄露"的歧义——信息流就是显式的 `h`。
 
 ### 2.6 代价（"以牺牲时间"）
 
@@ -89,6 +106,7 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 | `recurrent` | `False` | 总开关。**关闭时不建任何 `rec_*` 子模块/参数** ⇒ state_dict 键与历史实现逐位一致，旧 checkpoint `strict=True` 继续可载 |
 | `recurrent_state` | `"cumulative"` | `"cumulative"` / `"increment"`，见 §2.2 |
 | `recurrent_fuse` | `"proj"` | `"proj"`（zero-init Linear）/ `"add"`（标量门控） |
+| `recurrent_memory` | `"block"` | 循环路径读窗口：`"block"`（=并行同掩码）/ `"prefix"`（累积前缀）/ `"open"`（全读，实测塌缩） |
 | `recurrent_detach` | `False` | 是否截断 BPTT |
 | `recurrent_gate_init` | `0.0` | `fuse="add"` 的标量门初值 |
 
@@ -105,8 +123,10 @@ NUM_GPUS=2 ./run_v2_train.sh \
     --slice_start 0 --slice_end 5 \
     --decoder_depth 2 --num_specials 0
 # 可选: --recurrent_state {cumulative,increment}  --recurrent_fuse {proj,add}
-#       --recurrent_detach  --recurrent_gate_init 0.0
+#       --recurrent_memory {block,prefix,open}  --recurrent_detach  --recurrent_gate_init 0.0
 ```
+
+> 读窗口的建议测法（受控）: 先 `block`（默认，与基线只差循环本身）; 若 `block` 下后步量级仍上不去、怀疑"h 把前面的键摘要丢了"，再单独跑一臂 `prefix`。**不要**在还没验证 `block` 前就上 `open`（已证会塌缩）。
 
 推理 / 可视化**不用传** `--recurrent`：一律读 `model_info.json`（新增字段 `recurrent` / `recurrent_state` / `recurrent_fuse` / `recurrent_detach` / `recurrent_gate_init`）。CLI 只作 fallback 与显式覆盖告警。
 
@@ -135,13 +155,15 @@ NUM_GPUS=2 ./run_v2_train.sh \
 4. **跨步信息流（核心）**：扰动步 1 的 `z_s` 块（位置 1,2）——并行 `blockdiag` 路径后期步逐位不变（§2b 已断言），循环路径**每个后期步都变**。
 5. **跨步梯度回流**：BPTT 下末步损失能推动步 1 register（`> 0`）；`recurrent_detach=True` 下恰为 0。
 6. zero-init `rec_proj` 收到非零梯度（循环可被打开）+ `query_base`/`special_bank`/`PixelHead` 全通。
-7. `increment` / `add` 两种配置能跑；非法 `recurrent_state` / `recurrent_fuse` 立刻报错。
+7. `increment` / `add` 两种配置能跑；非法 `recurrent_state` / `recurrent_fuse` / `recurrent_memory` 立刻报错。
+8. 读窗口三档：`block` 与 `build_block_mask` **逐位相同**（`torch.equal`）；`prefix` 每步允许 `[:hi+1]` 且严格宽于 `block`；`open` 全允许；三档整模型前向都通。
 
 另有本地 CPU 冒烟（`N=576, K=35, steps=[1,4,9,16,25], B=2`）：
 
 - zero-init 下，循环 forward **逐步等价于**"`query=query_base` + 该步掩码行"的单步解码（误差 `<1e-5`）；
 - 打开反馈后 step1 逐位不变、后续步改变；
-- 全模型 `loss.backward()` 通，`rec_proj` 梯度范数和 ≈134.6（确实被打开）。
+- 全模型 `loss.backward()` 通，`rec_proj` 梯度范数和 ≈134.6（确实被打开）；
+- 读窗口实测（`N=576, K=35, steps=[1,4,9,16,25]`，每行允许列数）: `block` 首/末步 = 4/11 列、`prefix` = 4/36、`open` = 36/36（`S=K+1=36`），三档反向均通。
 
 **回归**：用 `git show HEAD:model_v2.py` 的旧模块与新模块，同种子、同输入、同权重下 `F_hat` / `loss` / `Y` 的 `float64` 求和**完全相等**，`state_dict` 键数一致（50）⇒ 非循环路径逐位不变。
 

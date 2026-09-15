@@ -58,9 +58,9 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
     · 代价 = 时间（步间顺序依赖, 无法并行算完 T 步）; 梯度默认沿整条循环
       反传（BPTT）。默认关 ⇒ 并行路径逐位不变; 开启新增 rec_* 参数。
     · 参数: --recurrent / --recurrent_state {cumulative,increment} /
-      --recurrent_fuse {proj,add} / --recurrent_detach /
-      --recurrent_gate_init; 详见 model_v2.py OutputQueryDecoder 的 recurrent 段
-      与 doc/2026-09-15/DESIGN_v2_recurrent.md。
+      --recurrent_fuse {proj,add} / --recurrent_memory {block,prefix,open} /
+      --recurrent_detach / --recurrent_gate_init; 详见 model_v2.py
+      OutputQueryDecoder 的 recurrent 段与 doc/2026-09-15/DESIGN_v2_recurrent.md。
 
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
@@ -183,6 +183,15 @@ def parse_args():
                         "Linear(dim→dim) ⇒ 初始化时反馈恰为 0, 起步等价于纯 query_base "
                         "读出, 循环随训练长出（+dim² 参数）; add = 标量门控 × LayerNorm "
                         "直接相加（更字面的 `上一步输出 + query_base`）")
+    p.add_argument("--recurrent_memory", default="block",
+                   choices=("block", "prefix", "open"),
+                   help="循环路径的**读窗口**（步 t 的 cross-attention 能读哪些 z_s）: "
+                        "block（默认）= 与并行路径**逐位同一个**分块掩码, 每步只读自己"
+                        "那块（保持每个 register 只被一个步读的分工压力, 历史信息全由循环"
+                        "状态 h 携带）; prefix = 步 t 读到'自己块末'为止的全部（累积前缀, "
+                        "每步可重读此前的键, 补偿 h 是有损摘要）; open = 每步读全部 z_s"
+                        "（**已实测会塌缩**, 见 REPORT_v2_slice05_memory_open, 仅复现/诊断）。"
+                        "不改权重形状 ⇒ 错了不报错、只静默算错, 消费方以 model_info 为准")
     p.add_argument("--recurrent_detach", action="store_true",
                    help="循环状态喂给下一步前 detach（截断 BPTT: 省显存/更稳, 但后期步的"
                         "损失不再能推动早期步的 register）。默认关 = 整条循环反传")
@@ -306,6 +315,7 @@ def main():
                        recurrent=args.recurrent,
                        recurrent_state=args.recurrent_state,
                        recurrent_fuse=args.recurrent_fuse,
+                       recurrent_memory=args.recurrent_memory,
                        recurrent_detach=args.recurrent_detach,
                        recurrent_gate_init=args.recurrent_gate_init)
 
@@ -335,6 +345,7 @@ def main():
                     if ".rec_" in n)
         print(f"[model] 循环架构 ON: 上一步输出→下一步输入; state="
               f"{model.recurrent_state}, fuse={model.recurrent_fuse}, "
+              f"memory={model.recurrent_memory}, "
               f"detach={model.recurrent_detach}, gate_init={args.recurrent_gate_init} "
               f"(+{n_rec / 1e6:.3f}M 循环参数) —— 步间顺序依赖, "
               f"wall-clock 比并行路径长（以时间换跨步信息流）")
@@ -420,6 +431,7 @@ def main():
                 "recurrent": bool(raw.decoder.recurrent),
                 "recurrent_state": raw.decoder.recurrent_state,
                 "recurrent_fuse": raw.decoder.recurrent_fuse,
+                "recurrent_memory": raw.decoder.recurrent_memory,
                 "recurrent_detach": bool(raw.decoder.recurrent_detach),
                 "recurrent_gate_init": args.recurrent_gate_init,
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
