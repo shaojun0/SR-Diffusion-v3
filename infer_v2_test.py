@@ -104,6 +104,9 @@ def parse_args():
                    choices=("block", "prefix", "open"),
                    help="循环路径读窗口(与训练一致); 默认取 model_info.json。"
                         "不改权重形状 → 不一致时 load 不崩、只会静默算错")
+    p.add_argument("--recurrent_step_embed", action="store_true",
+                   help="逐采样步可学习偏置(与训练一致; open 读窗口必需); "
+                        "默认取 model_info.json。**改变权重形状** → 不一致时 load 直接崩")
     p.add_argument("--recurrent_detach", action="store_true",
                    help="循环状态 detach(BPTT 截断; 只影响训练梯度, 推理不用传)")
     p.add_argument("--recurrent_gate_init", type=float, default=0.0,
@@ -223,6 +226,8 @@ def main():
                                 "cumulative"))
     recurrent_fuse = str(_pick("recurrent_fuse", args.recurrent_fuse, "proj"))
     recurrent_memory = str(_pick("recurrent_memory", args.recurrent_memory, "block"))
+    recurrent_step_embed = bool(_pick("recurrent_step_embed",
+                                      args.recurrent_step_embed, False))
     recurrent_detach = bool(_pick("recurrent_detach", args.recurrent_detach, False))
     recurrent_gate_init = float(_pick("recurrent_gate_init",
                                       args.recurrent_gate_init, 0.0))
@@ -245,6 +250,7 @@ def main():
                        recurrent_state=recurrent_state,
                        recurrent_fuse=recurrent_fuse,
                        recurrent_memory=recurrent_memory,
+                       recurrent_step_embed=recurrent_step_embed,
                        recurrent_detach=recurrent_detach,
                        recurrent_gate_init=recurrent_gate_init)
     sd = torch.load(args.final_model, map_location="cpu")
@@ -256,7 +262,7 @@ def main():
           f"K(num_specials)={model.num_specials}, "
           f"query_mask_mode={model.query_mask_mode}, "
           f"recurrent={model.recurrent}"
-          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory})' if model.recurrent else ''}, "
+          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory}, step_embed={model.recurrent_step_embed})' if model.recurrent else ''}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
@@ -282,6 +288,7 @@ def main():
             for key, got in (("recurrent_state", model.recurrent_state),
                              ("recurrent_fuse", model.recurrent_fuse),
                              ("recurrent_memory", model.recurrent_memory),
+                             ("recurrent_step_embed", model.recurrent_step_embed),
                              ("recurrent_detach", model.recurrent_detach)):
                 if key in train_info and train_info[key] != got:
                     mism.append(f"{key}: 训练 {train_info[key]} != 推理 {got}"

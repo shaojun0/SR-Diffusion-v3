@@ -501,6 +501,7 @@ class OutputQueryDecoder(nn.Module):
                  recurrent_state: str = "cumulative",
                  recurrent_fuse: str = "proj",
                  recurrent_memory: str = "block",
+                 recurrent_step_embed: bool = False,
                  recurrent_detach: bool = False,
                  recurrent_gate_init: float = 0.0):
         super().__init__()
@@ -554,6 +555,7 @@ class OutputQueryDecoder(nn.Module):
         self.recurrent_state = str(recurrent_state)
         self.recurrent_fuse = str(recurrent_fuse)
         self.recurrent_memory = str(recurrent_memory)
+        self.recurrent_step_embed = bool(recurrent_step_embed)
         self.recurrent_detach = bool(recurrent_detach)
         self.recurrent_gate_init = float(recurrent_gate_init)
         if self.recurrent:
@@ -565,6 +567,13 @@ class OutputQueryDecoder(nn.Module):
             else:                                       # "add": 标量门控
                 self.rec_gate = nn.Parameter(
                     torch.tensor(self.recurrent_gate_init))
+            if self.recurrent_step_embed:
+                # 逐采样步可学习偏置 (|T|,D), **zero-init**: 起步不改变任何步,
+                # 但梯度按步不同 ⇒ 第一次更新即一阶打破"各步同函数"的对称。
+                # 对 recurrent_memory="open"（删掉 memory_mask）是**必需**的:
+                # 此时各步查询形式与 memory 完全相同, 没有它各步会逐位相同。
+                self.rec_step_embed = nn.Parameter(
+                    torch.zeros(len(self.steps), dim))
 
     def forward(self, z_cls: Tensor, z_s: Tensor) -> Tensor:
         B, N, D = z_s.shape[0], self.num_patches, z_s.shape[-1]
@@ -625,6 +634,8 @@ class OutputQueryDecoder(nn.Module):
         Ys = []
         for i in range(len(self.steps)):
             q = self.query_base.unsqueeze(0).expand(B, N, D)     # (B,N,D) 行 k↔patch k
+            if self.recurrent_step_embed:                        # 步身份（破 open 的步对称）
+                q = q + self.rec_step_embed[i]
             if i > 0:                                            # step1 无反馈
                 state = h if self.recurrent_state == "cumulative" else last
                 if self.recurrent_fuse == "proj":
@@ -707,6 +718,7 @@ class SRPhase1V2(nn.Module):
         recurrent_state: str = "cumulative",
         recurrent_fuse: str = "proj",
         recurrent_memory: str = "block",
+        recurrent_step_embed: bool = False,
         recurrent_detach: bool = False,
         recurrent_gate_init: float = 0.0,
     ):
@@ -747,6 +759,7 @@ class SRPhase1V2(nn.Module):
                                           recurrent_state=recurrent_state,
                                           recurrent_fuse=recurrent_fuse,
                                           recurrent_memory=recurrent_memory,
+                                          recurrent_step_embed=recurrent_step_embed,
                                           recurrent_detach=recurrent_detach,
                                           recurrent_gate_init=recurrent_gate_init)
         self.query_mask_mode = self.decoder.query_mask_mode
@@ -755,6 +768,7 @@ class SRPhase1V2(nn.Module):
         self.recurrent_state = self.decoder.recurrent_state
         self.recurrent_fuse = self.decoder.recurrent_fuse
         self.recurrent_memory = self.decoder.recurrent_memory
+        self.recurrent_step_embed = self.decoder.recurrent_step_embed
         self.recurrent_detach = self.decoder.recurrent_detach
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
@@ -1412,11 +1426,58 @@ if __name__ == "__main__":
         except AssertionError as e:
             assert "recurrent_memory" in str(e), e
 
+    # 6.8 删掉 memory_mask（open）的**步退化** + step_embed 修复
+    #     实测: open + zero-init 循环 + 无步信号 ⇒ 各步查询形式与 memory 完全相同
+    #     ⇒ 各步输出**逐位相同**（模型起步 = 同一输出的 |T| 份拷贝）。这是"删掩码"
+    #     必须配步身份的原因; block/prefix 因为各步 memory 不同而不退化。
+    d_open = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps, num_specials=N,
+                                recurrent=True, recurrent_memory="open")
+    d_open.eval()
+    assert not [k for k in d_open.state_dict() if "rec_step_embed" in k], \
+        "未开 step_embed 时 decoder 不应有该参数"
+    with torch.no_grad():
+        Y_open = d_open(zc_r, zs_r)
+    for ti in range(1, len(T_steps)):
+        assert (Y_open[:, ti] - Y_open[:, 0]).abs().max().item() == 0.0, \
+            "open + zero-init 循环 + 无步信号: 各步应逐位相同（同一函数, 已实测）"
+    # 对照: block 各步 memory 不同 ⇒ 不退化
+    d_blk = OutputQueryDecoder(num_patches=N, dim=D, steps=T_steps, num_specials=N,
+                               recurrent=True, recurrent_memory="block")
+    d_blk.eval()
+    with torch.no_grad():
+        Y_blk = d_blk(zc_r, zs_r)
+    assert (Y_blk[:, 1] - Y_blk[:, 0]).abs().max().item() > 0.0, \
+        "block 各步 memory 不同, 不应退化"
+    # step_embed 修复: |T|×D zero-init 参数; 起步各步仍相同, 但**梯度按步不同**
+    #   ⇒ 第一次更新即一阶打破对称（不依赖 LN 的尺度不变性那点二阶信号）
+    m_se = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                      decoder_steps=square_block_starts(N), recurrent=True,
+                      recurrent_memory="open", recurrent_step_embed=True)
+    se = m_se.decoder.rec_step_embed
+    assert se.shape == (len(T_steps), D), se.shape
+    assert torch.count_nonzero(se).item() == 0, "step_embed 必须 zero-init"
+    m_se(x)["loss"].backward()
+    gse = se.grad
+    assert gse is not None and gse.abs().sum().item() > 0, "step_embed 收不到梯度"
+    for ti in range(1, len(T_steps)):
+        assert (gse[ti] - gse[0]).abs().max().item() > 0.0, \
+            f"step_embed 步 {ti} 的梯度应与步 0 不同（一阶破对称, 否则 open 打不开）"
+    with torch.no_grad():                                   # 让 step_embed 真生效后各步必须不同
+        se.normal_(0.0, 0.05)
+        Y_se = m_se.decoder(zc_r, zs_r)
+    for ti in range(1, len(T_steps)):
+        assert (Y_se[:, ti] - Y_se[:, 0]).abs().max().item() > 0.0, \
+            f"open + step_embed: 步 {ti} 输出应与步 0 不同"
+    # step_embed 默认关: 不新增参数/键
+    assert not [k for k in model.state_dict() if "rec_step_embed" in k], \
+        "非循环/未开 step_embed 时不应出现 rec_step_embed 键"
+
     n_rec = sum(p.numel() for k, p in m_rc.named_parameters() if ".rec_" in k)
     print(f"[ok] 循环架构: step1 查询=query_base(无 A_t), step t≥2=上一步输出+query_base; "
           f"state={dec_rc.recurrent_state}/fuse={dec_rc.recurrent_fuse}/"
           f"memory={dec_rc.recurrent_memory} "
           f"(rec_proj zero-init, +{n_rec} 参数); 跨步信息流与跨步梯度回流实测成立, "
-          f"detach 截断后恰为 0; 读窗口 block/prefix/open 三档; 默认关闭不新增任何键")
+          f"detach 截断后恰为 0; 读窗口 block/prefix/open 三档; open 无步信号会"
+          f"步退化(实测逐位相同), recurrent_step_embed 一阶破对称; 默认关闭不新增任何键")
 
     print("\nALL CHECKS PASSED")

@@ -83,13 +83,36 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 
 - `"block"`（默认）：与并行路径**逐位复用 `build_block_mask`**（自检里直接 `torch.equal` 校验）。保持"每个 register 只被一个步读"的分工压力（`REPORT_v2_slice05_memory_open` 的结论：键被多步共享会摊薄梯度、导致趋同塌缩）。此时循环仍是**真顺序循环**：步 t 读自己那块 + 通过 `h` 看全部历史输出。
 - `"prefix"`：步 t 读 `z_cls + z_s[1..自己块末]`（累积前缀）。每步可**重读**此前的键，补偿 `h` 只是 D 维有损摘要。代价是前面块的键被后面所有步共享 ⇒ 分工压力下降（走向 `open` 那一侧的中间档）。
-- `"open"`：每步读全部 `z_s`。**仓库已实测会塌缩**（`REPORT_v2_slice05_memory_open`），仅复现/诊断，不推荐训练使用。
+- `"open"`：**删掉 `memory_mask`**，每步 cross-attention 都读全部 `z_s`。此时不再是"分块渐进读"，而是**对同一份键的迭代细化**——交叉注意力本身进入循环（链: `cross-attn_{t-1} → Y_{t-1} → h_{t-1} → q_t → cross-attn_t`）。**但有一个必须处理的陷阱，见 §2.5.2。**
 
-> 关于"是不是偷偷并行化了"：**没有**。`_forward_recurrent` 是 Python `for` 循环，第 i 步的 `self.stack(stack_in(q), mem, memory_mask=row)` 里 `q` 依赖第 i−1 步的 `Y`（即 `h`），步间是硬数据依赖，无法把 `|T|` 折进 batch 维一次算完。**并行只发生在单步内部**（该步 N 行查询一次前向）。`--recurrent_detach` 也不把它变并行——它只切梯度，不切前向依赖。
+> ⚠️ 修正一处早先的过度警告: `REPORT_v2_slice05_memory_open` 的塌缩证据来自**并行**架构（T 步同时算、每个键被 T 步 × N 行共享 ⇒ 单键梯度占比 1/36 ⇒ 键趋同）。循环架构里各步经 `h` **顺序化**，机制不同，所以 `open` 不是"禁用项"，而是一个值得单跑的臂——前提是配 `recurrent_step_embed`。
+
+### 2.5.2 `open` 的步退化（实测）与 `recurrent_step_embed` 修复
+
+删掉 `memory_mask` 后，若不开步身份信号，**各步在 zero-init 时会逐位相同**。本地实测（`N=36, K=18, steps=[1,4,9]`，`rec_proj=0`，各步与 step-1 输出最大差）：
+
+| `recurrent_memory` | 各步 vs step1 最大差 | 说明 |
+|---|---|---|
+| `block` | `[2.30, 2.73]` | 各步 memory 不同 ⇒ 天然不退化 |
+| `prefix` | `[1.14, 1.75]` | 同上（读窗口随步变宽） |
+| `open` | `[0.0, 0.0]` | **逐位相同**：查询形式与 memory 都不随步变，模型起步 = 同一输出的 \|T\| 份拷贝 |
+
+为什么难逃逸: 唯一随步变的是 `h_{t-1} = Σ_{i<t}Y_i`，而它在进查询前过了 `LayerNorm`——`LN(c·Y) = LN(Y)`（c>0），尺度信息被抹掉；`rec_proj` 又是 zero-init，所以对 `rec_proj` 的梯度里"步与步的差别"是二阶小量。等价地，此时模型对"用哪一步"完全对称。
+
+**修复 = `--recurrent_step_embed`**：加一个 `(|T|, D)` 的 zero-init 可学习逐采样步偏置到查询上。
+- 初始化时它也是 0，所以不扰动任何基线；
+- 但它的梯度 `∂L/∂q_t` **按步不同**（loss 是 `mean_t L1(cumsum_t, target)`，`cumsum_t = t·Y`），⇒ **第一次更新就一阶打破对称**，不依赖那个二阶信号。
+- 自检 §6.8 同时验证了三件事: `open` 无步信号各步逐位相同、`block` 不退化、`step_embed` 各步梯度互不相同且生效后各步输出不同。
+
+> 代价: `+ |T|·D` 参数（`T=5, D=1024` → 5K，可忽略）。它**只**在 `recurrent=True` 且显式开启时创建 ⇒ 不开不影响任何旧权重。
+>
+> 注: 这与 `doc/2026-09-12/EXPERIMENT_step_identity_arms.md`（并行架构下步身份"相互干扰"）不矛盾——那是**并行**架构里的结论；在 `open` + 循环下步身份不是"锦上添花"而是**打破退化的必要条件**。
 
 ### 2.5.1 `query_mask_mode` 在循环模式下的地位
 
 不参与前向（保留参数只为构造兼容 / `model_info.json` 记录）。循环模式不再有"块间泄露"的歧义——信息流就是显式的 `h`。
+
+> 关于"是不是偷偷并行化了"：**没有**。`_forward_recurrent` 是 Python `for` 循环，第 i 步的 `self.stack(stack_in(q), mem, memory_mask=row)` 里 `q` 依赖第 i−1 步的 `Y`（即 `h`），步间是硬数据依赖，无法把 `|T|` 折进 batch 维一次算完。**并行只发生在单步内部**（该步 N 行查询一次前向）。`--recurrent_detach` 也不把它变并行——它只切梯度，不切前向依赖。
 
 ### 2.6 代价（"以牺牲时间"）
 
@@ -106,7 +129,8 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 | `recurrent` | `False` | 总开关。**关闭时不建任何 `rec_*` 子模块/参数** ⇒ state_dict 键与历史实现逐位一致，旧 checkpoint `strict=True` 继续可载 |
 | `recurrent_state` | `"cumulative"` | `"cumulative"` / `"increment"`，见 §2.2 |
 | `recurrent_fuse` | `"proj"` | `"proj"`（zero-init Linear）/ `"add"`（标量门控） |
-| `recurrent_memory` | `"block"` | 循环路径读窗口：`"block"`（=并行同掩码）/ `"prefix"`（累积前缀）/ `"open"`（全读，实测塌缩） |
+| `recurrent_memory` | `"block"` | 循环路径读窗口：`"block"`（=并行同掩码）/ `"prefix"`（累积前缀）/ `"open"`（**删掉 memory_mask**, 交叉注意力进循环; 需配 step_embed） |
+| `recurrent_step_embed` | `False` | 逐采样步 zero-init 偏置（`|T|×D`）；`open` 时**必需**（破步退化, §2.5.2） |
 | `recurrent_detach` | `False` | 是否截断 BPTT |
 | `recurrent_gate_init` | `0.0` | `fuse="add"` 的标量门初值 |
 
@@ -123,10 +147,14 @@ NUM_GPUS=2 ./run_v2_train.sh \
     --slice_start 0 --slice_end 5 \
     --decoder_depth 2 --num_specials 0
 # 可选: --recurrent_state {cumulative,increment}  --recurrent_fuse {proj,add}
-#       --recurrent_memory {block,prefix,open}  --recurrent_detach  --recurrent_gate_init 0.0
+#       --recurrent_memory {block,prefix,open}  --recurrent_step_embed
+#       --recurrent_detach  --recurrent_gate_init 0.0
 ```
 
-> 读窗口的建议测法（受控）: 先 `block`（默认，与基线只差循环本身）; 若 `block` 下后步量级仍上不去、怀疑"h 把前面的键摘要丢了"，再单独跑一臂 `prefix`。**不要**在还没验证 `block` 前就上 `open`（已证会塌缩）。
+**三臂建议（受控）**：
+1. `--recurrent`（memory=`block`，不加 step_embed）：只改循环这一个变量，对照基线 0.3318。
+2. `--recurrent --recurrent_memory prefix`：单独验"读窗口放宽"。
+3. `--recurrent --recurrent_memory open --recurrent_step_embed`：**删掉 memory_mask**，交叉注意力进循环 = 对全部键的迭代细化。`open` 不配 `step_embed` 会步退化（§2.5.2），train 会打 warning。
 
 推理 / 可视化**不用传** `--recurrent`：一律读 `model_info.json`（新增字段 `recurrent` / `recurrent_state` / `recurrent_fuse` / `recurrent_detach` / `recurrent_gate_init`）。CLI 只作 fallback 与显式覆盖告警。
 
@@ -157,6 +185,7 @@ NUM_GPUS=2 ./run_v2_train.sh \
 6. zero-init `rec_proj` 收到非零梯度（循环可被打开）+ `query_base`/`special_bank`/`PixelHead` 全通。
 7. `increment` / `add` 两种配置能跑；非法 `recurrent_state` / `recurrent_fuse` / `recurrent_memory` 立刻报错。
 8. 读窗口三档：`block` 与 `build_block_mask` **逐位相同**（`torch.equal`）；`prefix` 每步允许 `[:hi+1]` 且严格宽于 `block`；`open` 全允许；三档整模型前向都通。
+9. §6.8：`open` + zero-init + 无步信号 ⇒ 各步输出**逐位相同**（实测退化）; `block` 不退化; `recurrent_step_embed` 各步梯度互不相同（一阶破对称）且生效后各步输出不同; 未开启时不新增 `rec_step_embed` 键。
 
 另有本地 CPU 冒烟（`N=576, K=35, steps=[1,4,9,16,25], B=2`）：
 

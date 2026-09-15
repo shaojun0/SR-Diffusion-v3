@@ -70,6 +70,9 @@ def parse_args():
     p.add_argument("--recurrent_memory", default="block",
                    choices=("block", "prefix", "open"),
                    help="循环路径读窗口(与训练一致); 默认取 model_info.json")
+    p.add_argument("--recurrent_step_embed", action="store_true",
+                   help="逐采样步可学习偏置(与训练一致); 默认取 model_info.json。"
+                        "改变权重形状 -> 错了 load 直接崩")
     p.add_argument("--n_images", type=int, default=3, help="展示几张图(行)")
     p.add_argument("--steps", default="", help="展示哪些采样步(逗号分隔); 空=自动选 6 个")
     p.add_argument("--seed", type=int, default=0)
@@ -160,11 +163,14 @@ def main():
     recurrent_state = args.recurrent_state
     recurrent_fuse = args.recurrent_fuse
     recurrent_memory = args.recurrent_memory
+    recurrent_step_embed = args.recurrent_step_embed
     if train_info is not None and "recurrent" in train_info:
         recurrent = bool(train_info["recurrent"])
         recurrent_state = str(train_info.get("recurrent_state", recurrent_state))
         recurrent_fuse = str(train_info.get("recurrent_fuse", recurrent_fuse))
         recurrent_memory = str(train_info.get("recurrent_memory", recurrent_memory))
+        recurrent_step_embed = bool(train_info.get("recurrent_step_embed",
+                                                   recurrent_step_embed))
     if recurrent != args.recurrent:
         print(f"[info] model_info.json 记录 recurrent={recurrent}"
               f"(state={recurrent_state}, fuse={recurrent_fuse}, "
@@ -182,7 +188,8 @@ def main():
                        recurrent=recurrent,
                        recurrent_state=recurrent_state,
                        recurrent_fuse=recurrent_fuse,
-                       recurrent_memory=recurrent_memory)
+                       recurrent_memory=recurrent_memory,
+                       recurrent_step_embed=recurrent_step_embed)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -191,7 +198,7 @@ def main():
     print(f"[model] N={num_patches}, K(num_specials)={model.num_specials}, "
           f"decoder_depth={args.decoder_depth}, slice=[{args.slice_start}:{args.slice_end}], "
           f"recurrent={model.recurrent}"
-          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory})' if model.recurrent else ''}, "
+          f"{f'(state={model.recurrent_state}, fuse={model.recurrent_fuse}, memory={model.recurrent_memory}, step_embed={model.recurrent_step_embed})' if model.recurrent else ''}, "
           f"{len(T_steps)} 采样步 {T_steps}")
 
     # 自动选展示步: 前/中/后均匀取 (含最后一步 = 全量累加结果)
