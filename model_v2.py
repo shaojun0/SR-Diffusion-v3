@@ -47,6 +47,8 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     L = mean_n L1(cumsum_n(Y_t), patch)   ← 每步累积结果平权全覆盖损失
         （梯度按步解耦: carry 整体 detach + 自己的预测——每步恰收 1 份梯度,
         避免"t=0 收 |T| 份梯度"的三角失衡; 见 SRPhase1V2.decode）
+        口径可切: loss_mode="final" ⇒ 只监督 Σ_t Y_t（= 监控量 recon）;
+        loss_decouple=False ⇒ 朴素 cumsum, 保留跨步恒等捷径（循环架构推荐试）
 
     循环架构（recurrent=True, 2026-09-15 新增; 默认关 ⇒ 上述并行路径逐位不变）:
         step1 查询 = query_base（**去掉 A_t**）; step t≥2 查询 =
@@ -344,6 +346,13 @@ DEFAULT_QUERY_MASK_MODE = "blockdiag"
 RECURRENT_STATES = ("cumulative", "increment")
 RECURRENT_FUSES = ("proj", "add")
 RECURRENT_MEMORY_MODES = ("block", "prefix", "open")
+
+# 训练损失口径（SRPhase1V2.decode）。**不改变任何权重形状**, 只改监督怎么施加。
+#   "cumulative"（默认, 全历史行为）: 每个采样步的**累加结果**都监督成整图——
+#       L = mean_t L1(PixelHead(Σ_{i≤t}Y_i), target) = 全轨迹深监督。
+#   "final": 只监督**最终集成结果** F_hat = PixelHead(Σ_t Y_t):
+#       L = L1(F_hat, target)（= 监控量 recon 本身）, 中间步不再被直接约束。
+LOSS_MODES = ("cumulative", "final")
 
 
 def build_causal_query_mask(num_steps: int, num_queries: int,
@@ -721,8 +730,14 @@ class SRPhase1V2(nn.Module):
         recurrent_step_embed: bool = False,
         recurrent_detach: bool = False,
         recurrent_gate_init: float = 0.0,
+        loss_mode: str = "cumulative",
+        loss_decouple: bool = True,
     ):
         super().__init__()
+        assert loss_mode in LOSS_MODES, \
+            f"未知 loss_mode={loss_mode!r}, 合法值 {LOSS_MODES}"
+        self.loss_mode = str(loss_mode)
+        self.loss_decouple = bool(loss_decouple)
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
@@ -804,14 +819,22 @@ class SRPhase1V2(nn.Module):
 
     # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
-        """解码器 + 像素头 + 平权全覆盖像素 L1。
+        """解码器 + 像素头 + 像素 L1（口径由 loss_mode / loss_decouple 决定）。
 
         **累加语义**: Y_cum[:, n] = Σ_{t≤n} Y_t（特征空间累加再统一过
         PixelHead——PixelHead 含 bias, 先投影再累加会重复加 bias）。
-        **梯度按步解耦**: 数值上仍 Y_cum = cumsum(Y)（F_hat 不变）, 但
-        carry = [0, cumsum(Y)[:-1]] 整体 detach + 自己的预测——每个 Y_t 只
-        从自己那一步的损失收 1 份梯度（平权 1/|T|）, 不再从所有 ≥t 的
-        累加位置收梯度（否则 t=0 有 |T| 份梯度动力, 学乱）。
+        **loss_mode**（默认 "cumulative"）:
+          · "cumulative"（全历史行为）: 每个采样步的**累加结果**都监督成整图,
+            L = mean_t L1(Y_pix[:,t], target)（全轨迹深监督, 平权）;
+          · "final": 只监督最终集成 F_hat = Σ_t Y_t, L = L1(F_hat, target)
+            （= 监控量 recon 本身; 中间步不再被直接约束）。
+        **loss_decouple**（默认 True）: 累加 carry 是否 detach。
+          · True: carry = [0, cumsum(Y)[:-1]] 整体 detach + 自己的预测 ⇒ 每步恰从
+            **累加路径**收 1 份梯度（数值上 Y_cum 仍 = cumsum(Y), F_hat 不变）。
+            循环架构下要注意: 此时跨步梯度只剩解码器循环那一条（q_t ← h_{t-1}）,
+            而 rec_proj zero-init 使它在初始化时恰为 0 ⇒ 各步**独立**受训。
+          · False: Y_cum = 朴素 cumsum ⇒ 保留跨步恒等捷径, 一开始就是耦合的 BPTT
+            深监督（循环架构推荐试这一档）。
 
         dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步累加
         像素 B,|T|,N,588), "target_pix"(B,N,588)}——训练取 loss; 推理取
@@ -827,16 +850,27 @@ class SRPhase1V2(nn.Module):
                       .permute(0, 2, 4, 1, 3, 5) \
                       .reshape(B, N, C * 14 * 14)       # (B,N,588) 归一化像素
         # 特征空间累加 → 统一过 PixelHead（bias 只加一次）。
-        # 梯度按步解耦: carry[n] = Σ_{t<n} Y_t（detach）; + Y[n] ⇒ 每步恰收
-        # 1 份梯度（数值上 Y_cum[n] 仍 = Σ_{t≤n} Y_t, F_hat 不变）
-        Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y   # (B,|T|,N,D)
+        # loss_decouple=True（默认, 全历史行为）: carry[n] = Σ_{t<n} Y_t（detach）;
+        #   + Y[n] ⇒ 每步恰从**累加路径**收 1 份梯度（数值上 Y_cum[n] 仍 = Σ_{t≤t} Y_t,
+        #   F_hat 不变）。**注意（循环架构）**: detach 掉的是"累加恒等捷径"; 跨步梯度
+        #   仍可经解码器循环（q_t ← h_{t-1}）回流——但 zero-init rec_proj 下该通路在
+        #   初始化时恰为 0 ⇒ 各步会**独立**受训。要一开始就有跨步耦合的 BPTT, 传
+        #   loss_decouple=False（Y_cum = 朴素 cumsum, 恒等捷径保留）。
+        if self.loss_decouple:
+            Y_cum = torch.cat([torch.zeros_like(Y[:, :1]),
+                               Y.cumsum(dim=1)[:, :-1]], dim=1).detach() + Y
+        else:
+            Y_cum = Y.cumsum(dim=1)                     # 朴素累加（不 detach carry）
         Y_pix = self.pixel_head(Y_cum)                  # (B,|T|,N,588) 累加像素
         F_pix = Y_pix[:, -1]                            # (B,N,588) 最终 = Σ_t Y_t
-        # 平权全覆盖损失: 每个采样步的累加结果都还原全部 patch 像素
+        # 每步累加结果的像素 L1（两个 loss_mode 都要, 便于监控/自检）
         per_step = F.l1_loss(Y_pix, target_pix.unsqueeze(1).expand_as(Y_pix),
                              reduction="none").mean(dim=(0, 2, 3))   # (|T|,)
-        loss = per_step.mean()                          # 平权
         recon = F.l1_loss(F_pix, target_pix)            # 集成重建（监控用, 归一化空间）
+        if self.loss_mode == "cumulative":              # 默认: 全轨迹深监督, 平权
+            loss = per_step.mean()
+        else:                                           # "final": 只监督 F_hat
+            loss = recon
         return {"loss": loss, "recon": recon, "F_hat": F_pix,
                 "Y_pix": Y_pix, "target_pix": target_pix}
 
@@ -1472,6 +1506,66 @@ if __name__ == "__main__":
     assert not [k for k in model.state_dict() if "rec_step_embed" in k], \
         "非循环/未开 step_embed 时不应出现 rec_step_embed 键"
 
+    # ── 6.9 损失口径: cumulative(默认, 深监督每步累加) vs final(只监督 F_hat) ──
+    # 6.9.0 默认必须还是 cumulative + 按步解耦（全历史行为逐位不变）
+    assert model.loss_mode == "cumulative" and model.loss_decouple, \
+        (model.loss_mode, model.loss_decouple)
+    _per = F.l1_loss(out["Y_pix"],
+                     out["target_pix"].unsqueeze(1).expand_as(out["Y_pix"]),
+                     reduction="none").mean(dim=(0, 2, 3))
+    assert torch.isclose(out["loss"], _per.mean()), "默认 loss 应为各步累加 L1 的均值"
+    # 6.9.1 final: loss 就是 F_hat(=Σ_t Y_t) 的 L1（= 监控量 recon 本身）
+    m_fin = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                       decoder_steps=square_block_starts(N), loss_mode="final")
+    o_fin = m_fin(x)
+    assert torch.isclose(o_fin["loss"], o_fin["recon"]), \
+        "loss_mode='final': loss 应 == recon（同为 F_hat 的 L1）"
+    assert o_fin["F_hat"].shape == (2, N, PATCH_PX)
+    # 6.9.2 loss_decouple=False: 数值上 Y_cum/F_hat/loss 与 True 相同（只是图不同）
+    m_nd = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                      decoder_steps=square_block_starts(N), recurrent=True,
+                      loss_decouple=False)
+    o_nd = m_nd(x)
+    _per_nd = F.l1_loss(o_nd["Y_pix"],
+                        o_nd["target_pix"].unsqueeze(1).expand_as(o_nd["Y_pix"]),
+                        reduction="none").mean(dim=(0, 2, 3))
+    assert torch.isclose(o_nd["loss"], _per_nd.mean()), \
+        "loss_decouple 只改梯度图, 不应改 loss 数值"
+    # 6.9.3 循环下"跨步梯度"的结构差异:
+    #   decouple=True(默认) + rec_proj=0 ⇒ 后期步损失对早期 Y **结构性无梯度**(恰 0)
+    #   （累加恒等捷径被 detach; 循环通路在 rec_proj=0 时也为 0 ⇒ 各步独立受训）
+    m_dc = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                      decoder_steps=square_block_starts(N), recurrent=True)
+    o_dc = m_dc(x)
+    Y_dc = m_dc.decoder.last_Y
+    per_dc = F.l1_loss(o_dc["Y_pix"],
+                       o_dc["target_pix"].unsqueeze(1).expand_as(o_dc["Y_pix"]),
+                       reduction="none").mean(dim=(0, 2, 3))
+    g_dc = torch.autograd.grad(per_dc[-1], Y_dc)[0]
+    assert g_dc[:, :-1].abs().max().item() == 0.0, \
+        "decouple=True + rec_proj=0: 末步损失不应给早期步梯度（应恰 0）"
+    assert g_dc[:, -1].abs().max().item() > 0.0, "末步自己的梯度应非零"
+    #   decouple=False ⇒ 同一末步损失**能**推到步 0（朴素累加的恒等捷径回来了）
+    m_nd2 = SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                       decoder_steps=square_block_starts(N), recurrent=True,
+                       loss_decouple=False)
+    o_nd2 = m_nd2(x)
+    Y_nd2 = m_nd2.decoder.last_Y
+    per_nd2 = F.l1_loss(o_nd2["Y_pix"],
+                        o_nd2["target_pix"].unsqueeze(1).expand_as(o_nd2["Y_pix"]),
+                        reduction="none").mean(dim=(0, 2, 3))
+    g_nd2 = torch.autograd.grad(per_nd2[-1], Y_nd2)[0]
+    assert g_nd2[:, 0].abs().max().item() > 0.0, \
+        "decouple=False: 末步损失应能经累加恒等捷径推动步 0"
+    # 6.9.4 loss_mode 非法值立刻报错
+    for bad in ("", "cum", "mean"):
+        try:
+            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D,
+                       loss_mode=bad)
+            raise AssertionError(f"loss_mode={bad!r} 应被拒绝")
+        except AssertionError as e:
+            assert "loss_mode" in str(e), e
+
     n_rec = sum(p.numel() for k, p in m_rc.named_parameters() if ".rec_" in k)
     print(f"[ok] 循环架构: step1 查询=query_base(无 A_t), step t≥2=上一步输出+query_base; "
           f"state={dec_rc.recurrent_state}/fuse={dec_rc.recurrent_fuse}/"
@@ -1479,5 +1573,9 @@ if __name__ == "__main__":
           f"(rec_proj zero-init, +{n_rec} 参数); 跨步信息流与跨步梯度回流实测成立, "
           f"detach 截断后恰为 0; 读窗口 block/prefix/open 三档; open 无步信号会"
           f"步退化(实测逐位相同), recurrent_step_embed 一阶破对称; 默认关闭不新增任何键")
+    print(f"[ok] 损失口径: loss_mode={model.loss_mode}(默认, 每步累加结果平权深监督) / "
+          f"final(只监督 F_hat, =监控量 recon); loss_decouple=True(默认, 累加 carry "
+          f"detach) / False(朴素 cumsum)——循环下 decouple=True+rec_proj=0 时早期步对"
+          f"后期损失**无梯度**(实测恰 0, 各步独立受训), False 则保留跨步恒等捷径")
 
     print("\nALL CHECKS PASSED")

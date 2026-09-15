@@ -118,6 +118,41 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 
 并行路径一次算 `|T|·N` 行；循环路径分 `|T|` 次、每次 `N` 行。**FLOPs 相近，但步间顺序依赖 ⇒ 无法并行**，wall-clock 变长（Python 循环 + 无法把 `|T|` 折进 batch 维）。激活显存与并行路径同量级（总行数相同），`recurrent_detach=True` 可进一步降。
 
+### 2.7 损失口径（**先确认事实，再谈要不要改**）
+
+**事实（`SRPhase1V2.decode`）**：训练 `loss` **一直是累加口径**，不是"直接监督 `F_hat`"：
+
+```python
+Y_cum = [0, cumsum(Y)[:-1]].detach() + Y      # 数值上 = Σ_{i≤t} Y_i
+Y_pix = pixel_head(Y_cum)                     # 每步累加结果的像素
+F_pix = Y_pix[:, -1]                          # F_hat = Σ_t Y_t
+per_step = L1(Y_pix, target).mean(dim=(0,2,3))  # (|T|,)
+loss   = per_step.mean()                      # ← 训练损失: 每个采样步的累加结果都监督成整图
+recon  = L1(F_pix, target)                    # ← 只是**监控量**（以及 §6 判据）
+```
+
+所以"直接输出 `F_hat`"的那个量是 **`recon`**——它只用于 eval/日志，**不是**被优化的目标。`F_hat = PixelHead(Σ_t Y_t)` 是推理/可视化用的集成结果，它与训练的深监督并不冲突。
+
+**但在循环架构下，损失确实有一个值得改的点**——不是口径，而是**累加路径的梯度**：
+
+- 默认 `loss_decouple=True`（carry `detach`）的动机是并行架构的"每步恰收 1 份梯度、避免 t=0 的三角失衡"。循环架构里它带来一个副作用：
+  - 累加恒等捷径被 `detach` 切断；
+  - 跨步梯度只剩解码器循环那条（`q_t ← h_{t-1}`），而 `rec_proj` **zero-init ⇒ 该通路在初始化时恰为 0**；
+  - ⇒ **各步初始时是独立受训的**（自检 §6.9 实测：末步损失对早期步的梯度**恰为 0**）。循环的耦合要等 `rec_proj` 长起来才建立。
+- `loss_decouple=False`（朴素 `cumsum`）保留恒等捷径 ⇒ 一开始就是耦合的 **BPTT 深监督**（标准 iterative-refinement 做法），末步损失能直接推动步 0（实测 `> 0`）。
+
+两个开关（都**不改变任何权重形状**，只改监督；`model_info.json` 记录）：
+
+| 开关 | 取值 | 含义 |
+|---|---|---|
+| `--loss_mode` | `cumulative`（默认=历史）/ `final` | `cumulative` = `mean_t L1(Σ_{i≤t}Y_i, target)` 全轨迹深监督; `final` = 只监督 `F_hat`（= `recon`） |
+| `--loss_decouple` | `true`（默认=历史）/ `false` | 累加 carry 是否 `detach`；**循环架构建议试 `false`** |
+
+**建议**：第一臂仍用默认（`cumulative` + `decouple=true`）以做受控对照；若出现"后步几乎不动/循环学不起来"，再单跑一臂 `--loss_decouple false`。**不建议**先上 `--loss_mode final`：那就回到"后步输出≈0"的原始失败模式（没有逐步监督，后步没有动力做残差），而且它正是把 `recon` 当损失——即本文件 §1 诊断里要避免的形态。
+
+> 注：`loss_mode` / `loss_decouple` 只影响训练损失，`F_hat` / `Y_pix` / `recon` 在任何模式下逐位相同 ⇒ 推理/可视化不必对齐（`model_info.json` 仅作留档）。
+> 另一条正交的损失杠杆是 **P1 区域损失**（`doc/2026-09-07/DESIGN_v2_region_loss.md`，代码已还原）：让 step t 只监督自己那块 patch 区，从根上消掉"步间任务同构"。它和本方案可叠加，但一次只改一个变量。
+
 ---
 
 ## 3. 接口
@@ -133,6 +168,8 @@ for i, t in enumerate(steps):                    # t ∈ {1,4,9,16,25,...}
 | `recurrent_step_embed` | `False` | 逐采样步 zero-init 偏置（`|T|×D`）；`open` 时**必需**（破步退化, §2.5.2） |
 | `recurrent_detach` | `False` | 是否截断 BPTT |
 | `recurrent_gate_init` | `0.0` | `fuse="add"` 的标量门初值 |
+| `loss_mode` | `"cumulative"` | 训练损失口径：`"cumulative"`（=历史, 逐步累加深监督）/ `"final"`（只监督 `F_hat`）。**不是**权重, 只改监督（§2.7） |
+| `loss_decouple` | `True` | 累加 carry 是否 `detach`。`True`=历史; **循环架构建议试 `False`**（§2.7） |
 
 ### 3.2 CLI / model_info.json
 
@@ -149,6 +186,7 @@ NUM_GPUS=2 ./run_v2_train.sh \
 # 可选: --recurrent_state {cumulative,increment}  --recurrent_fuse {proj,add}
 #       --recurrent_memory {block,prefix,open}  --recurrent_step_embed
 #       --recurrent_detach  --recurrent_gate_init 0.0
+#       --loss_mode {cumulative,final}  --loss_decouple {true,false}
 ```
 
 **三臂建议（受控）**：
@@ -156,7 +194,9 @@ NUM_GPUS=2 ./run_v2_train.sh \
 2. `--recurrent --recurrent_memory prefix`：单独验"读窗口放宽"。
 3. `--recurrent --recurrent_memory open --recurrent_step_embed`：**删掉 memory_mask**，交叉注意力进循环 = 对全部键的迭代细化。`open` 不配 `step_embed` 会步退化（§2.5.2），train 会打 warning。
 
-推理 / 可视化**不用传** `--recurrent`：一律读 `model_info.json`（新增字段 `recurrent` / `recurrent_state` / `recurrent_fuse` / `recurrent_detach` / `recurrent_gate_init`）。CLI 只作 fallback 与显式覆盖告警。
+**损失臂（正交, 单独跑）**：`--recurrent --loss_decouple false`（保留跨步恒等捷径, 一开始就做耦合 BPTT 深监督）。不要先上 `--loss_mode final`（§2.7）。
+
+推理 / 可视化**不用传** `--recurrent`：一律读 `model_info.json`（新增字段 `recurrent` / `recurrent_state` / `recurrent_fuse` / `recurrent_memory` / `recurrent_step_embed` / `recurrent_detach` / `recurrent_gate_init` / `loss_mode` / `loss_decouple`）。CLI 只作 fallback 与显式覆盖告警。`loss_*` 只影响训练损失, 推理不必对齐（`model_info.json` 仅留档）。
 
 > ⚠️ `recurrent` 会新增 `rec_*` 参数 ⇒ 与非循环 checkpoint **形状不兼容**，传错时 `strict=True` 会**明确报错**（这是好事，不会静默算错）。但 `recurrent_state` / `recurrent_fuse` 不改权重形状 ⇒ 传错只静默算错，消费方必须以 `model_info.json` 为准。
 
@@ -186,6 +226,7 @@ NUM_GPUS=2 ./run_v2_train.sh \
 7. `increment` / `add` 两种配置能跑；非法 `recurrent_state` / `recurrent_fuse` / `recurrent_memory` 立刻报错。
 8. 读窗口三档：`block` 与 `build_block_mask` **逐位相同**（`torch.equal`）；`prefix` 每步允许 `[:hi+1]` 且严格宽于 `block`；`open` 全允许；三档整模型前向都通。
 9. §6.8：`open` + zero-init + 无步信号 ⇒ 各步输出**逐位相同**（实测退化）; `block` 不退化; `recurrent_step_embed` 各步梯度互不相同（一阶破对称）且生效后各步输出不同; 未开启时不新增 `rec_step_embed` 键。
+10. §6.9 损失口径：默认仍是 `cumulative` + `loss_decouple=True` 且 `loss == mean_t`；`loss_mode="final"` 时 `loss == recon`；`loss_decouple` 只改梯度图不改数值；**循环 + `decouple=True` + `rec_proj=0` 时末步损失对早期 `Y` 的梯度恰为 0，`decouple=False` 时非零**；非法 `loss_mode` 报错。
 
 另有本地 CPU 冒烟（`N=576, K=35, steps=[1,4,9,16,25], B=2`）：
 
@@ -213,8 +254,9 @@ NUM_GPUS=2 ./run_v2_train.sh \
 
 ## 7. 改动文件
 
-- `model_v2.py`: `OutputQueryDecoder` 的 recurrent 路径 + `SRPhase1V2` 透传 + 自检 §6 + 模块/类 docstring。
-- `train_v2.py`: CLI（`--recurrent*`）/ 构造透传 / 启动打印 / `model_info.json` 新字段 / 头部说明。
+- `model_v2.py`: `OutputQueryDecoder` 的 recurrent 路径 + `SRPhase1V2` 透传 + `loss_mode`/`loss_decouple` + 自检 §6 + 模块/类 docstring。
+- `train_v2.py`: CLI（`--recurrent*` / `--loss_mode` / `--loss_decouple`）/ 构造透传 / 启动打印 / `model_info.json` 新字段 / 头部说明。
 - `infer_v2_test.py`: CLI + `model_info.json` 优先解析 + 构造透传 + 加载打印 + 一致性检查。
 - `visualize_recon_pixel.py`: CLI + `model_info.json` 解析 + 构造透传 + 打印。
+- 工作区（非仓库）: `probe_step_collapse.py`（探针支持循环字段）、`run_recurrent_slice05.sh`（对照臂入口）。
 - 本文件。

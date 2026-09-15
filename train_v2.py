@@ -63,6 +63,14 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
       --recurrent_gate_init; 详见 model_v2.py OutputQueryDecoder 的 recurrent 段
       与 doc/2026-09-15/DESIGN_v2_recurrent.md（§2.5 掩码怎么变 / §2.5.2 open 步退化）。
 
+2026-09-15（损失口径确认 + 两个开关; 详见 DESIGN §2.7）:
+    · 训练 loss **一直是累加口径**（`mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)` = 全轨迹
+      深监督）, 不是"直接监督 F_hat"。`F_hat = Σ_t Y_t`, 它的 L1 只是监控量 `recon`。
+    · `--loss_mode {cumulative,final}`: final 才改成只监督 F_hat（可作对照臂）。
+    · `--loss_decouple {true,false}`: 累加 carry 是否 detach。**循环架构下值得试
+      false**——decouple=true 且 rec_proj zero-init 时, 累加恒等捷径被切断、循环通路
+      梯度又恰为 0 ⇒ 各步初始时独立受训; false 保留跨步恒等捷径（自检 §6.9 实测）。
+
 HF Trainer 风格（消除造轮子）:
     · 训练循环 / 梯度累积 / 调度器 / checkpoint / 分布式 → 全部交给
       transformers.Trainer + TrainingArguments（lr_scheduler_type="cosine"
@@ -209,6 +217,21 @@ def parse_args():
                         "损失不再能推动早期步的 register）。默认关 = 整条循环反传")
     p.add_argument("--recurrent_gate_init", type=float, default=0.0,
                    help="--recurrent_fuse add 时标量门的初值（默认 0.0 = 同 proj, 起步无反馈）")
+    # ── 损失口径（不改变任何权重形状, 只改监督怎么施加）──
+    p.add_argument("--loss_mode", default="cumulative",
+                   choices=("cumulative", "final"),
+                   help="训练损失: cumulative（默认, 全历史行为）= 每个采样步的**累加结果**"
+                        "都监督成整图, L = mean_t L1(PixelHead(Σ_{i≤t}Y_i), target)（全轨迹"
+                        "深监督, 平权）; final = **只监督最终集成 F_hat**（= Σ_t Y_t）, "
+                        "L = L1(F_hat, target)。注意: 监控量 recon 在任何模式下都等于 F_hat 的 "
+                        "L1, 别把它当成训练损失")
+    p.add_argument("--loss_decouple", default="true",
+                   choices=("true", "false"),
+                   help="累加路径的 carry 是否 detach（默认 true = 全历史行为, 每步恰从累加"
+                        "路径收 1 份梯度）。**循环架构下值得试 false**: decouple=true 且 "
+                        "rec_proj zero-init 时, 累加恒等捷径被切断、循环通路梯度又恰为 0 ⇒ "
+                        "各步初始时**独立受训**（末步损失推不动早期步, 自检实测恰 0）; "
+                        "false 保留朴素 cumsum 的跨步恒等捷径, 一开始就是耦合的 BPTT 深监督")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(如 4 ⇔ 计划[4:9]); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -330,7 +353,9 @@ def main():
                        recurrent_memory=args.recurrent_memory,
                        recurrent_step_embed=args.recurrent_step_embed,
                        recurrent_detach=args.recurrent_detach,
-                       recurrent_gate_init=args.recurrent_gate_init)
+                       recurrent_gate_init=args.recurrent_gate_init,
+                       loss_mode=args.loss_mode,
+                       loss_decouple=(args.loss_decouple == "true"))
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -369,6 +394,11 @@ def main():
                   "⇒ 起步退化为'同一输出的 T 份拷贝'。强烈建议加 --recurrent_step_embed")
     else:
         print("[model] 循环架构 OFF（并行路径, 与原实现逐位一致; 需循环请加 --recurrent）")
+    print(f"[model] 损失: loss_mode={model.loss_mode} "
+          f"(cumulative=每步累加结果平权深监督 / final=只监督 F_hat), "
+          f"loss_decouple={model.loss_decouple} "
+          f"({'累加 carry detach, 每步恰 1 份梯度' if model.loss_decouple else '朴素 cumsum, 保留跨步恒等捷径'})"
+          f"{'  ← 非默认' if (model.loss_mode != 'cumulative' or not model.loss_decouple) else ''}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -453,6 +483,8 @@ def main():
                 "recurrent_step_embed": bool(raw.decoder.recurrent_step_embed),
                 "recurrent_detach": bool(raw.decoder.recurrent_detach),
                 "recurrent_gate_init": args.recurrent_gate_init,
+                "loss_mode": raw.loss_mode,
+                "loss_decouple": bool(raw.loss_decouple),
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
