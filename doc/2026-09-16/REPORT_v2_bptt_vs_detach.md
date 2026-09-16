@@ -166,7 +166,7 @@ NUM_GPUS=2 ./run_v2_train.sh \
 
 **建议后续**
 - 多 seed 复核 −30.8% 的幅度。
-- **补跑 slice[0:5]（`K=35`, 5 步）+ BPTT 臂**：这才是仓库那条线真正的问题所在。对照物有两类——历史 slice05 数字（`eval_recon` 0.3318，但是**并行架构** `d72e5eb`，只能作跨代参照），以及 `doc/2026-09-10/probe_step_collapse.py` 的 `step_px_scale` 判据（`DESIGN_v2_recurrent.md` §6 判据①，比只看 `eval_recon` 更贴题）。若要严格归因，还需在当前代码上补一个 slice05 + detach 的控制臂。
+- **~~补跑 slice[0:5]（`K=35`, 5 步）+ BPTT 臂~~ → 已跑，见 [`REPORT_v2_slice05_bptt.md`](REPORT_v2_slice05_bptt.md)**：全量 `full_norm_l1` **0.314064**（比历史基线 0.3318 低 5.3%，但**跨代 + 跨损失口径**，只能算提示）；**逐步 L1 只改善 1.3%** ⇒ 在 slice05 上**后步仍未分工**。若要严格归因，还需在当前代码上补一个 slice05 + detach 的控制臂。另：`DESIGN_v2_recurrent.md` §6 判据①（`step_px_scale`）在直接预测口径下**已失效**（实测各步恒 ≈1.03），不要再拿它当坍缩探测器。
 - 既然 BPTT 免费且后步已开始贡献，可**重测 README §4.1 的 P1 分区掩码损失**（`doc/2026-09-07/DESIGN_v2_region_loss.md`）：当时"只给私有目标无效"的结论是在 detach（后步无梯度）前提下得到的，**前提已经变了**。注意该结论**来自 slice05**，重测也应在 slice05 上做。
 - 是否把这一行落成仓库默认（或重新做成 `--recurrent_detach` 开关）待定。
 
