@@ -66,6 +66,7 @@ python infer_v2_test.py --data_dir /root/autodl-tmp/construction_site \
 ## 3. 文档导航（doc/ 按日期归档，读最新在前）
 
 - 权威目标: `doc/2026-08-28/GOAL_compression_for_nlp.md`
+- **BPTT vs detach 对照实验（2026-09-16，循环 carry 反传）**: `doc/2026-09-16/REPORT_v2_bptt_vs_detach.md`（只去掉 `model_v2.py:528` 的 `.detach()` ⇒ 全量 test 像素 L1 23.72 → **16.42**、`full_norm_l1` 0.4127 → **0.2857**，**−30.8%**；24 步逐步曲线由"平"转"降"、**后步坍缩均衡被打破**（但饱和仍早，见该文 §3）；显存/步速与 detach 版**逐位相同** ⇒ 不是拿算力换的。附件 `doc/2026-09-16/model_v2_bptt.patch`。**本实验未改仓库默认行为**）
 - 架构现状（2026-09-15，**当前代码 = 循环 + 直接预测损失**）: `doc/2026-09-15/DESIGN_v2_recurrent.md`（设计过程与带开关那一版的细节；**当前实现是其中"无开关"的子集**，差异见 §1 —— 尤其它记的默认 `recurrent_detach=False`（BPTT）**不是**当前行为）
 - 解码器/可视化修复（2026-09-15）: `model_v2.py` 的 `patches_to_image`（target_pix 布局的唯一反变换 + 自检 §1b 往返断言）；`infer_v2_test.py`/`visualize_recon_pixel.py` 一律调用它
 - 实验（2026-09-10，blockdiag 单卡复跑 + 后步坍缩探针）: `doc/2026-09-10/REPORT_v2_blockdiag_slice05.md`（slice[0:5] K=35 单卡 bs=32，`eval_recon` 0.3584→**0.3318**）、`doc/2026-09-10/PROBE_v2_step_collapse_blockdiag.md`（探针 `probe_step_collapse.py`：**step1~5 仍坍缩且 blockdiag 更甚**；证明该增益来自单发通路而非后步分工）
