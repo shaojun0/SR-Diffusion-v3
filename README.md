@@ -65,6 +65,7 @@ python infer_v2_test.py --data_dir /root/autodl-tmp/construction_site \
 
 ## 3. 文档导航（doc/ 按日期归档，读最新在前）
 
+- **多模态数据集盘点（2026-09-17，12 个 mm-datasets 总表）**: `doc/2026-09-17/ANALYSIS_mm_datasets_inventory.md` —— 服务器镜像 `/root/autodl-tmp/mm-datasets/` **202 GB / 12 repo / 10 OK + 2 gated**；逐项给出类型（4 检测 / 2 分类 / 2 多轮视觉指令 / 1 VQA / 1 纯文本 QA / 1 渲染包 / 1 机器人录制 / 1 BLOCKED）、单轮多轮、单图多图与规模，**含图样本约 80 万+**（LLaVA-NeXT 779,289 行中 738,601 行有图）；机器可读 JSON 与 4 份原始分组证据入库 `doc/2026-09-17/data/dataset_recon/`
 - **K-sweep 汇总（2026-09-16，BPTT 口径 8 点压缩-质量曲线，单卡 bs32）**: `doc/2026-09-16/REPORT_ksweep_bptt.md` —— K=15→120 像素 L1 **15.02 → 12.51**（norm 0.2612 → 0.2175；7 个单卡点，**K=63 非单调异常**：14.06 px 反差于 K=48）；含 2 个 2 卡 DDP 锚点（K=35 / K=576）与 detach 基线，用 k35c 同 K 控制把单卡↔DDP 口径差量化为 **21.62% / 3.9030 px** ⇒ 原“单卡 K=99/K=120 反超 DDP K=576”的**反转被推翻**；**Phase-1 判定**：K≈128（K=120）最优且干净、K≈32（K=35c）可用、**K≈64（K=63）存疑须重跑**
 - **逐步细化形态分析（2026-09-16，BPTT K-sweep）**: `doc/2026-09-16/ANALYSIS_ksweep_stepwise_refinement.md` —— 逐步增量分解：**有**真细化（detach 全平 → BPTT 连续正增量），但落差 **≥88% 在前 3–4 步**、增量按 ~3–4 倍几何衰减、**末 2–3 步转负（过冲）**；仅 **K≥48** 明显（K≤35 ≤1.8%），K=63 折返；⇒ K 的有效容量远小于名义 K
 - 权威目标: `doc/2026-08-28/GOAL_compression_for_nlp.md`
