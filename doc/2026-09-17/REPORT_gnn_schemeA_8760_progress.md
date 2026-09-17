@@ -1,6 +1,6 @@
 # 方案A（GNN + 置换不变 Readout）分支备份 + 8760 步正式实验启动报告
 
-- 报告时间：**2026-09-17 18:20 CST**（服务器 `autodl-container-jnb93wme4w-bf7ae4cd`，本地时间与服务器一致）
+- 报告时间：**2026-09-17 18:28 CST**（含 18:19 启动验证与 18:28 稳定性复核；服务器 `autodl-container-jnb93wme4w-bf7ae4cd`，本地时间与服务器一致）
 - 范围：仅操作服务器 clone `/root/autodl-tmp/sr-diffusion-v3-gnnA`（分支 `feat-gnn-schemeA`）与本地 repo 的 `git fetch` / `git push origin feat-gnn-schemeA`
 - 状态：**(A) 分支备份已完成并校验通过；(B) 三臂 8760 步正式实验已在两卡启动并验证稳定运行**（本报告为启动快照，训练仍在后台继续）
 
@@ -124,6 +124,14 @@ CUDA_VISIBLE_DEVICES=0 python train_v2.py \
   - `[train] 7009 样本 | 每卡 bs=16 x 1 卡 | grad_accum=2 | ~438 步/epoch x 40 = 8760 步 | warmup 262 步`
 - **步数/口径正常**：`max_steps=8760`、`seed=42`、`slice 0:5 / 0:6`、全量 7009 训练样本、`eval_limit 0`。
 
+**再核查（2026-09-17 18:28，运行 ~13 min）**：
+
+- GPU0 `49,951 MiB / 100%`，GPU1 `52,423 MiB / 100%`（显存峰值与 18:19 完全一致，无增长/泄漏）。
+- K35 `403/8760`（1.88 s/it，ETA 4h22m）；K48 `379/8760`（1.99 s/it，ETA 4h38m）。
+- 两日志 `Traceback|OutOfMemory` 命中次数 = **0 / 0**。
+- 训练在收敛：K35 loss `0.6973 → 0.6505 → 0.6381`（grad_norm ~1.4）；K48 loss `0.7473 → 0.7296 → 0.6729`（grad_norm ~1.1），与 bs16ga2 2000 步短程曲线量级一致。
+- 输出目录 `/root/autodl-tmp/sr-diffusion-v3-gnnA/output/gnnA_sum_{K35,K48}_8760/` 已创建（首个 checkpoint 在 step 2000，约 19:20 / 19:23 落盘）。
+
 ### B.5 显存峰值（实测，采样自 `gpu_mem.csv`，每 10 s）
 
 | arm | 配置 | 峰值（MiB） | 峰值（GiB） | 上限占用 |
@@ -136,12 +144,12 @@ CUDA_VISIBLE_DEVICES=0 python train_v2.py \
 
 （nvidia-smi 总显存 97,887 MiB = 95.59 GiB；`memory.used` 含非 PyTorch 开销。）
 
-### B.6 当前进度与 ETA（快照 2026-09-17 18:19）
+### B.6 当前进度与 ETA（快照 2026-09-17 18:28）
 
 | arm | 进度 | 速率 | 训练剩余 | 预计训练完成 | 预计全 arm 完成（含 infer） |
 |---|---|---|---|---|---|
-| K35 (slice 0:5) | 102 / 8760 | 1.88 s/it | ~4h31m | ~22:50 | — |
-| K48 (slice 0:6) | 96 / 8760 | 1.99 s/it | ~4h48m | ~23:07 | ~23:12（lane1 收尾） |
+| K35 (slice 0:5) | 403 / 8760 | 1.88 s/it | ~4h22m | ~22:50 | — |
+| K48 (slice 0:6) | 379 / 8760 | 1.99 s/it | ~4h38m | ~23:06 | ~23:12（lane1 收尾） |
 | K99 (slice 0:9) | 排队（lane0 第二棒） | 探针 ~2.3–2.7 s/it | ~5h36m（估） | ~04:35（次日） | **~2026-09-18 04:45 CST 全部完成** |
 
 > ETA 依据：K35/K48 的实测 tqdm 速率外推，K99 由 bs16ga2 探针速率（2.74 s/step 含启动）按步数线性缩放并考虑 9 步 vs 5 步的解码开销；每个 run 另有 5 次全量 eval（eval_every 2000、eval_limit 0，3004 条，实测 ~100 s/次）与末尾 `infer_v2_test.py`（~2–3 min）。
@@ -164,4 +172,5 @@ CUDA_VISIBLE_DEVICES=0 python train_v2.py \
 - 未改 main：服务器只动 `sr-diffusion-v3-gnnA`（其 `origin` 本地路径未被 push）；本地只 `git fetch` + `git push origin feat-gnn-schemeA`，`main` SHA/工作区/stash 均未受影响。
 - 未触碰他人 clone/数据：`/root/autodl-tmp/sr-diffusion-v3-bptt-ksweep`（锚点产物）只读；`/root/autodl-tmp/construction_site`、`/root/autodl-tmp/models/dinov2-large` 只读；未杀任何其他智能体进程；未装包/未 pytest；未删数据。
 - 磁盘：`/root/autodl-tmp` 已用 629G / 可用 422G（60%），3 个 run 的 checkpoint（save_every 2000）预计占用 ~50 GB，余量充足。
+- **关于本报告自身的版本状态（18:32 补充，须知会）**：本 subagent 全程**未执行任何 main 的 commit / push**（只做了 `git fetch`(bundle) 与 `git push origin feat-gnn-schemeA`）。但编排方在 18:19:36 已把本报告的**上一版本**（167 行）commit 为 `94c8aea` 并 `push origin main`（`git ls-remote origin main` = `94c8aea`）；此后本报告又追加了 18:28 稳定性复核等约 +12/−4 行，**这部分仍是未提交的工作区改动**（`git status` → ` M doc/2026-09-17/REPORT_gnn_schemeA_8760_progress.md`）。是否再次入库由编排方决定；本地 main 的代码文件与 stash 未受影响。
 - 需后续核对的点：① 本次为 **bs16 ga2**，与锚点 bs32 ga1 存在微批口径差，最终报告必须标注；② 每个 run 的 `infer_test.json` 出来后按 `full_pixel_l1_255`/`full_norm_l1` 与上表对齐；③ 关注 K=99 实际峰值是否与探针一致。
