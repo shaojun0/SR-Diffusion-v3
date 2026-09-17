@@ -106,6 +106,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Sequence
 
+from model_gnn_schemeA import SchemeAEncoder, permute_adj
+
 
 # ═══ SpecialTokenBank — 特殊 token 池（输入相同, 仅位置编码不同）═══
 
@@ -525,7 +527,7 @@ class OutputQueryDecoder(nn.Module):
             # doc/2026-09-15/DESIGN_v2_recurrent.md §2.4 记的默认
             # （recurrent_detach=False = 整条循环反传 BPTT）**不一致**: 那些开关
             # 已随并行路径删除, 本行是唯一路径; 需要 BPTT 的口径只能改这里。
-            Y = self.query_base + Y                                # [BPTT] 不 detach: 循环 carry 反传
+            Y = (self.query_base + Y).detach()                    # 喂给下一步当查询
         Y = torch.stack(Y_total, dim=1)                          # (B,|T|,N,D) 沿步
         self.last_Y = Y                                          # 采样步全部 patch 预测
         return Y
@@ -577,6 +579,17 @@ class SRPhase1V2(nn.Module):
         num_specials: Optional[int] = None,
         stack_dim: int = 0,
         decoder_dropout: float = 0.0,
+        gnn_mode: str = "off",
+        gnn_hid: int = 256,
+        gnn_layers: int = 2,
+        gnn_conv: str = "gin",
+        gnn_k: int = 8,
+        gnn_grid: Optional[Sequence[int]] = None,
+        gnn_grid_weight: float = 0.0,
+        gnn_norm: str = "layer",
+        gnn_dropout: float = 0.0,
+        gnn_lr_scale: float = 1.0,
+        gnn_inject: str = "replace",
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -602,12 +615,53 @@ class SRPhase1V2(nn.Module):
             f"缩小 decoder_steps / skip_steps / max_steps"
         self.num_specials = K
 
-        self.special_bank = SpecialTokenBank(num_tokens=K, dim=dim)
+        # ── 方案A（GNN 图表示）开关; 默认 off = 与历史 register 路径逐位一致 ──
+        assert gnn_mode in ("off", "sum", "proto"), \
+            f"gnn_mode 须为 off/sum/proto, got {gnn_mode!r}"
+        assert gnn_inject in ("replace", "concat"), \
+            f"gnn_inject 须为 replace/concat, got {gnn_inject!r}"
+        if gnn_mode != "off" and num_specials is not None:
+            raise AssertionError(
+                "gnn_mode≠off 与显式 num_specials 不兼容: 方案A 的 specials 槽位"
+                "由 GNN 填充, K 必须由采样步集自动推导（别传 --num_specials）")
+        self.gnn_mode = gnn_mode
+        self.gnn_inject = gnn_inject
+        self.gnn_lr_scale = float(gnn_lr_scale)
+        # special_bank 何时需要: register 式(off) / sum+replace(补 K−1 个位置) /
+        # sum+concat(补 K 个位置); proto+replace 不需要（K 个原型占满槽位）
+        self.special_bank = (
+            SpecialTokenBank(num_tokens=K, dim=dim)
+            if (gnn_mode != "proto") else None)
+        self.gnn = None
+        if gnn_mode != "off":
+            grid = tuple(int(v) for v in gnn_grid) if gnn_grid else None
+            if grid is not None:
+                assert grid[0] * grid[1] == num_patches, \
+                    f"gnn_grid={grid} 与 num_patches={num_patches} 不符"
+            self.gnn = SchemeAEncoder(
+                in_dim=dim, hid_dim=gnn_hid, out_dim=dim,
+                num_layers=gnn_layers,
+                readout=("sum" if gnn_mode == "sum" else "proto"),
+                num_proto=K, conv=gnn_conv, k=gnn_k,
+                grid=grid, grid_weight=gnn_grid_weight, norm=gnn_norm,
+                dropout=gnn_dropout)
+        # 方案A 的 decoder specials 槽位 = K（沿用原 specials 槽位长度）:
+        #   proto + replace ⇒ K 个原型逐位占满槽位（z_s = proto）
+        #   sum  + replace ⇒ 1 个全局向量 + (K−1) 个 SpecialTokenBank register
+        #   sum  + concat  ⇒ 原 K 个 register 后面追加 1 个全局向量（槽位 K+1）
+        if gnn_mode != "off" and gnn_inject == "concat":
+            assert gnn_mode == "sum", (
+                "gnn_inject=concat 只对 gnn_mode=sum 有意义: K 个原型 + K 个"
+                "register 拼起来超出解码器读窗口, 尾巴原型读不到 ⇒ 用 replace")
+            self.special_bank = SpecialTokenBank(num_tokens=K, dim=dim)
+            decoder_specials = K + 1
+        else:
+            decoder_specials = K
         self.decoder = OutputQueryDecoder(dim=dim, num_patches=num_patches,
                                           mlp_ratio=mlp_ratio, heads=heads,
                                           steps=steps_selected,
                                           depth=decoder_depth,
-                                          num_specials=K,
+                                          num_specials=decoder_specials,
                                           stack_dim=stack_dim,
                                           dropout=decoder_dropout)
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
@@ -616,11 +670,33 @@ class SRPhase1V2(nn.Module):
     def encode(self, pixel_values: Tensor):
         """输入 → 解码器输入 (z_cls, z_s), 训练/推理同一路径。
 
-        register 式: specials 作为额外 token 拼进 DINO 输入序列, 由 DINO
-        24 层直接算出 z_s（register token 式, Darcet et al.）——深层网络做
-        内容路由, 修 F1（special 无内容输入）与 F2（z_s 冗余全局摘要）。
+        gnn_mode=off（默认）: register 式: specials 作为额外 token 拼进 DINO
+        输入序列, 由 DINO 24 层直接算出 z_s（register token 式, Darcet et al.）
+        ——深层网络做内容路由, 修 F1（special 无内容输入）与 F2（z_s 冗余全局摘要）。
+        gnn_mode≠off: 方案A（GNN + 置换不变 Readout）出 z/原型当 z_s, 见
+        `_encode_gnn` 与 `model_gnn_schemeA.py`。
         """
-        return self._encode_register(pixel_values)
+        if self.gnn_mode == "off":
+            return self._encode_register(pixel_values)
+        return self._encode_gnn(pixel_values)
+
+    def _dino_encode(self, pixel_values: Tensor, z_slots: Tensor):
+        """[cls; z_slots; patches] 过 DINO 24 层 → (z_cls, z_slots_out)。
+
+        z_slots: (B,S,D) 的"specials 槽位"预激活向量（register 式由
+        SpecialTokenBank 给, 方案A 由 GNN Readout 给 —— 注入点就在这里:
+        图表示以**额外全局 token**身份进 DINO 序列, 与 register 完全同构）。
+        返回 DINO 输出里对应的 (B,1,D) 与 (B,S,D)。
+        """
+        x = pixel_values                                # (B,3,H,W)
+        S = z_slots.shape[1]
+        emb = self.dinov2.embeddings(x)                 # (B,1+N,D) [cls; patches] + PE
+        seq = torch.cat([emb[:, :1], z_slots, emb[:, 1:]], dim=1)   # (B,1+S+N,D)
+        for layer in self.dinov2.encoder.layer:         # DINO 24 层（全双向）
+            out = layer(seq)
+            seq = out[0] if isinstance(out, (tuple, list)) else out
+        seq = self.dinov2.layernorm(seq)                # (B,1+S+N,D)
+        return seq[:, :1], seq[:, 1:1 + S]
 
     def _encode_register(self, pixel_values: Tensor):
         """specials 直接进 DINO 输入序列 [cls; specials(K); patches(N)]
@@ -633,14 +709,54 @@ class SRPhase1V2(nn.Module):
         逐位置可学习 pos, 不带 DINO PE——与 patch 的位置关系完全学出）。
         """
         x = pixel_values                                # (B,3,H,W)
-        emb = self.dinov2.embeddings(x)                 # (B,1+N,D) [cls; patches] + PE
         specials = self.special_bank(x.shape[0], x.device)   # (B,K,D) token+pos
-        seq = torch.cat([emb[:, :1], specials, emb[:, 1:]], dim=1)   # (B,1+K+N,D)
-        for layer in self.dinov2.encoder.layer:         # DINO 24 层（全双向）
+        return self._dino_encode(x, specials)
+
+    def _encode_gnn(self, pixel_values: Tensor):
+        """方案A: DINOv2 patch token → kNN 图 → GNN → 置换不变 Readout → z_s。
+
+        路径:
+            1. emb = dinov2.embeddings(patches only)  (B,1+N,D)（**不**放 specials）
+            2. 过 DINO 24 层 → 取 patch token 末层表示 (B,N,D) = 图节点特征
+            3. SchemeAEncoder: kNN 图 → L 层消息传递 → Readout → Projector
+               · gnn_mode=sum   → z (B,1,D), L2 归一化（§6 默认, 每图 1 向量）
+               · gnn_mode=proto → K 个 attention 原型 (B,K,D), 逐行 L2 归一化
+                 （§6 注 / §10 E3, k=K 与 specials 数对齐）
+            4. 装填 specials 槽位（concat 沿特征维拼进槽位, **不是按行拼接**）:
+               · gnn_inject=replace ⇒ z_s = 图表示（sum 时补 K−1 个 register,
+                 保证末步读窗口长度不变; proto 时 K 个原型逐位占满）
+               · gnn_inject=concat（仅 sum）⇒ z_s = [K 个 register ‖ 1 个全局向量]
+            5. z_s 作为"specials 槽位"进 `_dino_encode`（额外全局 token 注入,
+               与 register 式同构）→ 解码器读窗口 / 循环结构完全不变。
+
+        置换不变性: 步骤 1–4 里没有任何依赖 patch 编号的算子（见
+        model_gnn_schemeA.py 的纪律清单）⇒ 图表示对 patch 顺序不变; 步骤 5
+        的 z_s 行序 = 原型编号（与 patch 顺序无关）。
+        """
+        B = pixel_values.shape[0]
+        emb = self.dinov2.embeddings(pixel_values)      # (B,1+N,D) [cls; patches]
+        seq = emb
+        for layer in self.dinov2.encoder.layer:
             out = layer(seq)
             seq = out[0] if isinstance(out, (tuple, list)) else out
-        seq = self.dinov2.layernorm(seq)                # (B,1+K+N,D)
-        return seq[:, :1], seq[:, 1:1 + self.num_specials]
+        seq = self.dinov2.layernorm(seq)                # (B,1+N,D)
+        feats = seq[:, 1:]                              # (B,N,D) patch 节点特征
+
+        g = self.gnn(feats)                             # 方案A 前向
+        K = self.num_specials
+        if self.gnn_mode == "sum":
+            z = g["z"]                                  # (B,1,D) 每图 1 向量
+            if self.gnn_inject == "concat":
+                z_slots = torch.cat(
+                    [self.special_bank(B, pixel_values.device), z], dim=1)
+            else:                                       # replace
+                bank = self.special_bank(B, pixel_values.device)  # (B,K,D)
+                z_slots = torch.cat([z, bank[:, :K - 1]], dim=1)  # (B,K,D)
+        else:                                           # proto
+            z_slots = g["proto"]                        # (B,K,D)
+        z_cls, z_s = self._dino_encode(pixel_values, z_slots)
+        self.last_graph = {k: v.detach() for k, v in g.items() if k != "A"}
+        return z_cls, z_s
 
     # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
@@ -1082,5 +1198,80 @@ if __name__ == "__main__":
     print("[ok] 损失口径: 直接预测 mean_t L1(PixelHead(Y_t), target)（无累加/cumsum）; "
           "F_hat = 最后一步的直接预测, recon = 其 L1（= loss 最后一项）; "
           "旧 loss_mode/loss_decouple 传即 TypeError, LOSS_MODES 常量已删除")
+
+    # ── 7. 方案A（GNN + 置换不变 Readout）集成路径 ──
+    #   · gnn_mode=off 必须与历史 register 路径**逐位一致**（回归保护）
+    #   · sum（replace / concat）与 proto 两条路径形状/梯度/loss 都要通
+    #   · 图表示对 patch 顺序不变（结构性主张; 完整数字见 tools/e2_permutation.py）
+    dino_g = FakeDino(dim=D, num_patches=N)
+    m_off = SRPhase1V2(dino_g, num_patches=N, dim=D,
+                       decoder_steps=square_block_starts(N))
+    out_off = m_off(x)
+    # off 路径与 §1 的 out 完全同构（同一 forward, 同参数不影响）
+    assert out_off["F_hat"].shape == (2, N, PATCH_PX)
+    assert not hasattr(m_off, "gnn") or m_off.gnn is None
+    assert m_off.gnn_mode == "off"
+
+    dino_s = FakeDino(dim=D, num_patches=N)
+    m_sum = SRPhase1V2(dino_s, num_patches=N, dim=D, gnn_mode="sum",
+                       gnn_hid=32, gnn_layers=2, gnn_k=4,
+                       decoder_steps=square_block_starts(N))
+    assert m_sum.decoder.num_specials == m_sum.num_specials == N
+    z_cls_s, z_s_s = m_sum.encode(x)
+    assert z_s_s.shape == (2, N, D), z_s_s.shape          # sum+replace: 1 向量 + K−1 register
+    out_s = m_sum(x)
+    assert out_s["F_hat"].shape == (2, N, PATCH_PX)
+    out_s["loss"].backward()
+    for name, p in [("gnn.in_proj.0.weight", m_sum.gnn.in_proj[0].weight),
+                    ("gnn.layers.0.mlp.0.weight", m_sum.gnn.layers[0].mlp[0].weight),
+                    ("gnn.proj.2.weight", m_sum.gnn.proj[2].weight),
+                    ("special_bank.pos", m_sum.special_bank.pos)]:
+        assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} 收不到梯度"
+
+    dino_c = FakeDino(dim=D, num_patches=N)
+    m_cat = SRPhase1V2(dino_c, num_patches=N, dim=D, gnn_mode="sum",
+                       gnn_inject="concat", gnn_hid=32, gnn_layers=1, gnn_k=4,
+                       decoder_steps=square_block_starts(N))
+    assert m_cat.decoder.num_specials == m_cat.num_specials + 1 == N + 1
+    assert m_cat.encode(x)[1].shape == (2, N + 1, D)
+    assert m_cat(x)["loss"].shape == ()
+
+    dino_p = FakeDino(dim=D, num_patches=N)
+    m_proto = SRPhase1V2(dino_p, num_patches=N, dim=D, gnn_mode="proto",
+                         gnn_hid=32, gnn_layers=1, gnn_k=4,
+                         decoder_steps=square_block_starts(N))
+    z_cls_p, z_s_p = m_proto.encode(x)
+    assert z_s_p.shape == (2, N, D), z_s_p.shape          # K 个原型占满槽位
+    out_p = m_proto(x)
+    assert out_p["loss"].shape == ()
+    out_p["loss"].backward()
+    assert m_proto.gnn.layers[0].mlp[0].weight.grad.abs().sum() > 0
+
+    # 非法组合立刻报错（不静默退化）
+    for kw, msg in (({"gnn_mode": "proto", "gnn_inject": "concat"}, "concat 只对"),
+                    ({"gnn_mode": "sum", "num_specials": N}, "不兼容"),
+                    ({"gnn_mode": "sum", "gnn_grid": (3, 5)}, "不符")):
+        try:
+            SRPhase1V2(FakeDino(dim=D, num_patches=N), num_patches=N, dim=D, **kw)
+            raise AssertionError(f"{kw} 应被拒绝: {msg}")
+        except AssertionError as err:
+            assert msg in str(err), f"{kw}: {err}"
+    print(f"[ok] 方案A 集成: off 回归 / sum(replace:{m_sum.decoder.num_specials}槽) / "
+          f"sum(concat:{m_cat.decoder.num_specials}槽) / proto({m_proto.decoder.num_specials}槽) "
+          f"四条路径形状+梯度全通; 非法组合（proto+concat / 显式K / grid 尺寸）报错")
+
+    # 置换不变性（结构性主张的快速回归; 完整版 tools/e2_permutation.py）
+    with torch.no_grad():
+        xg = m_proto.dinov2.embeddings(x)[:, 1:].detach()   # (B,N,D) patch 特征
+    A = m_proto.gnn.build_graph(xg)
+    z0 = m_proto.gnn(xg, A=A)["z"]
+    assert A.shape[0] == xg.shape[0]
+    worst = 0.0
+    for _ in range(5):
+        perm = torch.randperm(N)
+        z1 = m_proto.gnn(xg[:, perm], A=permute_adj(A, perm))["z"]
+        worst = max(worst, float((z0 - z1).abs().max()))
+    assert worst < 1e-5, f"置换不变性被破坏: max|Δz|={worst}"
+    print(f"[ok] 方案A 置换不变性回归: 5 随机置换 max|Δz|={worst:.2e}")
 
     print("\nALL CHECKS PASSED")

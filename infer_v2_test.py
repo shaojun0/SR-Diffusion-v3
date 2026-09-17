@@ -85,6 +85,18 @@ def parse_args():
                    help="可选挑选分块终点索引(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
+    # ── 方案A（GNN 图表示; 与训练侧一一对应, model_info.json 优先）──
+    p.add_argument("--gnn_mode", default="off", choices=["off", "sum", "proto"])
+    p.add_argument("--gnn_inject", default="replace", choices=["replace", "concat"])
+    p.add_argument("--gnn_hid", type=int, default=256)
+    p.add_argument("--gnn_layers", type=int, default=2)
+    p.add_argument("--gnn_conv", default="gin", choices=["gin", "gcn", "sage"])
+    p.add_argument("--gnn_k", type=int, default=8)
+    p.add_argument("--gnn_grid", default=None, help="'gh,gw'（与训练一致）")
+    p.add_argument("--gnn_grid_weight", type=float, default=0.0)
+    p.add_argument("--gnn_norm", default="layer", choices=["layer", "none"])
+    p.add_argument("--gnn_dropout", type=float, default=0.0)
+    p.add_argument("--gnn_lr_scale", type=float, default=1.0)
     # 注: 解码器是顺序循环（唯一路径, 见 model_v2.py OutputQueryDecoder）;
     # 2026-09-15 之前并行路径的 --recurrent* 开关已删除。
     return p.parse_args()
@@ -165,6 +177,20 @@ def main():
               f"K=N={num_patches}）: 若 strict load 形状不符, 请显式 "
               f"--num_specials {num_patches}")
 
+    # ── 方案A 结构超参: model_info.json 优先（权重形状对不上就 strict load 崩）──
+    gnn_mode = str(_pick("gnn_mode", args.gnn_mode, "off"))
+    gnn_inject = str(_pick("gnn_inject", args.gnn_inject, "replace"))
+    gnn_hid = int(_pick("gnn_hid", args.gnn_hid, 256))
+    gnn_layers = int(_pick("gnn_layers", args.gnn_layers, 2))
+    gnn_conv = str(_pick("gnn_conv", args.gnn_conv, "gin"))
+    gnn_k = int(_pick("gnn_k", args.gnn_k, 8))
+    gnn_grid = _pick("gnn_grid", args.gnn_grid, None)
+    gnn_grid = ([int(v) for v in gnn_grid.split(",")] if isinstance(gnn_grid, str)
+                and gnn_grid else gnn_grid)
+    gnn_grid_weight = float(_pick("gnn_grid_weight", args.gnn_grid_weight, 0.0))
+    gnn_norm = str(_pick("gnn_norm", args.gnn_norm, "layer"))
+    gnn_dropout = float(_pick("gnn_dropout", args.gnn_dropout, 0.0))
+
     # ── 模型: 训练好的重建权重 ──
     dino = Dinov2Model.from_pretrained(args.dino_dir)
     if getattr(dino.config, "use_mask_token", False):
@@ -187,9 +213,16 @@ def main():
                        decoder_depth=decoder_depth,
                        skip_steps=slice_start,
                        max_steps=slice_end,
-                       num_specials=num_specials,
+                       # 方案A 模式下 K 由模型自己按步集推导（显式 num_specials
+                       # 会被 SRPhase1V2 拒绝, 因为 specials 槽位由 GNN 填充）
+                       num_specials=(None if gnn_mode != "off" else num_specials),
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout)
+                       decoder_dropout=decoder_dropout,
+                       gnn_mode=gnn_mode, gnn_inject=gnn_inject,
+                       gnn_hid=gnn_hid, gnn_layers=gnn_layers,
+                       gnn_conv=gnn_conv, gnn_k=gnn_k, gnn_grid=gnn_grid,
+                       gnn_grid_weight=gnn_grid_weight, gnn_norm=gnn_norm,
+                       gnn_dropout=gnn_dropout)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)

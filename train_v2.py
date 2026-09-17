@@ -174,6 +174,28 @@ def parse_args():
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(N) "
                         "(分块起点=平方数) 再按 slice 切片; K 自动由最终步集推导")
+    # ── 模型（方案A: GNN + 置换不变 Readout; feature/DESIGN_graph_embedding_schemeA.md）──
+    p.add_argument("--gnn_mode", default="off", choices=["off", "sum", "proto"],
+                   help="方案A 图表示开关: off=register 式(默认, 与历史逐位一致); "
+                        "sum=sum Readout 出 1 个向量 z 当额外全局 token; "
+                        "proto=attention Readout 出 K 个原型占满 specials 槽位")
+    p.add_argument("--gnn_inject", default="replace", choices=["replace", "concat"],
+                   help="图表示与 register 的关系: replace=替换 specials 槽位; "
+                        "concat=保留 K 个 register 并在其后追加 1 个全局向量(仅 sum)")
+    p.add_argument("--gnn_hid", type=int, default=256, help="GNN hidden 维")
+    p.add_argument("--gnn_layers", type=int, default=2, help="GNN 消息传递层数 L")
+    p.add_argument("--gnn_conv", default="gin", choices=["gin", "gcn", "sage"],
+                   help="消息传递算子（纯 PyTorch 实现, 不依赖 torch_geometric）")
+    p.add_argument("--gnn_k", type=int, default=8, help="DINOv2 patch 特征 kNN 图的 k")
+    p.add_argument("--gnn_grid", default=None,
+                   help="把 patch 网格邻接并入图: 'gh,gw'（如 16,36 ⇔ 576 patch）")
+    p.add_argument("--gnn_grid_weight", type=float, default=0.0,
+                   help="网格邻接边权（0 = 不并入, 纯 kNN 图）")
+    p.add_argument("--gnn_norm", default="layer", choices=["layer", "none"],
+                   help="GNN 逐节点归一化（layer=LayerNorm; BatchNorm 被禁: 破坏不变性）")
+    p.add_argument("--gnn_dropout", type=float, default=0.0)
+    p.add_argument("--gnn_lr_scale", type=float, default=1.0,
+                   help="方案A 图模块参数的学习率倍率（相对全局 lr; 默认 1.0）")
     return p.parse_args()
 
 
@@ -218,6 +240,40 @@ class SRPhase1V2Trainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.can_return_loss = True   # 无 labels 模型也允许 eval 算 loss
+
+    def create_optimizer(self):
+        """默认 AdamW 分组, 但方案A 的图模块（`gnn.*`）单独一组, lr 乘
+        `--gnn_lr_scale`（默认 1.0）。
+
+        动机: GNN 是随机初始化的新模块, 而 DINOv2 是预训练权重; 同一个 lr 下
+        新模块的有效步长完全不同。--gnn_lr_scale >1 可以让图模块更快学起来,
+        <1 可以防止图模块早期噪声污染 DINO 的预训练表征。默认 1.0 = 不改历史行为。
+        """
+        model = self.model_wrapped if isinstance(self.model_wrapped, torch.nn.Module) else self.model
+        if self.optimizer is not None:
+            return self.optimizer
+        scale = float(self.gnn_lr_scale)
+        if scale == 1.0 or not any(n.startswith("gnn.") for n, _ in model.named_parameters()):
+            self.optimizer = super().create_optimizer()
+            return self.optimizer
+        decay = self.get_decay_parameter_names(model)
+        groups = [
+            {"params": [p for n, p in model.named_parameters()
+                        if n.startswith("gnn.") and p.requires_grad],
+             "lr": self.args.learning_rate * scale, "weight_decay": 0.0,
+             "name": "gnn"},
+            {"params": [p for n, p in model.named_parameters()
+                        if (not n.startswith("gnn.")) and n in decay
+                        and p.requires_grad],
+             "weight_decay": self.args.weight_decay, "name": "decay"},
+            {"params": [p for n, p in model.named_parameters()
+                        if (not n.startswith("gnn.")) and n not in decay
+                        and p.requires_grad],
+             "weight_decay": 0.0, "name": "no_decay"},
+        ]
+        cls, kwargs = self.get_optimizer_cls_and_kwargs(self.args, model)
+        self.optimizer = cls(groups, **kwargs)
+        return self.optimizer
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """eval 时忽略巨型逐采样步输出（Y_pix B×25×576×588 累积即 OOM）。
@@ -282,7 +338,19 @@ def main():
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout)
+                       decoder_dropout=args.decoder_dropout,
+                       gnn_mode=args.gnn_mode,
+                       gnn_inject=args.gnn_inject,
+                       gnn_hid=args.gnn_hid,
+                       gnn_layers=args.gnn_layers,
+                       gnn_conv=args.gnn_conv,
+                       gnn_k=args.gnn_k,
+                       gnn_grid=([int(v) for v in args.gnn_grid.split(",")]
+                                 if args.gnn_grid else None),
+                       gnn_grid_weight=args.gnn_grid_weight,
+                       gnn_norm=args.gnn_norm,
+                       gnn_dropout=args.gnn_dropout,
+                       gnn_lr_scale=args.gnn_lr_scale)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -290,6 +358,15 @@ def main():
           f"输入 {W}x{H}, patches={num_patches}, specials={K} "
           f"(序列 {1 + K + num_patches} token), decoder 采样 "
           f"{len(model.decoder.steps)} 步 {model.decoder.steps}")
+    if args.gnn_mode != "off":
+        n_gnn = sum(p.numel() for p in model.gnn.parameters())
+        print(f"[model] ★ 方案A 开启: gnn_mode={args.gnn_mode} "
+              f"inject={args.gnn_inject} conv={args.gnn_conv} "
+              f"L={args.gnn_layers} hid={args.gnn_hid} k={args.gnn_k} "
+              f"grid={args.gnn_grid} w_grid={args.gnn_grid_weight} "
+              f"norm={args.gnn_norm} | GNN 参数 {n_gnn / 1e6:.2f}M; "
+              f"z_s 槽位 {model.decoder.num_specials} 个 "
+              f"(读窗口上界 {max(model.decoder.steps)})")
     if args.num_specials:
         print(f"[model] num_specials 显式 = {K}（须 ≥ max 采样步; "
               f"复现旧 checkpoint 用, 如 K=N={num_patches}）")
@@ -355,6 +432,7 @@ def main():
         data_collator=coll,
         compute_metrics=compute_metrics if eval_ds is not None else None,
     )
+    trainer.gnn_lr_scale = args.gnn_lr_scale
 
     n_proc = trainer.accelerator.num_processes
     trainer.accelerator.print(
@@ -386,7 +464,14 @@ def main():
                 "decoder_steps": raw.decoder.steps,
                 "loss": "mean_t L1(PixelHead(Y_t), target)（直接预测, 无累加）",
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
-                "dino_dir": args.dino_dir, "dtype": "fp32"}
+                "dino_dir": args.dino_dir, "dtype": "fp32",
+                # ── 方案A（GNN 图表示）元数据; off 时 gnn_mode="off" 与历史一致 ──
+                "gnn_mode": args.gnn_mode, "gnn_inject": args.gnn_inject,
+                "gnn_hid": args.gnn_hid, "gnn_layers": args.gnn_layers,
+                "gnn_conv": args.gnn_conv, "gnn_k": args.gnn_k,
+                "gnn_grid": args.gnn_grid, "gnn_grid_weight": args.gnn_grid_weight,
+                "gnn_norm": args.gnn_norm, "gnn_dropout": args.gnn_dropout,
+                "gnn_lr_scale": args.gnn_lr_scale}
         with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
             json.dump(info, f, indent=2)
         print(f"[final] {final} 已保存 (fp32, 含 DINO 权重)")
