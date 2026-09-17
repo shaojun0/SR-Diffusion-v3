@@ -146,3 +146,7 @@ NUM_GPUS=2 ./run_v2_train.sh --data_dir /root/autodl-tmp/construction_site \
 权重（未入库，服务器 `autodl-tmp`）：
 `output/phase1_v2_bptt/final_model.pt`（1.31 GB，建议作为 Phase-1 产物）、
 `output/phase1_v2_run1_detach/final_model.pt`、`output/phase1_v2_slice05_bptt/final_model.pt`。
+
+## 9. K-sweep 原始数据
+
+BPTT K-sweep（k15 / k24 / k35c / k48 / k63 / k99 / k120）的原始 `infer_test.json` + `args.json` + md5 索引见 [`data/ksweep/`](data/ksweep/)（逐文件索引：[`data/ksweep/README.md`](data/ksweep/README.md)），对应 [`REPORT_ksweep_bptt.md`](REPORT_ksweep_bptt.md) 及 `REPORT_ksweep_<tag>.md` 分报告。
