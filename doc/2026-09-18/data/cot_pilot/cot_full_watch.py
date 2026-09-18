@@ -22,8 +22,10 @@
         cot_full_repair.py  ->  cot_full_qa.py  ->  cot_full_aggregate.py
      全部 rc==0 时写 FINALIZE_DONE；任一步失败写 FINALIZE_FAILED 且**不自动重试**
      （写 FINALIZE_ATTEMPTED 标记，避免反复重写产物），留待人工处理。
-  3) ALL_DONE 存在但计数不吻合 -> 写 WARN_ALL_DONE_MISMATCH，**不自动收尾**
-     （说明某车道中途崩过，直接收尾会把缺量当成完成）。
+  3) ALL_DONE 存在但逐数据集计数不吻合 -> 说明某车道中途崩过。**不自动收尾**
+     （否则会把缺量当成完成），改为按 handoff §1.4 自动重启全量驱动续跑
+     （幂等：已存在的 id 会跳过），最多 WATCH_RESUME_LIMIT 次（默认 2），
+     并写 WARN_ALL_DONE_MISMATCH / RESUME_ATTEMPTED。
   4) 超过 STALL_SEC 无任何新产出且无 cot_generate 进程且未完成 -> 写 WARN_STALL。
 
 用法（必须脱离会话，setsid nohup）：
@@ -50,6 +52,7 @@ INTERVAL = int(os.environ.get("WATCH_INTERVAL", "300"))
 STALL_SEC = int(os.environ.get("WATCH_STALL_SEC", "3600"))
 RSS_LIMIT_GIB = float(os.environ.get("WATCH_RSS_LIMIT_GIB", "20"))
 RESTART_SERVICES = os.environ.get("RESTART_SERVICES", "1") == "1"
+RESUME_LIMIT = int(os.environ.get("WATCH_RESUME_LIMIT", "2"))   # 自动续跑上限
 PORTS = [(8100, "0"), (8101, "1")]          # (port, CUDA_VISIBLE_DEVICES)
 
 os.makedirs(LOG, exist_ok=True)
@@ -176,6 +179,17 @@ def restart_service(port, dev):
     log("[ALERT] 重启模型服务 :%d (CUDA_VISIBLE_DEVICES=%s) -> %s/serve_%d.log" % (port, dev, LOG, port))
 
 
+def launch_driver():
+    """按 handoff §1.4 重启全量驱动。生成幂等：产物中已存在的 id 会被跳过，
+    因此只会补上缺口，不会重复生成。"""
+    lf = open(os.path.join(LOG, "driver_console.log"), "a")
+    env = dict(os.environ, PATH="/root/miniconda3/bin:" + os.environ.get("PATH", ""))
+    subprocess.Popen(["bash", "/root/translate/run_cot_full.sh"], env=env, cwd="/root",
+                     stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                     start_new_session=True)
+    log("[ALERT] 已按 handoff §1.4 重启全量驱动 run_cot_full.sh（幂等续跑）")
+
+
 def gpu_snapshot():
     try:
         o = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
@@ -231,6 +245,7 @@ def main():
     last_total, last_ts = None, time.time()
     t_start, total_start = time.time(), None
     restart_at = {}
+    resume_count, resume_at = 0, 0.0
     finalized = os.path.exists(os.path.join(LOG, "FINALIZE_ATTEMPTED"))
 
     while True:
@@ -292,8 +307,20 @@ def main():
                     finalize(exp, act)
             elif all_done and missing:
                 marker("WARN_ALL_DONE_MISMATCH", json.dumps(missing, ensure_ascii=False))
-                log("[ALERT] ALL_DONE 已出现但计数不吻合（缺口 %d 个数据集）：%s —— 不自动收尾"
+                log("[ALERT] ALL_DONE 已出现但计数不吻合（缺口 %d 个数据集）：%s"
                     % (len(missing), list(missing.items())[:5]))
+                if not gens and resume_count < RESUME_LIMIT and time.time() - resume_at > 600:
+                    resume_count += 1
+                    resume_at = time.time()
+                    try:
+                        os.remove(os.path.join(OUT, "ALL_DONE"))
+                    except Exception:
+                        pass
+                    marker("RESUME_ATTEMPTED", "count=%d missing=%s"
+                           % (resume_count, json.dumps(missing, ensure_ascii=False)))
+                    launch_driver()
+                elif not gens and resume_count >= RESUME_LIMIT:
+                    log("[ALERT] 自动续跑已达上限 %d 次，停止续跑，需人工介入（handoff §1.4）" % RESUME_LIMIT)
 
             # ---- 停滞判定 ----
             if not all_done and stall > STALL_SEC and not gens:
