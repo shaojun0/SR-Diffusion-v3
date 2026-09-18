@@ -103,7 +103,7 @@
     "hf-vision": {
       "head": {"semantics": "裸头=未戴安全帽（违规）", "clauses": ["GB55034-2022:2.0.5", "GB55034-2022:3.2.1", "GB39800.12-2025:table1-highwork"]},
       "helmet": {"semantics": "已戴安全帽（合规）", "clauses": [], "note": "可选标 compliance=true，不硬塞条款"},
-      "person": {"semantics": "待确认（是否有独立于 head/helmet 的 person 框）", "clauses": [], "open_question": "需 IoU 统计确认类别包含关系"},
+      "person": {"semantics": "人体框（210 行，616 框）；实测 210/210 行都与 helmet 同行、从无独立出现", "violation": false, "clauses": [], "note": "不单独构成违规；违规判据唯一确定为存在 head 框（1322 行）"},
       "others": {"semantics": "其他", "clauses": [], "note": "忽略"}
     },
     "hayden": {
