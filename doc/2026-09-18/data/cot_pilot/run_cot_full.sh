@@ -12,7 +12,8 @@ ALL="aswin00000__ConstructionSiteCleanedDataSet iluvvatar__wood_surface_defects 
 
 echo "[$(date +%H:%M:%S)] 等待构建完成 ..." >> "$LOG/driver.log"
 for i in $(seq 1 180); do
-  nb=$(pgrep -fc cot_build_full.py 2>/dev/null || echo 0)
+  nb=$(pgrep -fc cot_build_full.py 2>/dev/null || true)
+  nb=${nb:-0}; nb=$(echo "$nb" | head -1)
   miss=""
   for ds in $ALL; do
     grep -l "\"dataset\": \"$ds\"" "$ROOT"/manifest*.jsonl >/dev/null 2>&1 || miss="$miss $ds"
