@@ -23,12 +23,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 PRESET_OURS = [
-    ("ours 448x252 (K=576, d2, BPTT)", "/tmp/srd_eval/bptt_construction_site_test.json"),
-    ("ours 224x126 (K=144, d4, BPTT)", "/tmp/srd_eval/test_224_d4_bptt.json"),
+    ("ours 224x126 (K=144, d4, BPTT, fp32)", "/root/autodl-tmp/cot_l1/eval_224_d4/test_224_d4_bptt.json"),
+    ("ours 896x504 (K=168, d4, BPTT, fp16+8bit)",
+     "/root/autodl-tmp/cot_l1/eval_896_d4/test_896_d4_bptt_slice012.json"),
 ]
 PRESET_BASE = [
-    ("JPEG/WebP @448x252", "/tmp/srd_eval/baseline_classic.json"),
-    ("JPEG/WebP @224x126", "/tmp/srd_eval/baseline_classic_224.json"),
+    ("224x126", "/root/autodl-tmp/cot_l1/eval_224_d4/baseline_classic_224.json"),
+    ("896x504", "/root/autodl-tmp/cot_l1/eval_896_d4/baseline_classic_896.json"),
 ]
 
 
@@ -77,17 +78,18 @@ def main() -> int:
         ax.plot(b, p, "-o", ms=5, color=colors[i % len(colors)], label=name, zorder=5)
 
     styles = [("JPEG", "-s"), ("WebP", "-^"), ("AVIF", "-d")]
+    base_colors = ["tab:gray", "tab:olive", "tab:cyan", "tab:pink"]
     for j, (name, path) in enumerate(base):
         if not os.path.isfile(path):
             print(f"[skip] {name}: {path} 不存在")
             continue
-        ax.plot([], [], " ", label=f"—— {name} ——")
+        ax.plot([], [], " ", label=f"—— classic @{name} ——")
         for codec, (b, p) in load_base(path).items():
             mk = dict(styles).get(codec, "-x")
             ax.plot(b, p, mk, ms=4, lw=1.2, alpha=.85,
-                    color="tab:gray" if j % 2 == 0 else "tab:olive",
+                    color=base_colors[j % len(base_colors)],
                     linestyle="-" if j % 2 == 0 else "--",
-                    label=f"{codec} {'448x252' if j % 2 == 0 else '224x126'}")
+                    label=f"{codec} @{name}")
 
     ax.set_xscale("log")
     ax.set_xlabel("bpp (bits/pixel, β=1 estimated for ours)")
