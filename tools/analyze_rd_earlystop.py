@@ -195,7 +195,11 @@ def make_plot(path, tag, T, bpps, fixed_psnr, rows, cl1, hist_best, oracle, hull
 def report(tag: str, d: dict, args) -> None:
     T = list(d["decoder_steps"])
     M = len(T)
-    px = args.px
+    # bpp 分母/β 优先取 json 自带的（避免 448×252 的默认值污染 224×126 的结果）
+    px = int(d.get("bpp_px") or args.px)
+    beta = float(d.get("bpp_beta") or args.beta)
+    if px != args.px:
+        print(f"[note] bpp 口径取 json: px={px}, beta={beta}（CLI 传的是 px={args.px}）")
     l1 = np.array(d.get("step_pixel_l1_255") or d.get("step_l1"), np.float64)
     mse = d.get("step_mse_255")
     psnr = d.get("step_psnr")
@@ -206,7 +210,7 @@ def report(tag: str, d: dict, args) -> None:
     psnrc = d.get("step_psnr_content")
     per_image = d.get("per_image")
     tokens = np.array([t + 1 for t in T], np.float64)
-    bpps = tokens * args.d * args.beta / px
+    bpps = tokens * args.d * beta / px
 
     print("=" * 92)
     print(f"[{tag}]  n={d.get('n')}  K={d.get('num_specials')}  input={d.get('input')}  "
@@ -255,7 +259,7 @@ def report(tag: str, d: dict, args) -> None:
 
     eps_grid = args.eps_grid
     rows, idx_cache, cl1, cmse, tok = adaptive_sweep(
-        per_image, T, args.d, px, args.beta, eps_grid, args.hysteresis, args.min_idx)
+        per_image, T, args.d, px, beta, eps_grid, args.hysteresis, args.min_idx)
     fixed_psnr = psnr_from_mse(cmse.mean(axis=0))
     fixed_l1 = cl1.mean(axis=0)
 
@@ -285,7 +289,7 @@ def report(tag: str, d: dict, args) -> None:
 
     # ── Oracle gap ──
     i_or = np.argmin(cl1, axis=1)
-    or_bpp = float((tok[i_or] * args.d * args.beta / px).mean())
+    or_bpp = float((tok[i_or] * args.d * beta / px).mean())
     or_psnr = float(psnr_from_mse(cmse[np.arange(len(i_or)), i_or].mean()))
     print(f"\n  (4) Oracle（逐图取最优 t）: 平均 bpp={or_bpp:.3f}  PSNR={or_psnr:.2f} dB | "
           f"同 bpp 下固定 t={interp_at(bpps, fixed_psnr, or_bpp):.2f} dB "

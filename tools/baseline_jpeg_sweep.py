@@ -40,6 +40,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只用前 N 张（0=全量）")
     ap.add_argument("--w", type=int, default=448)
     ap.add_argument("--h", type=int, default=252)
+    ap.add_argument("--ours", default=None,
+                    help="同分辨率的我们模型 infer json（用于同 bpp 对比表；"
+                         "不传则只出基线自身曲线）")
     ap.add_argument("--jpg_q", default="3,5,8,10,15,20,25,30,40,50,60,70,80,90")
     ap.add_argument("--webp_q", default="3,5,10,15,20,30,40,50,60,70,80,90")
     args = ap.parse_args()
@@ -108,10 +111,11 @@ def main() -> int:
     for r in rows:
         print(f"{r['codec']:>6}{r['quality']:>5}{r['bpp']:>10.4f}{r['psnr']:>10.2f}")
 
-    # 与我们的曲线对比（同 bpp 插值）
-    ours = "/root/autodl-tmp/cot_l1/eval_psnr/bptt_construction_site_test.json"
+    # 与我们的曲线对比（同 bpp 插值）。⚠️ 必须传**同一分辨率**模型的 json，
+    # 否则是拿 224×126 的基线 bpp 去插 448×252 的曲线（2026-09-22 踩过）。
+    ours = args.ours
     cmp_tbl = []
-    if os.path.isfile(ours):
+    if ours and os.path.isfile(ours):
         with open(ours) as f:
             d = json.load(f)
         b = np.array(d["step_bpp_beta1"], float)

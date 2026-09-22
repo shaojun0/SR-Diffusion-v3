@@ -140,19 +140,37 @@ def ms_ssim(gt, rec):
     w = torch.tensor([0.299, 0.587, 0.114], device=gt.device, dtype=gt.dtype)
     x = (gt * w.view(1, 3, 1, 1)).sum(1, keepdim=True)
     y = (rec * w.view(1, 3, 1, 1)).sum(1, keepdim=True)
-    if min(x.shape[-2:]) < 176:
+    n = ms_ssim_n_scales(x.shape[-2], x.shape[-1])
+    if n == 0:
         return torch.full((gt.shape[0],), float("nan"), device=gt.device)
+    wts = np.asarray(_MS_SSIM_WEIGHTS[:n], np.float64)
+    wts = wts / wts.sum()          # 尺度数不足时按比例重归一
     g = _gauss_1d(11, 1.5, gt.device, gt.dtype)
     out = None
-    for i, wt in enumerate(_MS_SSIM_WEIGHTS):
+    for i in range(n):
         ssim, cs = _ssim_cs(x, y, g)
-        if i < len(_MS_SSIM_WEIGHTS) - 1:
+        wt = float(wts[i])
+        if i < n - 1:
             v = cs.mean(dim=(1, 2, 3)).clamp(min=1e-6) ** wt
             x, y = F.avg_pool2d(x, 2), F.avg_pool2d(y, 2)
         else:
             v = ssim.mean(dim=(1, 2, 3)).clamp(min=1e-6) ** wt
         out = v if out is None else out * v
     return out
+
+
+def ms_ssim_n_scales(H: int, W: int, win: int = 11) -> int:
+    """本图尺寸能用几个 MS-SSIM 尺度（标准 5 尺度在 224×126 上放不下）。
+
+    每级做 valid Gaussian 卷积, 要求该级 min(H,W) ≥ win。224×126 → 126,63,31,15
+    ⇒ n=4；448×252 → 252,126,63,31,15 ⇒ n=5（与 pytorch_msssim 一致）。
+    尺度数不足时权重按比例重归一（论文里必须声明用了几个尺度）。
+    """
+    m = min(H, W)
+    n = 0
+    while n < len(_MS_SSIM_WEIGHTS) and (m >> n) >= win:
+        n += 1
+    return n
 
 
 def psnr_from_mse(mse):
@@ -488,6 +506,7 @@ def main():
         "trivial_black_l1_content_255": float(triv_l1_c),
         "trivial_black_psnr_content": triv_psnr_c,
         "ms_ssim_available": bool(do_ssim),
+        "ms_ssim_scales": int(ms_ssim_n_scales(H, W)),
         "bpp_beta": 1.0,
         "bpp_px": int(PX),
         "step_bpp_beta1": [float(bpp_of(t)) for t in T_steps],
