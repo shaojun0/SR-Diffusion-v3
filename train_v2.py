@@ -29,8 +29,12 @@ SR-Diffusion Phase 1 v2 — 训练（test 分支: 注意力机制改写后, 像�
 2026-08-27 训练口径调整（用户要求, 沿自上轮）:
     · 去掉加权体系: 全部采样步**平权**（loss = mean_t L1, 无 density/
       uniform/capability 权重）—— decoder 的 loss_weight 机制已整块删除;
-    · 全 fp32 训练: 训练/评估不用 bf16/fp16 —— 公平性（之前 bf16 算
-      fp32 存被质疑）; TrainingArguments 不设 bf16/fp16, 不套 autocast;
+    · 全 fp32 训练（**默认口径**）: 训练/评估不用 bf16/fp16 —— 公平性（之前
+      bf16 算 fp32 存被质疑）; TrainingArguments 默认不设 bf16/fp16, 不套 autocast。
+      ⚠️ 2026-09-22 起新增 **`--fp16`**（AMP: autocast + GradScaler, 权重仍
+      fp32）与 **`--optim`**（如 `adamw_bnb_8bit` = bitsandbytes 8-bit AdamW）
+      两个开关, **默认值 = 上面的历史口径逐位不变**; 高分辨率（896×504）上
+      实测 fp32→fp16+8bit 把 448 ms/img 压到 102 ms/img（见 tools/run_896_*.sh）。
     · batch_size 默认提高到 16/卡（97GB 显存充裕）。
 
 2026-09-02（K 与 N 解耦 + 修复 train/infer 与 model_v2.py 的接口脱节）:
@@ -136,6 +140,16 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=8)
+    # ── 精度 / 优化器（2026-09-22 新增; 默认值与历史行为逐位一致）──
+    p.add_argument("--fp16", action="store_true",
+                   help="fp16 混合精度（AMP: autocast + GradScaler, 由 accelerate "
+                        "接管; 模型权重与 final_model.pt 仍为 fp32）。默认关 = 纯 "
+                        "fp32（历史基线口径）。实测 896×504/d4 上 448→102 ms/img")
+    p.add_argument("--optim", default="",
+                   help="优化器（转发给 TrainingArguments.optim）: **留空 = 不传, 用库默认**"
+                        "（transformers 5.16.1 实测 = adamw_torch_fused, 与历史各臂一致）; "
+                        "可显式指定 adamw_torch / adamw_torch_fused / adamw_bnb_8bit"
+                        "（8-bit AdamW, 需 bitsandbytes）/ paged_adamw_8bit …")
     p.add_argument("--limit", type=int, default=0, help="只用前 N 条训练样本(调试)")
     p.add_argument("--eval_limit", type=int, default=0, help="eval 只用前 N 条(冒烟)")
     p.add_argument("--eval_every", type=int, default=2000)
@@ -328,6 +342,8 @@ def main():
     print("[model] 损失: 直接预测 mean_t L1(PixelHead(Y_t), target) "
           "（每个采样步各自直接预测整图, 无累加/集成; 各步平权深监督）"
           " | F_hat = 最后一步的直接预测, recon = 其 L1 (= loss 最后一项)")
+    print(f"[train] 精度: {'fp16 混合精度（autocast+GradScaler, 权重 fp32）' if args.fp16 else '纯 fp32（不套 autocast）'}"
+          f" | 优化器: {args.optim or '库默认（不传 optim）'}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -364,8 +380,15 @@ def main():
         report_to=[],                  # 不上报 wandb / tensorboard
         remove_unused_columns=False,   # 原始 dict 样本交给 V2Collator
         ddp_find_unused_parameters=False,
-        # 全 fp32: 不设 bf16/fp16, 不套 autocast
+        # fp16 混合精度（默认关 = 历史口径「全 fp32, 不套 autocast」）:
+        # fp16=True ⇒ accelerate mixed_precision="fp16" ⇒ autocast + GradScaler,
+        # 权重仍 fp32（final_model.pt 不变）; eval 默认 fp16_full_eval=False 走 fp32。
+        fp16=args.fp16,
     )
+    # --optim 留空 ⇒ **不传**（保持 TrainingArguments 的库默认, 本环境 =
+    # adamw_torch_fused = 历史各臂实际用的那个）; 显式给了才覆盖。
+    if args.optim:
+        training_args.optim = args.optim
 
     trainer = SRPhase1V2Trainer(
         model=model,
@@ -381,7 +404,9 @@ def main():
         f"[train] {len(train_ds)} 样本 | 每卡 bs={args.batch_size} "
         f"x {n_proc} 卡 | grad_accum={args.grad_accum} | "
         f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步 "
-        f"| warmup {warmup_steps} 步")
+        f"| warmup {warmup_steps} 步 "
+        f"| 实际优化器={training_args.optim} fp16={training_args.fp16} "
+        f"(真实优化步按 Trainer 口径, 与 grad_accum 有关)")
 
     if args.resume:
         trainer.accelerator.print(f"[resume] 从 {args.resume} 恢复 (Trainer checkpoint)")
