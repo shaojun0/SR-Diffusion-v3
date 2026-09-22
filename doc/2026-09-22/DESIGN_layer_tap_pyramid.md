@@ -8,6 +8,11 @@
 > 立项动机（仓库内诊断）：[`ANALYSIS_texture_vs_decoder_routing.md`](ANALYSIS_texture_vs_decoder_routing.md)
 > §1 —— 当前代码**只用末层**（`model_v2.py:_encode_register` 跑完 24 层 → `layernorm` →
 > 取 `z_cls/z_s`），**没有任何浅层 tap**；若纹理真在浅层，我们现在是 100% 丢弃。
+>
+> **📌 实测结果（2026-09-22 当天已跑完）→ [`REPORT_layer_tap_pyramid_224.md`](REPORT_layer_tap_pyramid_224.md)**：
+> 绝对画质 **输 0.80 dB**（13.34 vs 12.02 px），但曲线**从平线变成真有斜率**
+> （跨度 1.69 dB vs 0.30 dB；首末步跨图相关 0.9623 vs 0.9979）。
+> ⇒ 本文只描述**已实现并验证**的口径；结论与解读看 REPORT。
 
 ---
 
