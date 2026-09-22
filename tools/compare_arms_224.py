@@ -117,23 +117,31 @@ def main() -> int:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
+        # 服务器 matplotlib 无 CJK 字体 ⇒ 图内标签一律 ASCII（中文名只用于终端表格）
+        def _ascii(name):
+            short = name.split()[0]
+            if "金字塔" in name or "tap" in short:
+                return f"{short} layer pyramid"
+            return f"{short} square/deep"
+
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.6, 4.8))
         colors = ["tab:gray", "tab:blue", "tab:red", "tab:green"]
         for k, (name, d, _) in enumerate(data):
             c = colors[k % len(colors)]
+            lab = _ascii(name)
             ax1.plot(d["step_bpp_beta1"], d["step_psnr"], "-o", ms=4, color=c,
-                     label=f"{name}  best {max(d['step_psnr']):.2f} dB")
+                     label=f"{lab}  best {max(d['step_psnr']):.2f} dB")
             steps_i = list(range(1, len(d["decoder_steps"]) + 1))
-            ax2.plot(steps_i, d["step_psnr"], "-o", ms=4, color=c, label=f"{name} PSNR")
+            ax2.plot(steps_i, d["step_psnr"], "-o", ms=4, color=c, label=f"{lab} PSNR")
             ax2.plot(steps_i, d["step_pixel_l1_255"], "--s", ms=3, color=c, alpha=.55,
-                     label=f"{name} L1")
+                     label=f"{lab} L1")
         ax1.set_xscale("log")
         ax1.set_xlabel("bpp (beta=1 estimated)")
         ax1.set_ylabel("PSNR (dB)")
         ax1.set_title("224x126 RD: base / slice1 / tap (construction_site test n=3004)")
         ax1.grid(alpha=.3, which="both")
         ax1.legend(fontsize=7)
-        ax2.set_xlabel("decoder step index (1-based, 各臂自己的步集)")
+        ax2.set_xlabel("decoder step index (1-based, within each arm's own step set)")
         ax2.set_ylabel("PSNR (dB) / pixel L1 (0-255)")
         ax2.set_title("progressive curves (solid=PSNR, dashed=L1)")
         ax2.grid(alpha=.3)
