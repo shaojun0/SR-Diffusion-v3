@@ -302,8 +302,10 @@ def main():
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
           f"{'  ← 加宽: 前后 Linear 投影' if model.decoder.stack_dim != dino.config.hidden_size else '  (未加宽)'}")
+    _carry = ("detach（步间梯度截断）" if getattr(model.decoder, "carry_detach", False)
+              else "BPTT（不 detach, 循环 carry 反传）")
     print(f"[model] 解码器: 顺序循环（唯一路径）| 每步只读自己那块 z_s 切片, "
-          f"上一步输出（detach）喂回当下一步查询 ⇒ 步间无梯度回流, wall-clock "
+          f"上一步输出以 **{_carry}** 喂回当下一步查询 ⇒ wall-clock "
           f"长于旧并行路径（以时间换跨步信息流）")
     print("[model] 损失: 直接预测 mean_t L1(PixelHead(Y_t), target) "
           "（每个采样步各自直接预测整图, 无累加/集成; 各步平权深监督）"

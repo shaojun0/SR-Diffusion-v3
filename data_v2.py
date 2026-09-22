@@ -180,7 +180,10 @@ class V2Collator:
         out = {"pixel_values": torch.stack(xs)}
         if self.return_mask:
             out["content_mask"] = torch.stack(masks)          # (B,H,W) bool
-        out["image_path"] = [it.get("image_path") for it in batch]
+            # ⚠️ image_path 必须与 content_mask 同开关: Trainer 会把 collator 的**所有**
+            # key 当 kwargs 传给 model.forward, 多一个 key 就是 TypeError
+            # （2026-09-22 冒烟实测: forward() got an unexpected keyword argument）。
+            out["image_path"] = [it.get("image_path") for it in batch]
         if self.tokenizer is not None:
             # 文字: template(+隐患) → tokenize(截断) → batch 内动态 padding
             texts = [self._format_text(it["image_caption"], it["violations"])

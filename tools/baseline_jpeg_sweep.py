@@ -26,8 +26,6 @@ from PIL import Image, ImageOps
 
 from data_v2 import fit_to_canvas
 
-W, H = 448, 252
-PX = W * H
 
 
 def psnr(a: np.ndarray, b: np.ndarray) -> float:
@@ -40,9 +38,14 @@ def main() -> int:
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0, help="只用前 N 张（0=全量）")
+    ap.add_argument("--w", type=int, default=448)
+    ap.add_argument("--h", type=int, default=252)
     ap.add_argument("--jpg_q", default="3,5,8,10,15,20,25,30,40,50,60,70,80,90")
     ap.add_argument("--webp_q", default="3,5,10,15,20,30,40,50,60,70,80,90")
     args = ap.parse_args()
+    global W, H, PX
+    W, H = args.w, args.h
+    PX = W * H
 
     from datasets import load_dataset
     files = sorted(glob.glob(os.path.join(args.data_dir, "test-*.parquet")))

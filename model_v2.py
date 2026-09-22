@@ -461,6 +461,12 @@ class OutputQueryDecoder(nn.Module):
                                   skip_steps, max_steps)
         S = self.num_specials + 1                                # z_cls + K z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
+        # ── 循环 carry 的梯度口径开关（2026-09-22 显式化, 之前只能靠改本文件）──
+        # False = BPTT：Y_{t-1} 参与反传，存在"让 Y_{t-1} 成为对下一步有用的草稿"
+        #         的梯度通路（实测：L1(t) 才有单调下降的阶梯，见
+        #         doc/2026-09-22/REPORT_batch0_rd_earlystop.md §2b）。
+        # True  = detach（历史默认）：步间梯度截断，各步解耦；实测 24 步曲线是**平线**。
+        self.carry_detach = False                                # [BPTT] 本次实验口径
         # 标准解码器堆叠: nn.TransformerDecoder 内部按 num_layers 深拷贝同一
         # decoder_layer 并顺序执行（含逐层传掩码）, 无需手写循环。每层 =
         # 自注意力 + 交叉注意力(memory=A) + FFN + 残差, 各层共享同一 memory
@@ -514,18 +520,10 @@ class OutputQueryDecoder(nn.Module):
             Y = self.stack(self.stack_in(Y), A_in[:, lo:hi + 1])
             Y = self.stack_out(Y)
             Y_total.append(Y)                                    # 该步全部 patch 预测
-            # carry detach（**当前唯一行为, 没有开关**）: 步间不反传 ⇒ 每步 Y_t
-            # 只从自己那一步的损失收 1 份梯度（decode 侧无累加, 不存在跨步恒等
-            # 捷径 ⇒ 全局按步解耦）。前向数值与不 detach 逐位相同 ⇒ 各步预测 /
-            # loss 数值不变, 只是梯度图被切断。**代价（实测）**: ①∂L_t/∂Y_{t-1}=0,
-            # 即循环只有前向耦合、BPTT 被关闭——没有任何损失项要求 Y_{t-1} 成为
-            # "对下一步有用的草稿"; ②query_base 只从 step0 的损失收梯度
-            # （∂L_t/∂query_base=0 for t≥1, 因喂给下一步的 query 被 detach）,
-            # 而 step0 恰是读窗口最小的那一步。注意这与设计文档
-            # doc/2026-09-15/DESIGN_v2_recurrent.md §2.4 记的默认
-            # （recurrent_detach=False = 整条循环反传 BPTT）**不一致**: 那些开关
-            # 已随并行路径删除, 本行是唯一路径; 需要 BPTT 的口径只能改这里。
-            Y = (self.query_base + Y).detach()                    # 喂给下一步当查询
+            # carry 口径由 self.carry_detach 决定（见 __init__ 注释）:
+            # False = BPTT（本次实验）; True = 历史默认 detach。前向数值两者逐位相同。
+            Y = ((self.query_base + Y).detach() if self.carry_detach
+                 else self.query_base + Y)                           # 喂给下一步当查询
         Y = torch.stack(Y_total, dim=1)                          # (B,|T|,N,D) 沿步
         self.last_Y = Y                                          # 采样步全部 patch 预测
         return Y
