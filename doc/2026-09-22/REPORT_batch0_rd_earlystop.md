@@ -339,6 +339,15 @@ JPEG/WebP 的文件头 ≈ 600 B = 4,800 bit。224×126 = 28,224 px ⇒ **光容
 这意味着"把 codec 做得更好"仍有一根**没动过的杠杆**（估算 +4.5 dB @448），
 但即便拉满也仍落后 WebP，所以论文价值仍在 E8（任务保真）与极低码率独占区。
 
+> **2026-09-22 晚补（同日后续实验）**：上面"没动过的杠杆"指 P1-1/P1-2（解码器逐 patch 路由）。
+> 同晚另外把 **"tap 浅层特征"这条候选也实测了**（`--layer_tap` 逐层 tap 金字塔，
+> 与 §10 的 224×126/d4/BPTT 基线构成单变量对照）：像素 L1 **13.34 vs 12.02**（−0.80 dB）、
+> 每个 t 都输，**但曲线由"平线"变"真有斜率"**（PSNR 跨度 0.30→1.69 dB；§10.6 的
+> "72 倍码率换 +0.30 dB"在 tap 上变成有阶梯）
+> ⇒ 见 [`REPORT_layer_tap_pyramid_224.md`](REPORT_layer_tap_pyramid_224.md)。
+> **本节的判读不变：浅层 tap 不能替代修路由**；§10.6"瓶颈不是 token 预算"进一步被支持
+> （换向量来源能改形状，但改不了天花板）。
+
 > 产物：`doc/2026-09-22/data/rd_224_d4_bptt.{png,json}`、`rd_compare_all.png`、
 > `baseline_classic_224.json`；原始逐图 json 在服务器
 > `/root/autodl-tmp/cot_l1/eval_224_d4/{test,train1k}_224_d4_bptt.json`。
