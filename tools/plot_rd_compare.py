@@ -24,11 +24,14 @@ import numpy as np  # noqa: E402
 
 PRESET_OURS = [
     ("ours 224x126 (K=144, d4, BPTT, fp32)", "/root/autodl-tmp/cot_l1/eval_224_d4/test_224_d4_bptt.json"),
+    ("ours 448x252 (K=576, d2, BPTT, fp16+8bit)",
+     "/root/autodl-tmp/cot_l1/eval_448_d2/test_448_d2_bptt_fp16_8bit.json"),
     ("ours 896x504 (K=168, d4, BPTT, fp16+8bit)",
      "/root/autodl-tmp/cot_l1/eval_896_d4/test_896_d4_bptt_slice012.json"),
 ]
 PRESET_BASE = [
     ("224x126", "/root/autodl-tmp/cot_l1/eval_224_d4/baseline_classic_224.json"),
+    ("448x252", "/root/autodl-tmp/cot_l1/eval_448_d2/baseline_classic_448.json"),
     ("896x504", "/root/autodl-tmp/cot_l1/eval_896_d4/baseline_classic_896.json"),
 ]
 
