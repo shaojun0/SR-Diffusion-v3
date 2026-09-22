@@ -54,6 +54,29 @@ MS-SSIM 为**自实现**（5 尺度 / Y 通道 / Gaussian 11,σ=1.5 / 标准权�
 
 ---
 
+## 2b. E5 对照：BPTT vs detach（同一份代码，只差 `model_v2.py:528` 的 `.detach()`）
+
+两臂都是 construction_site test **3,004 张**、K=576、24 步，用**同一个**新推理脚本跑：
+
+| | **BPTT** | **detach** |
+|---|---:|---:|
+| L1 单调下降前缀 | **18/24** | **2/24** |
+| 全局最优 `t` | **324** | 4 |
+| L1 @ `t=1` → 最优 | 19.096 → **16.377** | 23.647 → 23.643 |
+| **PSNR @ `t=1` → 最优** | 18.15 → **19.01** | 16.44 → **16.44** |
+| MS-SSIM @ `t=576` | **0.5971** | 0.4625 |
+| 曲线形状 | **真 RD 曲线** | **一条平线**（涨落 ±0.02，纯噪声） |
+| 内容区 PSNR @最优 | **17.92** | 15.36 |
+| oracle 凸包天花板 | +0.129 dB | **+0.002 dB** |
+| 首步 vs 末步跨图相关 | 0.9785 | **0.9994** |
+| 能否支撑 C2a | ✅ | ❌ |
+
+**最锋利的一句话**：detach 模型**在 0.018 bpp（t=1，2 个 token）就已经 18.15 dB，
+比它自己跑满 5.234 bpp 的 16.43 dB 还高 1.7 dB** —— 给它再多 token 也**用不上**。
+所以"传多少 token"这个问题只在 BPTT 模型上才有意义，E5 从"可选消融"正式升格为 **E4 的前置条件**。
+
+---
+
 ## 3. E4b：内容自适应早停 —— **负结论**（这是本次最重要的发现）
 
 停判据 `t* = min{t_i : rel(t_i) < ε_rel 且 rel(t_{i+1}) < ε_rel}`（滞回 2 步，`min_idx=1`）：
@@ -131,13 +154,17 @@ MS-SSIM 为**自实现**（5 尺度 / Y 通道 / Gaussian 11,σ=1.5 / 标准权�
   （主图用的是已有的 BPTT 权重）。
 - 实测**并发跑零风险**：推理峰值约 4 GB（GPU0 空闲 9.7 GB），训练进程全程存活；
   代价只是训练瞬时速率 1.83 → ~2.6 s/it（25 分钟，约合 10 分钟训练时间）。
-- 但**正在跑的这条训练是 `detach`**，按 PLAN §E5 它**不能支撑早停主线**（detach 臂 mpl=2/24）。
+- 但**正在跑的这条训练是 `detach`**，而 §2b 刚刚用新指标把它钉死了：detach 的 RD 曲线是**一条平线**
+  （单调前缀 2/24、跑满 576 的 PSNR 与 t=1 相同、甚至更低）⇒ 它**不能支撑 C2a 主图**。
   三个选项：
   | 选项 | 代价 | 得到 |
   |---|---|---|
-  | (a) 不动，让它跑完（≈09-23 06:00） | 0 | E7 的"数据规模"结论（BASE vs BIG，同为 detach） |
+  | (a) 不动，让它跑完（≈09-23 06:00） | 0 | E7 的"数据规模"结论（BASE vs BIG，同为 detach；BIG 的曲线同样是平的） |
   | (b) 等 step 10000 出 checkpoint-10000（≈16:04）→ 停 → 换 BPTT 重跑 | 丢 0 | 可 resume；但仍是 detach 配方 |
-  | (c) 立刻 kill → 改 BPTT（去掉 `model_v2.py:528` 的 `.detach()`）跑 8,760 步（≈5 h） | 丢 3h26m | **一个真正可支撑 C2a 的域内模型**（CoT 68k 上） |
+  | (c) 立刻 kill → 改 BPTT（去掉 `model_v2.py:528` 的 `.detach()`）跑 8,760 步（≈5 h） | 丢 3h26m | **一个真正可支撑 C2a 的域内模型**（CoT 68k 上，且能与 7,009 张的 BASE 做数据规模对照） |
+
+> 说明：选项 (a) 的代价不是"浪费 GPU"，而是**论文主图只能在 construction_site（7,009 张训练）
+> 的 BPTT 模型上做**，拿不到"CoT 68k 域内 + 可早停"的版本。
 
 ---
 
@@ -156,7 +183,10 @@ MS-SSIM 为**自实现**（5 尺度 / Y 通道 / Gaussian 11,σ=1.5 / 标准权�
 
 | 产物 | 位置 |
 |---|---|
-| 逐图逐 step 原始 json（12.6 MB） | 服务器 `/root/autodl-tmp/cot_l1/eval_psnr/bptt_construction_site_test.json` |
-| 曲线 json（画图用） | [`data/rd_bptt_construction_site.json`](data/rd_bptt_construction_site.json) |
-| 三张图 | [`data/rd_bptt_construction_site.png`](data/rd_bptt_construction_site.png) |
+| 逐图逐 step 原始 json（12.6 MB × 2） | 服务器 `/root/autodl-tmp/cot_l1/eval_psnr/{bptt,detach}_construction_site_test.json` |
+| BPTT 曲线 json / 三张图 | [`data/rd_bptt_construction_site.json`](data/rd_bptt_construction_site.json) / [`data/rd_bptt_construction_site.png`](data/rd_bptt_construction_site.png) |
+| detach 曲线 json / 三张图 | [`data/rd_detach_construction_site.json`](data/rd_detach_construction_site.json) / [`data/rd_detach_construction_site.png`](data/rd_detach_construction_site.png) |
 | 分析命令 | `python tools/analyze_rd_earlystop.py <json> --plot out.png --save-json out.json` |
+
+> 两臂的原始 eval 耗时：BPTT 13.5 min（14:21:05→14:34:32）、detach 14.1 min（14:34:32→14:48:37），
+> 全程与训练并发（GPU0 空闲 9.7 GB，推理峰值约 4 GB），训练进程零中断。
