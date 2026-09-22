@@ -61,10 +61,15 @@ def fit_angle(w: int, h: int, cw: int = CANVAS_W, ch: int = CANVAS_H,
 def fit_to_canvas(img: Image.Image, canvas=(CANVAS_W, CANVAS_H),
                   angle_step: float = 0.5,
                   resample: int = Image.BICUBIC,
-                  fill=(0, 0, 0)) -> Image.Image:
+                  fill=(0, 0, 0),
+                  return_box: bool = False):
     """img → 旋转到最优角度 → 均匀缩放 → 居中填充到 canvas。返回 PIL RGB。
 
     输出恒为 (canvas_w, canvas_h)。内容零拉伸（各向同性缩放）。
+
+    return_box=True 时返回 ``(out, box)``，``box = (left, top, nw, nh)`` 是内容在
+    画布中的粘贴框。**仅供评测侧构造"内容区 mask"用**（PLAN §5 的 padding 问题）；
+    默认 False ⇒ 老调用方行为逐位不变（训练路径不受影响）。
     """
     w, h = img.size
     theta = fit_angle(w, h, canvas[0], canvas[1], angle_step)
@@ -77,7 +82,10 @@ def fit_to_canvas(img: Image.Image, canvas=(CANVAS_W, CANVAS_H),
     if (nw, nh) != (bw, bh):
         img = img.resize((nw, nh), resample)                    # 均匀缩放
     out = Image.new("RGB", canvas, fill)
-    out.paste(img, ((canvas[0] - nw) // 2, (canvas[1] - nh) // 2))
+    box = ((canvas[0] - nw) // 2, (canvas[1] - nh) // 2, nw, nh)
+    out.paste(img, box[:2])
+    if return_box:
+        return out, box
     return out
 
 
@@ -109,6 +117,7 @@ class ParquetImageDataset(Dataset):
         im = row["image"]
         return {
             "image_bytes": im["bytes"] if isinstance(im, dict) else im,
+            "image_path": im.get("path") if isinstance(im, dict) else None,
             "image_caption": row.get("image_caption"),
             "violations": row.get("violations"),
         }
@@ -126,7 +135,8 @@ class V2Collator:
     def __init__(self, model_size=(448, 252), canvas=(CANVAS_W, CANVAS_H),
                  angle_step: float = 0.5, tokenizer=None,
                  max_text_len: int = 256, pad_token_id: int = 0,
-                 text_template: str = DEFAULT_TEXT_TEMPLATE):
+                 text_template: str = DEFAULT_TEXT_TEMPLATE,
+                 return_mask: bool = False):
         self.model_w, self.model_h = model_size
         assert abs(self.model_w / self.model_h - canvas[0] / canvas[1]) < 1e-6, \
             "模型输入必须与画布同为 16:9, 否则缩放会变形"
@@ -135,6 +145,9 @@ class V2Collator:
         self.max_text_len = max_text_len
         self.pad_token_id = pad_token_id
         self.text_template = text_template
+        # return_mask=True ⇒ 额外返回 "content_mask" (B, H, W) bool（True=真内容,
+        # False=letterbox padding）。**只给评测用**，默认 False ⇒ 训练路径零变化。
+        self.return_mask = return_mask
 
     def _format_text(self, caption, violations) -> str:
         cap = caption or ""
@@ -145,15 +158,29 @@ class V2Collator:
 
     def __call__(self, batch: list) -> dict:
         xs = []
+        masks = []
         for item in batch:
             img = Image.open(io.BytesIO(item["image_bytes"]))
             img = ImageOps.exif_transpose(img).convert("RGB")
-            img = fit_to_canvas(img, self.canvas, self.angle_step)
+            if self.return_mask:
+                img, box = fit_to_canvas(img, self.canvas, self.angle_step,
+                                         return_box=True)
+            else:
+                img = fit_to_canvas(img, self.canvas, self.angle_step)
             img = img.resize((self.model_w, self.model_h), Image.BICUBIC)
+            if self.return_mask:
+                l, t, bw_, bh_ = box
+                m = Image.new("L", self.canvas, 0)
+                m.paste(Image.new("L", (bw_, bh_), 255), (l, t))
+                m = m.resize((self.model_w, self.model_h), Image.NEAREST)
+                masks.append(torch.from_numpy(np.asarray(m) > 127))
             arr = np.asarray(img, np.float32)
             arr = (arr - DINO_MEAN) / DINO_STD
             xs.append(torch.from_numpy(arr).permute(2, 0, 1))
         out = {"pixel_values": torch.stack(xs)}
+        if self.return_mask:
+            out["content_mask"] = torch.stack(masks)          # (B,H,W) bool
+        out["image_path"] = [it.get("image_path") for it in batch]
         if self.tokenizer is not None:
             # 文字: template(+隐患) → tokenize(截断) → batch 内动态 padding
             texts = [self._format_text(it["image_caption"], it["violations"])
