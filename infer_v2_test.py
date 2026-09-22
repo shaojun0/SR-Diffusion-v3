@@ -80,6 +80,11 @@ def parse_args():
                         "0=与 dim 相同。model_info.json 有 stack_dim 字段时以它为准")
     p.add_argument("--decoder_dropout", type=float, default=0.0,
                    help="self.stack 的 dropout(与训练一致; eval 推理下不生效, 但构造须对齐)")
+    p.add_argument("--layer_tap", action="store_true",
+                   help="DINOv2 逐层 tap（金字塔读出, 与训练一致）。⚠️ 两种模式"
+                        "**权重形状完全相同**, 传错不会报错只会算错 ⇒ 一律以训练侧"
+                        "model_info.json 的 layer_tap 为准（本开关仅在旧产物缺该"
+                        "字段时兜底）")
     p.add_argument("--slice_start", type=int, default=None,
                    help="可选挑选分块起点索引(与训练 --slice_start 一致); 默认 None = 全部分块")
     p.add_argument("--slice_end", type=int, default=None,
@@ -235,6 +240,9 @@ def main():
     slice_end = _pick("slice_end", args.slice_end, None)
     stack_dim = int(_pick("stack_dim", args.stack_dim, 0))
     decoder_dropout = float(_pick("decoder_dropout", args.decoder_dropout, 0.0))
+    # layer_tap: 读窗口口径（金字塔 vs 平方块）。两种模式权重形状相同 ⇒ 必须
+    # 以 model_info.json 为准, 否则会静默按错误口径推理（旧产物无此字段 = False）
+    layer_tap = bool(_pick("layer_tap", args.layer_tap, False))
     if steps is None and train_info is not None and "decoder_steps" in train_info:
         steps = [int(s) for s in train_info["decoder_steps"]]
     # num_specials(K) 解析: ① model_info.json 优先; ② --num_specials CLI;
@@ -278,7 +286,8 @@ def main():
                        max_steps=slice_end,
                        num_specials=num_specials,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout)
+                       decoder_dropout=decoder_dropout,
+                       layer_tap=layer_tap)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -287,6 +296,8 @@ def main():
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
           f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
+    print(f"[model] 读窗口口径: layer_tap={model.layer_tap}"
+          f"{'（DINOv2 逐层 tap 金字塔: 1,3,…,2S−1 个向量）' if model.layer_tap else '（平方块, 末层 z_s）'}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
     if train_info is not None:
@@ -299,6 +310,10 @@ def main():
                 and list(train_info["decoder_steps"]) != T_steps):
             mism.append(f"decoder_steps: 训练 {train_info['decoder_steps']} "
                         f"!= 推理 {T_steps}")
+        if ("layer_tap" in train_info
+                and bool(train_info["layer_tap"]) != model.layer_tap):
+            mism.append(f"layer_tap: 训练 {train_info['layer_tap']} "
+                        f"!= 推理 {model.layer_tap}")
         if mism:
             print(f"[warn] 推理参数与训练侧 model_info.json 不一致 ({info_path}):")
             for m in mism:
@@ -451,7 +466,10 @@ def main():
     triv_psnr = float(psnr_from_mse(triv_mse_sum / n))
     triv_l1_c = triv_l1_c_sum / n
     triv_psnr_c = float(psnr_from_mse(triv_mse_c_sum / n))
-    bpp_of = lambda t: (t + 1) * D_DIM * 1.0 / PX   # β=1 bit/dim 估计
+    # 每步实际读入解码器的 token 数 = t 个 register + (平方块口径下首步另读 z_cls)。
+    # layer_tap（金字塔）不读 z_cls ⇒ 偏移 0, 否则 1（历史口径）; 这决定 bpp 轴。
+    TOK_OFF = 0 if model.layer_tap else 1
+    bpp_of = lambda t: (t + TOK_OFF) * D_DIM * 1.0 / PX   # β=1 bit/dim 估计
 
     print(f"\n[full] 全量重建像素 L1 (归一化空间) = {norm_mean:.6f}")
     print(f"[full] 全量重建像素 L1 (0-255 空间) = {pix_mean:.2f} ± {pix_std:.2f}")
@@ -464,12 +482,12 @@ def main():
     print(f"       ⚠️ 最左端 (t=1) 的全画布 PSNR={step_psnr[0]:.2f} dB 必须显著高于 "
           f"{triv_psnr:.2f} dB 才算真重建, 否则曲线左端是 padding 撑的")
     print(f"       参照(旧实验): 全图平均色≈61, 每patch平均色≈?, 质心基线见 pixel_recon_check")
-    print(f"\n[steps] 渐进曲线 ({len(T_steps)} 步, 0-255; bpp = (t+1)·{D_DIM}/"
-          f"{PX} @β=1):")
+    print(f"\n[steps] 渐进曲线 ({len(T_steps)} 步, 0-255; "
+          f"tokens = t+{TOK_OFF}, bpp = (t+{TOK_OFF})·{D_DIM}/{PX} @β=1):")
     print(f"    {'t':>4}{'tokens':>8}{'bpp':>8}{'L1':>9}{'PSNR':>8}{'MS-SSIM':>9}"
           f"{'L1内容区':>10}{'PSNR内容区':>11}")
     for i, t in enumerate(T_steps):
-        print(f"    {t:>4}{t + 1:>8}{bpp_of(t):>8.3f}{step_pix_mean[i]:>9.3f}"
+        print(f"    {t:>4}{t + TOK_OFF:>8}{bpp_of(t):>8.3f}{step_pix_mean[i]:>9.3f}"
               f"{step_psnr[i]:>8.2f}{step_ssim[i]:>9.4f}"
               f"{step_l1_c[i]:>10.3f}{step_psnr_c[i]:>11.2f}")
     head = step_pix_mean[:min(4, len(step_pix_mean))]
@@ -509,12 +527,14 @@ def main():
         "ms_ssim_scales": int(ms_ssim_n_scales(H, W)),
         "bpp_beta": 1.0,
         "bpp_px": int(PX),
+        "layer_tap": bool(model.layer_tap),
         "step_bpp_beta1": [float(bpp_of(t)) for t in T_steps],
-        "step_tokens": [int(t + 1) for t in T_steps],
+        "step_tokens": [int(t + TOK_OFF) for t in T_steps],
         "canvas_fill": [0, 0, 0],
         "metrics_note": ("PSNR = 10log10(255^2/mean_MSE) 由平均 MSE 反算（压缩界标准口径）；"
                          "step_psnr_img_mean = 逐图 PSNR 的均值。bpp 为估计值 "
-                         "(t+1)·D·β/(H·W)，未量化/熵编码，真实 bpp 见 PLAN §4 E3。"
+                         "(t+tok_off)·D·β/(H·W)（tok_off = 1 平方块口径含 z_cls; "
+                         "layer_tap 金字塔 = 0），未量化/熵编码，真实 bpp 见 PLAN §4 E3。"
                          "内容区口径用 content_mask 剔除 letterbox padding。"),
     }
     if do_per_image:

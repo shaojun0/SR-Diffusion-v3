@@ -162,6 +162,15 @@ def parse_args():
                         "nhead(--heads) 须整除 stack_dim")
     p.add_argument("--decoder_dropout", type=float, default=0.0,
                    help="self.stack(nn.TransformerDecoderLayer) 的 dropout, 默认 0.0")
+    p.add_argument("--layer_tap", action="store_true",
+                   help="DINOv2 逐层 tap（金字塔读出, 2026-09-22）: 24 层按每 2 层"
+                        "一组分成 S 组（= 采样步数, 须有 2S 层）, 从顶往下第 g 组"
+                        "在该组两层之后读出 2g−1 个 register（1,3,5,…,2S−1, 合计 "
+                        "S²=K）并从序列里删除（'用掉的不进入下一层'）; 解码器第 i "
+                        "步只读第 i 组 ⇒ 顶部少向量走满全栈（语义）/底部多向量只"
+                        "走 2 层（细节）。须 steps=[1,4,…,S²] 且 K=S²（如 224×126 "
+                        "→ N=144, S=12, K=144）。与默认模式**权重形状相同**, 故"
+                        "训练侧写入 model_info.json、推理侧自动对齐。默认关")
     # ── 模型（解码器 = 顺序循环, 2026-09-15 起唯一路径）──
     # 并行路径的 --recurrent* / --query_mask_mode 开关已随之删除。
     # 损失口径的唯一性: 每步 Y 各自直接预测像素（无累加）⇒ 无 --loss_* 开关
@@ -282,7 +291,8 @@ def main():
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout)
+                       decoder_dropout=args.decoder_dropout,
+                       layer_tap=args.layer_tap)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -298,6 +308,14 @@ def main():
               f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
+    if model.layer_tap:
+        print(f"[model] layer_tap=ON: DINOv2 逐层 tap（金字塔读出）— "
+              f"{len(dino.encoder.layer)} 层 = {model.tap_groups} 组 × 2 层, "
+              f"从顶往下第 g 组 {2 * model.tap_groups - 1} … 1 个 register（宽 "
+              f"1,3,…,{2 * model.tap_groups - 1}）, 读出即删（不进下一层）; "
+              f"读窗口见 OutputQueryDecoder.forward")
+    else:
+        print("[model] layer_tap=OFF: z_s 全部来自 DINOv2 末层（历史口径）")
     print(f"[model] self.stack: d_model={model.decoder.stack_dim} "
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
@@ -386,6 +404,8 @@ def main():
                 "decoder_dropout": args.decoder_dropout,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
+                "layer_tap": bool(raw.layer_tap),
+                "tap_groups": int(getattr(raw, "tap_groups", 0)),
                 "loss": "mean_t L1(PixelHead(Y_t), target)（直接预测, 无累加）",
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}
