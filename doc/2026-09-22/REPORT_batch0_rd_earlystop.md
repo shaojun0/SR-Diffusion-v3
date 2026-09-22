@@ -310,8 +310,12 @@ JPEG/WebP 的文件头 ≈ 600 B = 4,800 bit。224×126 = 28,224 px ⇒ **光容
 `t=1`（2 token，0.073 bpp）就已 **21.06 dB**，`t=144`（145 token，5.26 bpp）只有 **21.36 dB**
 ——**72 倍码率换 +0.30 dB**（448 版是 15.6 倍换 +0.06 dB）。
 
-⇒ **瓶颈不是 token 预算**，而是 **DINOv2 特征对像素重建的信息量**（语义特征本来就不编码高频纹理）
-以及 PixelHead 的表达力。加 token、加 decoder 层数、加 BPTT 都改不了这一点。
+⇒ **瓶颈不是 token 预算**。加 token、加 decoder 层数、加 BPTT 都改不了这一点。
+
+**⚠️ 本节初版把瓶颈笼统归给"DINOv2 特征的信息量"，已按项目 8-27 的代码级诊断修正**：
+第一根因其实是**解码器的逐 patch 信息路由缺陷**（可回收 12.9 L1），特征上限只排第二。
+完整对照、以及 8-27 建议的落地状态（**排名第 1、第 2 的修法至今没做**）见
+[`ANALYSIS_texture_vs_decoder_routing.md`](ANALYSIS_texture_vs_decoder_routing.md)。
 
 ### 10.7 MS-SSIM 口径修正（重要）
 
@@ -330,8 +334,10 @@ JPEG/WebP 的文件头 ≈ 600 B = 4,800 bit。224×126 = 28,224 px ⇒ **光容
 | E4b 自适应 | Δ ≤ +0.02 dB | **Δ ≤ +0.01 dB** | 依旧不成立 |
 
 ⇒ **4 layer + 半分辨率 + BPTT 没有改变结论：像素/PSNR 这条轴赢不了。**
-真正的瓶颈已定位到特征信息量，而不是 token 预算——这直接意味着"把 codec 做得更好"
-这条路在本架构上收益极小，价值仍在 E8（任务保真）与极低码率独占区。
+瓶颈不在 token 预算；按 8-27 的代码级诊断，可回收的大头在**解码器的逐 patch 路由缺陷**
+（P1-1/P1-2，至今未做，见 [`ANALYSIS_texture_vs_decoder_routing.md`](ANALYSIS_texture_vs_decoder_routing.md)）——
+这意味着"把 codec 做得更好"仍有一根**没动过的杠杆**（估算 +4.5 dB @448），
+但即便拉满也仍落后 WebP，所以论文价值仍在 E8（任务保真）与极低码率独占区。
 
 > 产物：`doc/2026-09-22/data/rd_224_d4_bptt.{png,json}`、`rd_compare_all.png`、
 > `baseline_classic_224.json`；原始逐图 json 在服务器
