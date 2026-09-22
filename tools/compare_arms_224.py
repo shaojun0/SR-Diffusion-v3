@@ -13,6 +13,15 @@
     python tools/compare_arms_224.py                      # 打印全表
     python tools/compare_arms_224.py --plot curves.png    # 另存三臂逐 step 图
     python tools/compare_arms_224.py --arm "name=path.json" ...
+
+跨分辨率对照（2026-09-22 新增列: 输入 / bpp 分母 / RD 端点）:
+    python tools/compare_arms_224.py \
+      --arm "224 base=.../eval_224_d4/test_224_d4_bptt.json" \
+      --train1k "224 base=.../eval_224_d4/train1k_224_d4_bptt.json" \
+      --arm "896=.../eval_896_d4/test_896_d4_bptt_slice012.json" \
+      --train1k "896=.../eval_896_d4/train1k_896_d4_bptt_slice012.json" \
+      --title "224x126 vs 896x504" --plot rd.png
+    ⚠️ 跨分辨率时**像素 L1 不可直接比**（bpp 分母差 16×）; 同轴可比的是 bpp/bpp–PSNR。
 """
 from __future__ import annotations
 
@@ -52,6 +61,8 @@ def main() -> int:
     ap.add_argument("--train1k", action="append", default=[],
                     help="name=path（可选, 与 --arm 同名配对）")
     ap.add_argument("--plot", default=None)
+    ap.add_argument("--title", default=None,
+                    help="图标题（默认写死 224x126; 跨分辨率对照时用这个覆盖）")
     a = ap.parse_args()
 
     if a.arm:
@@ -71,9 +82,9 @@ def main() -> int:
         data.append((name, d, t1))
 
     print("## 总量（construction_site test 3,004）\n")
-    print("| 臂 | 步数 | layer_tap | K | 像素 L1 (0-255) | 最优 PSNR | 最优 t | 最优 MS-SSIM "
-          "| PSNR 跨度 | L1 跨度 | train1k L1 | Δ(train−test) |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| 臂 | 输入 | bpp 分母 px | 步数 | layer_tap | K | 像素 L1 (0-255) | 最优 PSNR | 最优 t "
+          "| 最优 MS-SSIM | PSNR 跨度 | L1 跨度 | train1k L1 | Δ(train−test) |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for name, d, t1 in data:
         i = best_idx(d)
         lt = d["layer_tap"] if "layer_tap" in d else "—(旧产物)"
@@ -82,11 +93,27 @@ def main() -> int:
         t1s = f"{t1['full_pixel_l1_255']:.2f}" if t1 else "—"
         dlt = (f"{t1['full_pixel_l1_255'] - d['full_pixel_l1_255']:+.2f}"
                if t1 else "—")
-        print(f"| {name} | {len(d['decoder_steps'])} | {lt} | {d['num_specials']} "
+        inp = d.get("input")
+        inp = (f"{inp[0]}×{inp[1]}" if isinstance(inp, (list, tuple)) and len(inp) == 2
+               else "—")
+        print(f"| {name} | {inp} | {d.get('bpp_px', '—')} "
+              f"| {len(d['decoder_steps'])} | {lt} | {d['num_specials']} "
               f"| {d['full_pixel_l1_255']:.2f} ± {d['full_pixel_std_255']:.2f} "
               f"| **{max(d['step_psnr']):.2f}** | {d['decoder_steps'][i]} "
               f"| {d['step_ms_ssim'][i]:.4f} | {span_p:.2f} dB | {span_l:.2f} px "
               f"| {t1s} | {dlt} |")
+
+    # 端点（RD 曲线两端 + 最优）：跨分辨率时**L1 不可直接比**, bpp/PSNR 才可同轴
+    print("\n## RD 端点（最左 / 最优 / 最右; bpp = β=1 估计, 分母见上表）\n")
+    print("| 臂 | 首步 t / tokens / bpp / PSNR | 最优 t / bpp / PSNR | 末步 t / tokens / bpp / PSNR |")
+    print("|---|---|---|---|")
+    for name, d, _ in data:
+        i = best_idx(d)
+        t = d["decoder_steps"]
+        tk, bp, ps = d["step_tokens"], d["step_bpp_beta1"], d["step_psnr"]
+        print(f"| {name} | t={t[0]} / {tk[0]} / {bp[0]:.3f} / {ps[0]:.2f} "
+              f"| t={t[i]} / {bp[i]:.3f} / **{ps[i]:.2f}** "
+              f"| t={t[-1]} / {tk[-1]} / {bp[-1]:.3f} / {ps[-1]:.2f} |")
 
     # 逐 step 对照（按 t 对齐; 各臂步集可能不同）
     all_t = sorted({t for _, d, _ in data for t in d["decoder_steps"]})
@@ -138,7 +165,8 @@ def main() -> int:
         ax1.set_xscale("log")
         ax1.set_xlabel("bpp (beta=1 estimated)")
         ax1.set_ylabel("PSNR (dB)")
-        ax1.set_title("224x126 RD: base / slice1 / tap (construction_site test n=3004)")
+        ax1.set_title(a.title or
+                      "224x126 RD: base / slice1 / tap (construction_site test n=3004)")
         ax1.grid(alpha=.3, which="both")
         ax1.legend(fontsize=7)
         ax2.set_xlabel("decoder step index (1-based, within each arm's own step set)")
