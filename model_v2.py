@@ -163,6 +163,53 @@ def square_block_starts(num_patches: int) -> list:
     return [k * k for k in range(1, K + 1)]
 
 
+def fixed_block_starts(num_patches: int, block: int) -> list:
+    """固定宽度分块计划的**步值** = 自然数 1..⌈N/block⌉。
+
+    动机（2026-09-23 用户口径）: square_block_starts 的步值是平方数
+    （1,4,9,16,…）, 步值本身在跳变; 本计划让步值按**自然数**增长, 每步读
+    **固定 block 个** z_s（末块不足则截断）。块几何见
+    step_windows(..., plan="fixed"): 第 k 步读 z_s 的第 k 块
+    （A 坐标 [(k−1)·block+1, min(k·block, K)]; 首步 lo=0 额外含 z_cls）。
+
+    例: N=16, block=4 → [1,2,3,4]（4 步）; N=576, block=4 → [1..144]。
+    block=1 即"每步读 1 个 token"（|T|=N, 24× 成本, 见报告 §成本）。
+    """
+    assert block >= 1, f"block 须 ≥1, got {block}"
+    return list(range(1, (num_patches + block - 1) // block + 1))
+
+
+def step_windows(num_specials: int, steps: Sequence[int],
+                 plan: str = "square", block: int = 0) -> list:
+    """每个采样步在 A 坐标（0=z_cls, 1..K=z_s）下的读窗口 `[(lo, hi), …]`。
+
+    · `plan="square"`（**默认, 历史唯一口径**）: k=⌊√t⌋,
+      hi=min((k+1)²−1, K); 非首步 lo=max(k²,1), 首步 lo=0（额外含 z_cls）。
+    · `plan="fixed"`: k=t（步值即块号）, hi=min(k·block, K);
+      非首步 lo=(k−1)·block+1, 首步 lo=0。
+
+    本函数是 `OutputQueryDecoder.forward` 直接切 `A[:, lo:hi+1]` 的**唯一来源**,
+    语义与 `build_block_mask` 逐位一致; 工具侧也用它算"实际累计读入 bpp"。
+    """
+    assert plan in ("square", "fixed"), f"未知 plan={plan}"
+    if plan == "fixed":
+        assert block >= 1, f"plan=fixed 须 block ≥1, got {block}"
+    out = []
+    for i, t in enumerate(steps):
+        if plan == "fixed":
+            k = int(t)
+            hi = min(k * block, num_specials)
+            lo = 0 if i == 0 else (k - 1) * block + 1
+        else:
+            k = math.isqrt(int(t))
+            hi = min((k + 1) ** 2 - 1, num_specials)
+            lo = 0 if i == 0 else max(k * k, 1)
+        assert lo <= hi, \
+            f"步 {t} 的读窗口 [{lo},{hi}] 为空 (K={num_specials}, plan={plan})"
+        out.append((lo, hi))
+    return out
+
+
 # ═══ derive_num_specials — K 由"最终生效采样步集"自动推导（无花瓶）═══
 
 def derive_num_specials(num_patches: int, steps: Sequence[int]) -> int:
@@ -457,7 +504,8 @@ class OutputQueryDecoder(nn.Module):
                  depth: int = 2, skip_steps: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  num_specials: Optional[int] = None,
-                 stack_dim: Optional[int] = None, dropout: float = 0.0):
+                 stack_dim: Optional[int] = None, dropout: float = 0.0,
+                 step_plan: str = "square", block: int = 0):
         super().__init__()
         self.num_patches = num_patches                 # 查询基行数 = N（输出 N 个 patch 预测, 不变）
         self.num_specials = num_patches if num_specials is None else int(num_specials)
@@ -465,8 +513,15 @@ class OutputQueryDecoder(nn.Module):
         # 上界 = K（num_specials）; 显式 steps 原样（调用方负责, 不切片）
         self.steps = select_steps(self.num_specials, steps,
                                   skip_steps, max_steps)
-        # 读窗口 = **平方块**（唯一口径）: 步 t 读 z_s[k²:(k+1)²−1], k=⌊√t⌋,
-        # 首步额外含 z_cls; z_s 全部来自 DINO **末层**。
+        # 读窗口计划（2026-09-23 新增, 默认保持历史口径）:
+        #   "square"（默认）= 步值平方数, 步 t 读 z_s[k²:(k+1)²−1], k=⌊√t⌋;
+        #   "fixed"        = 步值自然数, 第 k 步固定读 block 个 z_s。
+        # 几何统一由 step_windows 给出; 首步都额外含 z_cls。z_s 全部来自末层。
+        assert step_plan in ("square", "fixed"), f"未知 step_plan={step_plan}"
+        self.step_plan = step_plan
+        self.block = int(block)
+        if step_plan == "fixed":
+            assert self.block >= 1, f"step_plan=fixed 须 block ≥1, got {block}"
         # 最近一次 forward 实际使用的 A 坐标读窗口 [(lo, hi), …]（诊断/自检用）
         self.last_windows: Optional[list] = None
         S = self.num_specials + 1                                # z_cls + K z_s
@@ -516,17 +571,12 @@ class OutputQueryDecoder(nn.Module):
         # TransformerDecoder 会把 2-D tgt 当 unbatched, 与 3-D memory 冲突
         Y = self.query_base.unsqueeze(0).expand(B, -1, -1)       # (B,N,D)
         Y_total = []
-        windows = []
+        # 读窗口 = step_windows 给出的计划（plan="square" 与历史平方块口径
+        # 逐位一致; plan="fixed" = 步值自然数、每步固定读 block 个）
+        windows = step_windows(self.num_specials, self.steps,
+                               self.step_plan, self.block)
         for i, t in enumerate(self.steps):
-            # 读窗口 = 步 t 所在平方块（与 build_block_mask 的块口径逐位一致）:
-            # k=⌊√t⌋, hi=min((k+1)²−1, K); 首步 lo=0 ⇒ 含 z_cls 与其前全部元素,
-            # 其余步 lo=max(k²,1) ⇒ 只读自己那块（位置 0 = z_cls 屏蔽）
-            k = math.isqrt(int(t))
-            hi = min((k + 1) ** 2 - 1, self.num_specials)
-            lo = 0 if i == 0 else max(k * k, 1)
-            assert lo <= hi, \
-                f"步 {t} 的读窗口 [{lo},{hi}] 为空 (K={self.num_specials})"
-            windows.append((lo, hi))
+            lo, hi = windows[i]
             Y = self.stack(self.stack_in(Y), A_in[:, lo:hi + 1])
             Y = self.stack_out(Y)
             Y_total.append(Y)                                    # 该步全部 patch 预测
@@ -584,6 +634,8 @@ class SRPhase1V2(nn.Module):
         num_specials: Optional[int] = None,
         stack_dim: int = 0,
         decoder_dropout: float = 0.0,
+        step_plan: str = "square",
+        block: int = 0,
     ):
         super().__init__()
         self.dinov2 = dinov2
@@ -597,7 +649,10 @@ class SRPhase1V2(nn.Module):
         steps_selected = select_steps(num_patches, decoder_steps,
                                       skip_steps, max_steps)
         if num_specials is None:
-            K = derive_num_specials(num_patches, steps_selected)
+            # plan="fixed" 的读窗口铺满 1..N（末块 hi=min(⌈N/block⌉·block,N)=N）
+            # ⇒ K=N; plan="square" 沿用 derive_num_specials。
+            K = (num_patches if step_plan == "fixed"
+                 else derive_num_specials(num_patches, steps_selected))
         else:
             K = int(num_specials)
         assert 1 <= K <= num_patches, \
@@ -616,7 +671,9 @@ class SRPhase1V2(nn.Module):
                                           depth=decoder_depth,
                                           num_specials=K,
                                           stack_dim=stack_dim,
-                                          dropout=decoder_dropout)
+                                          dropout=decoder_dropout,
+                                          step_plan=step_plan,
+                                          block=block)
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     # ── encode: 输入 → 解码器输入 z_cls, z_s ──
@@ -901,6 +958,27 @@ if __name__ == "__main__":
     assert square_block_starts(12) == [1, 4, 9], square_block_starts(12)
     assert len(square_block_starts(256)) == 16
     assert len(square_block_starts(512)) == 22
+    # ── plan="fixed"（2026-09-23 新增）: 步值按自然数增长, 每步固定读 block 个 ──
+    assert fixed_block_starts(16, 4) == [1, 2, 3, 4], fixed_block_starts(16, 4)
+    assert fixed_block_starts(12, 4) == [1, 2, 3], fixed_block_starts(12, 4)
+    assert fixed_block_starts(576, 4) == list(range(1, 145))
+    assert fixed_block_starts(12, 1) == list(range(1, 13))
+    # 窗口几何: N=12/K=12/block=4 → 块 [1..4][5..8][9..12], 首步 lo=0 含 z_cls
+    w_fixed = step_windows(12, [1, 2, 3], plan="fixed", block=4)
+    assert w_fixed == [(0, 4), (5, 8), (9, 12)], w_fixed
+    # N=576/K=576/block=4 ⇒ 144 步铺满, 每步宽度 5(首)/4, 无空洞
+    w576 = step_windows(576, fixed_block_starts(576, 4), plan="fixed", block=4)
+    assert len(w576) == 144 and w576[0] == (0, 4) and w576[-1] == (573, 576)
+    assert all(b - a + 1 == (5 if i == 0 else 4)
+               for i, (a, b) in enumerate(w576)), "fixed 计划每步宽度须恒定"
+    assert w576[-1][1] == 576, "fixed 计划须铺满 1..K"
+    # square 计划经同一函数后与历史口径逐位一致（默认路径不回归）
+    assert step_windows(12, [1, 4, 9]) == [(0, 3), (4, 8), (9, 12)]
+    d_fix = OutputQueryDecoder(num_patches=16, dim=D, steps=fixed_block_starts(16, 4),
+                              step_plan="fixed", block=4)
+    assert d_fix.step_plan == "fixed" and d_fix.block == 4
+    d_fix(torch.randn(1, 1, D), torch.randn(1, 16, D))       # 循环跑得通
+    assert d_fix.last_windows == [(0, 4), (5, 8), (9, 12), (13, 16)], d_fix.last_windows
     # 用户给定示例核对（N=12）: 第一个步 t=1 可见 [0..3]; 步 2 (t=4) 只看 [4..8]
     m12 = build_block_mask(12, [1, 4, 9])
     assert m12.shape == (3 * 12, 13), m12.shape

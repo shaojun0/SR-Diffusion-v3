@@ -37,7 +37,8 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import Dinov2Model
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model_v2 import SRPhase1V2, patches_to_image, square_block_starts
+from model_v2 import (SRPhase1V2, patches_to_image, square_block_starts,
+                      fixed_block_starts, step_windows)
 from data_v2 import DINO_MEAN, DINO_STD
 
 MEAN = [float(v) for v in DINO_MEAN]
@@ -101,15 +102,17 @@ def use_patch_tokens(model):
     return model
 
 
-def build_model(model_dir, N, depth, stack_dim=0):
+def build_model(model_dir, N, depth, stack_dim=0, step_plan="square", block=0):
     # transformers>=5 的 Dinov2Embeddings.forward 内部**总会**调
     # self.interpolate_pos_encoding(emb, H, W) ⇒ 任意 14 倍数分辨率开箱可用,
     # 不需要（也不接受）interpolate_pos_encoding 开关。
     dino = Dinov2Model.from_pretrained(model_dir)
-    steps = square_block_starts(N)
+    steps = (fixed_block_starts(N, block) if step_plan == "fixed"
+             else square_block_starts(N))
     m = SRPhase1V2(dinov2=dino, num_patches=N, dim=DIM_SMALL, heads=8,
                    decoder_steps=steps, decoder_depth=depth, patch_px=588,
-                   mlp_ratio=4.0, stack_dim=stack_dim)
+                   mlp_ratio=4.0, stack_dim=stack_dim,
+                   step_plan=step_plan, block=block)
     return m, steps
 
 
@@ -140,9 +143,17 @@ def evaluate(model, loader, size, steps, beta, device):
     psnr = 10.0 * np.log10(255.0 ** 2 / np.maximum(mses, 1e-12))
     tokens = [t + 1 for t in steps]
     bpp = [tk * DIM_SMALL * beta / (size * size) for tk in tokens]
+    # 实际口径（交接 §6.6）: 步 t 累计读入 = hi+1 列 A（含 z_cls）, 而非名义 t+1。
+    # square 计划下 = (k+1)²; fixed 计划下 = min(k·block, K)（首步 +1 含 z_cls）。
+    wins = step_windows(model.num_specials, steps,
+                        model.decoder.step_plan, model.decoder.block)
+    win = [hi - lo + 1 for lo, hi in wins]
+    cum_read = [hi + 1 for _, hi in wins]
+    bpp_actual = [c * DIM_SMALL * beta / (size * size) for c in cum_read]
     model.train()
     return {"l1_255": l1s.tolist(), "mse": mses.tolist(), "psnr": psnr.tolist(),
-            "tokens": tokens, "bpp": bpp}
+            "tokens": tokens, "bpp": bpp, "win": win, "cum_read": cum_read,
+            "bpp_actual": bpp_actual}
 
 
 def main():
@@ -171,6 +182,11 @@ def main():
     ap.add_argument("--limit_val", type=int, default=0)
     ap.add_argument("--z_mode", default="register", choices=["register", "patch"],
                     help="z_s 取 register 输出(仓库原版) 还是 patch token 输出")
+    ap.add_argument("--step_plan", default="square", choices=["square", "fixed"],
+                    help="square=步值 k²（历史唯一口径）; "
+                         "fixed=步值自然数 1..⌈N/block⌉、每步固定读 block 个 z_s")
+    ap.add_argument("--block", type=int, default=0,
+                    help="--step_plan fixed 时每步读的 z_s 个数（如 4）")
     ap.add_argument("--arm", default="", help="tag 后缀，默认 bptt 自动")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--eval_every", type=int, default=0)
@@ -187,9 +203,13 @@ def main():
     np.random.seed(args.seed)
 
     N = (args.size // 14) ** 2
+    if args.step_plan == "fixed":
+        assert args.block >= 1, "--step_plan fixed 必须给 --block ≥1"
     arm = args.arm or "bptt"
     if args.z_mode != "register":
         arm = f"{arm}-{args.z_mode}"
+    if args.step_plan == "fixed":
+        arm = f"{arm}-fixw{args.block}"     # 步值自然数 / 每步固定读 block 个
     tag = f"{args.size}_{arm}"
     out = os.path.join(args.out_dir, tag)
     os.makedirs(out, exist_ok=True)
@@ -205,7 +225,8 @@ def main():
     print(f"[data] size={args.size} N={N} train={len(tr_files)} val={len(va_files)}",
           flush=True)
 
-    model, steps = build_model(args.model_dir, N, args.depth)
+    model, steps = build_model(args.model_dir, N, args.depth,
+                               step_plan=args.step_plan, block=args.block)
     if args.z_mode == "patch":
         use_patch_tokens(model)
     if args.head_zero_init:
@@ -216,8 +237,13 @@ def main():
         nn.init.zeros_(model.pixel_head.net[-1].bias)
     model = model.to(device)
     nparam = sum(p.numel() for p in model.parameters())
-    print(f"[model] steps={steps} (|T|={len(steps)}) params={nparam/1e6:.1f}M "
-          f"arm={arm} carry=BPTT "
+    # 步集可能很长（fixed 计划 N=576/block=4 → 144 步）⇒ 打印只给头尾
+    steps_brief = (str(steps) if len(steps) <= 12 else
+                   f"{steps[:6]}...+{steps[-2:]} (共 {len(steps)})")
+    print(f"[model] steps={steps_brief} (|T|={len(steps)}) params={nparam/1e6:.1f}M "
+          f"arm={arm} plan={args.step_plan}"
+          + (f"(block={args.block})" if args.step_plan == "fixed" else "")
+          + f" K={model.num_specials} carry=BPTT "
           f"head_zero_init={args.head_zero_init}", flush=True)
 
     npy_tr = os.path.join(args.data_root, f"S{args.size}_train.npy")
@@ -302,6 +328,8 @@ def main():
     ev = evaluate(model, vl, args.size, steps, 1.0, device)
     res = {"tag": tag, "size": args.size, "num_patches": N, "steps": steps,
            "dim": DIM_SMALL, "depth": args.depth, "arm": arm, "z_mode": args.z_mode,
+           "step_plan": args.step_plan, "block": args.block,
+           "num_specials": int(model.num_specials),
            "params_M": nparam / 1e6, "train_imgs": len(tr_files),
            "val_imgs": len(va_files), "train_steps": args.steps,
            "warm_steps": args.warm_steps, "head_zero_init": args.head_zero_init,
