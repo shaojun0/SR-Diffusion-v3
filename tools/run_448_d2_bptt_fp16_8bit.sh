@@ -13,7 +13,7 @@
 #   · 40 epoch = **8,760 优化步**; 每卡 bs **16** × 2 卡 × grad_accum **1** = 全局 32
 #     ⇒ `steps_per_epoch = 7009//32 = 219`、`warmup_steps = 262`（3% 默认）
 #     ⇒ **不需要 run_896 那个 --warmup_ratio 0.0075 的补丁**（grad_accum=1 时公式自洽）
-#   · carry = **BPTT**; 平方块读窗口（layer_tap 关）; 直接预测损失 mean_t L1
+#   · carry = **BPTT**; 平方块读窗口（layer_tap 已于 2026-09-23 移除）; 直接预测损失 mean_t L1
 #   · lr 1.5e-4 cosine / wd 0.01 / clip 1.0 / seed 42 / 数据与切分同 896 臂
 #   ⇒ 与文档里历史 448×252/BPTT 数字的**唯一差别 = fp16 + adamw_bnb_8bit**
 #

@@ -10,7 +10,7 @@
   · 编码器: DINOv2-small (D=384, 12 层)，不冻结；register specials K=N
   · 解码器: OutputQueryDecoder（顺序循环 / 平方块读窗口 / 直接预测损失）
   · 采样步: square_block_starts(N)（全量）
-  · carry: 默认 **BPTT**（carry_detach=False）；--detach 可切历史默认
+  · carry: **BPTT**（唯一路径, 2026-09-23 起 detach 开关随 model_v2 一起移除）
   · bpp = (t+1)·D·β / S²（β=1，与仓库同一"估计 bpp"口径，非真实熵编码）
   · 指标: 0-255 空间 L1 与 PSNR（PSNR 由聚合 MSE 反推 = PSNR(agg)）
 
@@ -169,10 +169,9 @@ def main():
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--limit_train", type=int, default=0)
     ap.add_argument("--limit_val", type=int, default=0)
-    ap.add_argument("--detach", action="store_true", help="关掉 BPTT（历史默认）")
     ap.add_argument("--z_mode", default="register", choices=["register", "patch"],
                     help="z_s 取 register 输出(仓库原版) 还是 patch token 输出")
-    ap.add_argument("--arm", default="", help="tag 后缀，默认 BPTT/detach 自动")
+    ap.add_argument("--arm", default="", help="tag 后缀，默认 bptt 自动")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--eval_every", type=int, default=0)
     ap.add_argument("--smoke", action="store_true")
@@ -188,7 +187,7 @@ def main():
     np.random.seed(args.seed)
 
     N = (args.size // 14) ** 2
-    arm = args.arm or ("detach" if args.detach else "bptt")
+    arm = args.arm or "bptt"
     if args.z_mode != "register":
         arm = f"{arm}-{args.z_mode}"
     tag = f"{args.size}_{arm}"
@@ -209,7 +208,6 @@ def main():
     model, steps = build_model(args.model_dir, N, args.depth)
     if args.z_mode == "patch":
         use_patch_tokens(model)
-    model.decoder.carry_detach = bool(args.detach)
     if args.head_zero_init:
         # PixelHead 末层置零 ⇒ 起点 = "预测归一化均值(0)"，loss≈0.8 而不是
         # 随机大输出(实测 loss 1.3~4.3 / gn 10~100)。仓库主线从预训练
@@ -219,7 +217,7 @@ def main():
     model = model.to(device)
     nparam = sum(p.numel() for p in model.parameters())
     print(f"[model] steps={steps} (|T|={len(steps)}) params={nparam/1e6:.1f}M "
-          f"arm={arm} carry_detach={model.decoder.carry_detach} "
+          f"arm={arm} carry=BPTT "
           f"head_zero_init={args.head_zero_init}", flush=True)
 
     npy_tr = os.path.join(args.data_root, f"S{args.size}_train.npy")
@@ -292,13 +290,11 @@ def main():
     # ── A 相: 单步 + 全读 warm start（仓库 cpu_probe_bptt_toy 的同一配方）──
     if args.warm_steps > 0:
         model.decoder.steps = [N]
-        model.decoder.carry_detach = True
         run_phase("A", args.warm_steps, args.warmup)
         ev = evaluate(model, vl, args.size, [N], 1.0, device)
         print(f"[{tag}] A 相结束: 全读单步 L1={ev['l1_255'][0]:.2f} "
               f"PSNR={ev['psnr'][0]:.2f}", flush=True)
         model.decoder.steps = steps
-        model.decoder.carry_detach = bool(args.detach)
 
     # ── B 相: 真实多步轨迹 ──
     run_phase("B", args.steps, min(args.warmup, max(1, args.steps // 10)))
@@ -306,7 +302,6 @@ def main():
     ev = evaluate(model, vl, args.size, steps, 1.0, device)
     res = {"tag": tag, "size": args.size, "num_patches": N, "steps": steps,
            "dim": DIM_SMALL, "depth": args.depth, "arm": arm, "z_mode": args.z_mode,
-           "carry_detach": model.decoder.carry_detach,
            "params_M": nparam / 1e6, "train_imgs": len(tr_files),
            "val_imgs": len(va_files), "train_steps": args.steps,
            "warm_steps": args.warm_steps, "head_zero_init": args.head_zero_init,

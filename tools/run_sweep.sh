@@ -3,7 +3,7 @@
 #
 # 口径见 sweep_res_train.py 头部。要点：
 #   · z_mode=patch（z_s = patch token；register 版在 800 张上 3500 步都学不动）
-#   · BPTT（carry_detach=False）+ 直接预测损失 + 平方块读窗口（仓库原版解码器）
+#   · BPTT（唯一路径）+ 直接预测损失 + 平方块读窗口（仓库原版解码器）
 #   · head_zero_init；lr=1.5e-4（仓库配方）；有效 batch 统一 16
 #   · 分辨率 28/56/112/224/336（14 的倍数，DINOv2 patch=14）
 #   · 预算：warm(单步全读) 1000 步 + nested 1500 步 = 2500 步/分辨率
@@ -38,9 +38,10 @@ run_one 112 16 1 ""
 run_one 224 16 1 ""
 run_one 336  8 2 ""
 
-# ── 对照臂：detach（历史默认，步间梯度截断）──
-run_one 56  16 1 "--detach"
-run_one 224 16 1 "--detach"
+# ── 对照臂（2026-09-23 删除）──
+# 原 detach 对照臂（--detach, 56/224）随 model_v2 的 carry 开关一起移除:
+# detach 与 BPTT 共用同一套权重形状、只能靠开关区分, 会静默算错; 历史结果见
+# doc/2026-09-22/res_sweep/runs/*_detach-patch/（用当时 commit 的代码复现）。
 
 # ── JPEG/WebP 基线（同图同分辨率）──
 for s in 28 56 112 224 336; do
@@ -50,6 +51,6 @@ done
 
 # ── 汇总报告 + 图 ──
 $P -u $R --out_dir "$OUT" --report "$OUT/sweep_res_report.md" \
-   --arms bptt-patch,detach-patch 2>&1 | tail -20
+   --arms bptt-patch 2>&1 | tail -20
 
 echo "SWEEP_ALL_DONE $(date '+%F %T')"

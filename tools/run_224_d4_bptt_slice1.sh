@@ -12,8 +12,8 @@
 # 其余**完全沿用基线配方**（可比对照）:
 #   construction_site 7,009 训练 / test 3,004 + 训练集随机 1,000 抽样评测;
 #   224×126 ⇒ patches 16×9=144; 40 epoch = 8,760 步; 2 卡 × bs16（全局 32）;
-#   lr 1.5e-4 cosine + warmup 3%; BPTT（carry_detach=False, 仓库默认）; decoder depth=4;
-#   直接预测损失; **不用 --layer_tap**（平方块读窗口, z_s 全部来自 DINOv2 末层）。
+#   lr 1.5e-4 cosine + warmup 3%; BPTT（唯一路径, 2026-09-23 起 detach 开关已移除）; decoder depth=4;
+#   直接预测损失; 平方块读窗口（z_s 全部来自 DINOv2 末层; layer_tap 已于 2026-09-23 移除）。
 #
 # 用法（服务器）:
 #   cd /root/autodl-tmp/sr-diffusion-v3-tap

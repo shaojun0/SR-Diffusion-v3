@@ -82,12 +82,11 @@ def main() -> int:
         data.append((name, d, t1))
 
     print("## 总量（construction_site test 3,004）\n")
-    print("| 臂 | 输入 | bpp 分母 px | 步数 | layer_tap | K | 像素 L1 (0-255) | 最优 PSNR | 最优 t "
+    print("| 臂 | 输入 | bpp 分母 px | 步数 | K | 像素 L1 (0-255) | 最优 PSNR | 最优 t "
           "| 最优 MS-SSIM | PSNR 跨度 | L1 跨度 | train1k L1 | Δ(train−test) |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for name, d, t1 in data:
         i = best_idx(d)
-        lt = d["layer_tap"] if "layer_tap" in d else "—(旧产物)"
         span_p = max(d["step_psnr"]) - min(d["step_psnr"])
         span_l = max(d["step_pixel_l1_255"]) - min(d["step_pixel_l1_255"])
         t1s = f"{t1['full_pixel_l1_255']:.2f}" if t1 else "—"
@@ -97,7 +96,7 @@ def main() -> int:
         inp = (f"{inp[0]}×{inp[1]}" if isinstance(inp, (list, tuple)) and len(inp) == 2
                else "—")
         print(f"| {name} | {inp} | {d.get('bpp_px', '—')} "
-              f"| {len(d['decoder_steps'])} | {lt} | {d['num_specials']} "
+              f"| {len(d['decoder_steps'])} | {d['num_specials']} "
               f"| {d['full_pixel_l1_255']:.2f} ± {d['full_pixel_std_255']:.2f} "
               f"| **{max(d['step_psnr']):.2f}** | {d['decoder_steps'][i]} "
               f"| {d['step_ms_ssim'][i]:.4f} | {span_p:.2f} dB | {span_l:.2f} px "

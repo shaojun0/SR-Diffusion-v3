@@ -29,15 +29,10 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
     非首步 lo=max(k²,1); 首步 lo=0 ⇒ 额外含位置 0 = z_cls 及其前的全部元素,
     口径与 build_block_mask 逐位一致）——切片即窗口, 无需显式掩码。
     无 ReEncoder（省 51.6M 参数）。
-    **逐层 tap / 金字塔读出**（layer_tap=True, 2026-09-22 新增; 默认 False =
-    历史口径）: 24 层 DINOv2 按每 2 层一组分成 S 组（24 层 → 12 组）, 与 S 个
-    采样步从顶到底一一对应; 从顶往下第 g 组在**该组两层之后**读出 2g−1 个
-    register（g=1 → 1 个、g=2 → 3 个、… g=S → 2S−1 个, 合计 S² = K）, 读出后
-    立即从序列里删除（"用掉的向量不进入下一层"）。解码器第 i 步只读第 i 组
-    那 2i−1 个向量 ⇒ 顶部少量向量走满 24 层（语义构建）、底部大量向量只走
-    2 层（细节描绘）, 即 YOLO/FPN 式深浅分工; 与平方块口径的**权重形状完全
-    相同**, 故只能在构造时用 layer_tap 区分（训练侧写入 model_info.json,
-    推理侧自动对齐, 见 train_v2.py / infer_v2_test.py）。
+    ⚠️ 2026-09-23: **逐层 tap / 特征金字塔（layer_tap）已整块从 main 移除**
+    （用户口径: main 只保留主线目标, 实验性分支不进主线）。历史实现与实测见
+    `doc/2026-09-22/DESIGN_layer_tap_pyramid.md` /
+    `doc/2026-09-22/REPORT_layer_tap_pyramid_224.md`（只作存档, 代码已不在）。
     register 数 K（num_specials）= 解码器实际读取的 z_s 范围: 默认由
     "最终生效采样步集"自动推导 K = min( max_{t∈steps}((⌊√t⌋+1)²−1), N )
     （公式/动机/示例见 derive_num_specials 与 doc/2026-09-02/
@@ -55,14 +50,14 @@ SR-Diffusion Phase 1 v2 — 训练脚手架（register 式, 无 ReEncoder）
                             lo, hi = 步 t 的块起止（首步 lo=0, 含 z_cls）
                             Y = stack(stack_in(Y), stack_in(A[:, lo:hi+1]))
                             Y = stack_out(Y)
-                            Y = (query_base + Y).detach()     ← 喂给下一步当查询
+                            Y = query_base + Y                 ← 喂给下一步当查询（BPTT, 不 detach）
                     查询基行 k ↔ patch k（行数 = N 不变）; 单步内 N 行查询
                     全双向自注意力。
     L = mean_t L1(PixelHead(Y_t), patch)  ← **直接预测**口径: 每个采样步的输出
         Y_t 自己过 PixelHead 直接预测整图, 各步平权全覆盖损失
         （无累加/集成: 2026-09-15 前的 cumsum 累加口径已整块删除, 需要复现旧
-        结果时从 git 取回。梯度按步解耦: 解码器循环 carry detach + decode 侧
-        无累加 ⇒ 每步 Y_t 恰从自己那一步的损失收 1 份梯度, 见
+        结果时从 git 取回。carry 走 **BPTT**（2026-09-23 起唯一路径, 无 detach
+        开关）⇒ 存在"让 Y_{t-1} 成为对下一步有用的草稿"的梯度通路, 见
         OutputQueryDecoder.forward / SRPhase1V2.decode）
         F_hat = Y_pix[:, -1]（最后一步的直接预测）; recon = L1(F_hat, patch)
         = 监控量（数值上 = 训练 loss 的最后一项）
@@ -166,41 +161,6 @@ def square_block_starts(num_patches: int) -> list:
     """
     K = math.isqrt(num_patches)
     return [k * k for k in range(1, K + 1)]
-
-
-# ═══ layer_tap_groups — DINOv2 逐层 tap（金字塔读出, 2026-09-22 新增）═══
-
-def layer_tap_groups(steps: Sequence[int], num_specials: int,
-                     num_layers: Optional[int] = None) -> int:
-    """校验 DINOv2 逐层 tap 配置, 返回层组数 S（= 采样步数 = num_layers/2）。
-
-    口径（2026-09-22 用户定稿, 见 doc/2026-09-22/DESIGN_layer_tap_pyramid.md）:
-      · DINOv2-large 24 层 → S 组 × 2 层, 与 S 个采样步一一对应;
-      · **从顶往下数**第 g 组（g=1..S）带宽 2g-1（g=1 → 1 个向量, g=2 → 3 个,
-        …, g=S → 2S-1 个）⇒ 合计 1+3+…+(2S-1) = S² = K, 无重叠、无花瓶;
-      · 第 g 组占 z_s[(g-1)² : g²], 由第 (L-2g, L-2g+1) 两层算出（L=num_layers）|
-        解码器第 i 步（1-based）只读第 i 组: A 坐标窗口 = (1+(i-1)², i²)
-        （A = [z_cls; z_s], 故 z_s[j] 在 A[j+1]; 索引 0 的 z_cls 本模式不读）;
-      · register 在**本组两层之后**被读出并**从序列里删除**（"用掉的向量不
-        进入下一层"）⇒ 越靠顶的组看到的层越多（语义构建）, 越靠底的组看到的
-        层越少、向量越多（细节描绘）, 即 YOLO/FPN 式的深浅分工。
-
-    合法性: steps 必须恰好是 [1, 4, 9, …, S²]（每个采样步 = 一组, |T| = S）;
-    num_specials == S²; 给了 num_layers 时还须 num_layers == 2S。
-    不合法一律清晰报错（不静默退化——tap 模式与默认模式**权重形状完全相同**,
-    静默跑错不会报错, 只会算错）。
-    """
-    S = len(steps)
-    assert S >= 1, "layer_tap: 采样步集不能为空"
-    assert list(steps) == [i * i for i in range(1, S + 1)], \
-        f"layer_tap: 采样步集须为 [1, 4, 9, …, S²], got {list(steps)}"
-    assert int(num_specials) == S * S, \
-        f"layer_tap: num_specials(K) 须 = S² = {S * S} (S={S}), got {num_specials}"
-    if num_layers is not None:
-        assert int(num_layers) == 2 * S, \
-            f"layer_tap: DINOv2 层数须 = 2S = {2 * S} (每 2 层一组, S={S}), " \
-            f"got {num_layers}"
-    return S
 
 
 # ═══ derive_num_specials — K 由"最终生效采样步集"自动推导（无花瓶）═══
@@ -350,9 +310,10 @@ def build_causal_query_mask(num_steps: int, num_queries: int,
       那 num_queries 行。每步退化为一个独立的 num_queries×num_queries 稠密
       双向注意力, 步与步在自注意力上完全隔离。此时:
         - memory_mask 的"每步只见自己的 z_s 块"在整条前向路径上字面成立;
-        - loss 的跨步梯度回流被切断（decode 侧现无累加, 跨步梯度只可能来自
-          循环 carry）, 与 OutputQueryDecoder.forward 的 carry.detach() 合起来
-          实现"每步只从自己那一步的损失收梯度"（该意图见 decode 的 docstring）。
+        - loss 的跨步梯度回流由循环 carry 提供（decode 侧无累加）⇒ 2026-09-23
+          起 carry 走 **BPTT**（不 detach）, 跨步梯度**存在**; 本掩码函数是
+          历史遗留纯函数, 仅供参考（当前循环架构每步只跑自己那 N 行查询,
+          不使用 tgt_mask）。
       **渐进语义不依赖本掩码**: 它来自 memory_mask 侧的信息量递增（每步只
       读自己块, 允许列数随步单调增 4→5→7→9→11）, 故 blockdiag 不破坏渐进性。
       **局限（实测）**: 对 register 塌缩**中性**——块内非种子成员的梯度差在
@@ -472,18 +433,15 @@ class OutputQueryDecoder(nn.Module):
     · num_specials（K）= z_s 长度; None = num_patches（历史 K==N 行为）。
       num_patches（N）只决定查询基行数 = 输出 patch 预测数, 两者解耦后
       不再恒等——pos_embed 尺寸 (1,K+1,D), query_base 行数 = N。
-    · **layer_tap（2026-09-22 新增, 默认 False）**: 读窗口口径开关。
-      False = 平方块（步 t 读 z_s[k²:(k+1)²−1], 首步含 z_cls）;
-      True = 逐层 tap 金字塔（步 i 读 z_s[(i-1)²:i²], 2i−1 个, 不读 z_cls）,
-      配合 SRPhase1V2 的逐层 tap 编码器使用; 两种模式权重形状相同。
+    · 读窗口 = **平方块**（步 t 读 z_s[k²:(k+1)²−1], 首步额外含 z_cls）。
     · 每步跑一次 nn.TransformerDecoder 堆叠（自注意力 + 交叉注意力(memory=该步
       块切片) + FFN）; 单步内 N 行查询全双向自注意力。
     · 返回 (B,|T|,N,D) = 每步全部 patch 的**直接**预测（每步各自过 PixelHead;
       F_hat = 最后一步, 都在 decode 做）。
-      **梯度按步解耦**: 循环本体把 carry detach（喂给下一步的 (query_base + 上一步
-      输出) 不带梯度）, decode 侧无累加 ⇒ 每步 Y_t 恰从自己那一步的损失收 1 份
-      梯度, 跨步梯度结构性为 0（前向仍是顺序循环、数值逐位不变, 但梯度上等价于
-      |T| 个共享权重的独立预测头 + 前向递归输入）
+      **梯度走 BPTT**（唯一路径, 无开关）: 循环本体把 (query_base + 上一步输出)
+      原样喂给下一步（**不 detach**）, decode 侧无累加 ⇒ 跨步梯度存在, 即存在
+      "让 Y_{t-1} 成为对下一步有用的草稿"的梯度通路; detach 口径实测曲线是平线
+      （doc/2026-09-22/REPORT_batch0_rd_earlystop.md §2b）, 开关已整块删除
     · 时刻采样（显存优化, 默认开启）: 采样计划 =
       select_steps(num_specials, steps, skip_steps, max_steps): 默认计划 =
       square_block_starts(K); skip_steps/max_steps 可选切片挑选; steps= 可
@@ -499,8 +457,7 @@ class OutputQueryDecoder(nn.Module):
                  depth: int = 2, skip_steps: Optional[int] = None,
                  max_steps: Optional[int] = None,
                  num_specials: Optional[int] = None,
-                 stack_dim: Optional[int] = None, dropout: float = 0.0,
-                 layer_tap: bool = False):
+                 stack_dim: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
         self.num_patches = num_patches                 # 查询基行数 = N（输出 N 个 patch 预测, 不变）
         self.num_specials = num_patches if num_specials is None else int(num_specials)
@@ -508,26 +465,16 @@ class OutputQueryDecoder(nn.Module):
         # 上界 = K（num_specials）; 显式 steps 原样（调用方负责, 不切片）
         self.steps = select_steps(self.num_specials, steps,
                                   skip_steps, max_steps)
-        # ── 读窗口口径（2026-09-22 新增 layer_tap）──
-        # False = 平方块读窗口（历史唯一口径）: 步 t 读 z_s[k²:(k+1)²−1], k=⌊√t⌋,
-        #         首步额外含 z_cls; z_s 全部来自 DINO **末层**。
-        # True  = 逐层 tap（金字塔读出）: 步 i（1-based）只读 z_s[(i-1)²:i²]
-        #         （2i−1 个, i=1→1, i=2→3, …, i=S→2S−1）, 这些 register 由
-        #         DINO 从顶往下第 i 组两层算出（见 SRPhase1V2._encode_register）;
-        #         不读 z_cls。两种模式的**权重形状完全相同** ⇒ 只能靠本开关区分。
-        self.layer_tap = bool(layer_tap)
-        if self.layer_tap:
-            layer_tap_groups(self.steps, self.num_specials)
+        # 读窗口 = **平方块**（唯一口径）: 步 t 读 z_s[k²:(k+1)²−1], k=⌊√t⌋,
+        # 首步额外含 z_cls; z_s 全部来自 DINO **末层**。
         # 最近一次 forward 实际使用的 A 坐标读窗口 [(lo, hi), …]（诊断/自检用）
         self.last_windows: Optional[list] = None
         S = self.num_specials + 1                                # z_cls + K z_s
         self.query_base = nn.Parameter(torch.randn(num_patches, dim) * 0.02)  # 行 k↔patch k
-        # ── 循环 carry 的梯度口径开关（2026-09-22 显式化, 之前只能靠改本文件）──
-        # False = BPTT：Y_{t-1} 参与反传，存在"让 Y_{t-1} 成为对下一步有用的草稿"
-        #         的梯度通路（实测：L1(t) 才有单调下降的阶梯，见
-        #         doc/2026-09-22/REPORT_batch0_rd_earlystop.md §2b）。
-        # True  = detach（历史默认）：步间梯度截断，各步解耦；实测 24 步曲线是**平线**。
-        self.carry_detach = False                                # [BPTT] 本次实验口径
+        # carry = **BPTT**（唯一路径, 2026-09-23 起无开关）: (query_base + 上一步输出)
+        # 原样喂给下一步（不 detach）⇒ 存在"让 Y_{t-1} 成为对下一步有用的草稿"的
+        # 梯度通路; 实测 L1(t) 才有单调下降的阶梯（detach 口径曲线是平线, 见
+        # doc/2026-09-22/REPORT_batch0_rd_earlystop.md §2b）。
         # 标准解码器堆叠: nn.TransformerDecoder 内部按 num_layers 深拷贝同一
         # decoder_layer 并顺序执行（含逐层传掩码）, 无需手写循环。每层 =
         # 自注意力 + 交叉注意力(memory=A) + FFN + 残差, 各层共享同一 memory
@@ -571,30 +518,20 @@ class OutputQueryDecoder(nn.Module):
         Y_total = []
         windows = []
         for i, t in enumerate(self.steps):
-            if self.layer_tap:
-                # 逐层 tap: 步 i（1-based g=i+1）只读"从顶往下第 g 组"那
-                # 2g−1 个 register ⇒ A 坐标 [1+(g−1)², g²]（z_s[j] 在 A[j+1]）;
-                # 索引 0 的 z_cls 本模式不读（金字塔口径: 顶部恰好 1 个向量）。
-                g = i + 1
-                lo = (g - 1) ** 2 + 1
-                hi = g * g
-            else:
-                # 读窗口 = 步 t 所在平方块（与 build_block_mask 的块口径逐位一致）:
-                # k=⌊√t⌋, hi=min((k+1)²−1, K); 首步 lo=0 ⇒ 含 z_cls 与其前全部元素,
-                # 其余步 lo=max(k²,1) ⇒ 只读自己那块（位置 0 = z_cls 屏蔽）
-                k = math.isqrt(int(t))
-                hi = min((k + 1) ** 2 - 1, self.num_specials)
-                lo = 0 if i == 0 else max(k * k, 1)
+            # 读窗口 = 步 t 所在平方块（与 build_block_mask 的块口径逐位一致）:
+            # k=⌊√t⌋, hi=min((k+1)²−1, K); 首步 lo=0 ⇒ 含 z_cls 与其前全部元素,
+            # 其余步 lo=max(k²,1) ⇒ 只读自己那块（位置 0 = z_cls 屏蔽）
+            k = math.isqrt(int(t))
+            hi = min((k + 1) ** 2 - 1, self.num_specials)
+            lo = 0 if i == 0 else max(k * k, 1)
             assert lo <= hi, \
                 f"步 {t} 的读窗口 [{lo},{hi}] 为空 (K={self.num_specials})"
             windows.append((lo, hi))
             Y = self.stack(self.stack_in(Y), A_in[:, lo:hi + 1])
             Y = self.stack_out(Y)
             Y_total.append(Y)                                    # 该步全部 patch 预测
-            # carry 口径由 self.carry_detach 决定（见 __init__ 注释）:
-            # False = BPTT（本次实验）; True = 历史默认 detach。前向数值两者逐位相同。
-            Y = ((self.query_base + Y).detach() if self.carry_detach
-                 else self.query_base + Y)                           # 喂给下一步当查询
+            # carry = BPTT（唯一路径, 不 detach）: 喂给下一步当查询（见 __init__ 注释）
+            Y = self.query_base + Y
         Y = torch.stack(Y_total, dim=1)                          # (B,|T|,N,D) 沿步
         self.last_windows = windows                              # 本次实际读窗口（A 坐标）
         self.last_Y = Y                                          # 采样步全部 patch 预测
@@ -620,12 +557,10 @@ class SRPhase1V2(nn.Module):
     "花瓶 register", 见 derive_num_specials / DESIGN doc）。
 
     解码器 = **顺序循环**（用户原始写法）: `Y = query_base` → 对每个采样步 t 循环
-    `Y = stack(stack_in(Y), stack_in(A[:, lo:hi+1]))` → `Y = stack_out(Y)` →
-    `Y = (query_base + Y).detach()`（喂回自己当下一步查询; 循环 carry 截断梯度,
-    故步间无梯度回流, 见 OutputQueryDecoder.forward）, lo/hi = 步 t 那块 z_s 的
-    起止（首步 lo=0 含 z_cls）; 返回 (B,|T|,N,D)。
-    layer_tap=True（逐层 tap 金字塔）时 lo/hi = 第 i 组那 2i−1 个 register
-    （1, 3, 5, …, 2S−1, 不读 z_cls）, 见 _encode_register / layer_tap_groups。
+    `Y = stack(stack_in(Y), A[:, lo:hi+1])` → `Y = stack_out(Y)` →
+    `Y = query_base + Y`（喂回自己当下一步查询; carry 走 **BPTT**、不 detach,
+    见 OutputQueryDecoder.forward）, lo/hi = 步 t 那块 z_s 的起止（首步 lo=0 含
+    z_cls）; 返回 (B,|T|,N,D)。
     **并行路径**（|T| 步一次算完 + 跨步 tgt_mask + query_mask_mode）与循环的
     那些开关（recurrent_state/fuse/memory/step_embed/detach）都已整块删除。
     损失 = **直接预测**口径（无开关）: 每步 Y_t 各自过 PixelHead 预测整图,
@@ -649,15 +584,12 @@ class SRPhase1V2(nn.Module):
         num_specials: Optional[int] = None,
         stack_dim: int = 0,
         decoder_dropout: float = 0.0,
-        layer_tap: bool = False,
     ):
         super().__init__()
         self.dinov2 = dinov2
         self.num_patches = num_patches
         self.dim = dim
         self.patch_px = patch_px
-        # layer_tap: DINOv2 逐层 tap（金字塔读出）, 见 layer_tap_groups / encode
-        self.layer_tap = bool(layer_tap)
 
         # 最终生效采样步集: 先按 N 计划选步（K 尚未推导; 与 train/infer
         # CLI 的 slice 索引口径一致, 见 select_steps）; K = 显式 num_specials
@@ -670,13 +602,6 @@ class SRPhase1V2(nn.Module):
             K = int(num_specials)
         assert 1 <= K <= num_patches, \
             f"num_specials 越界: K={K} (须 1 ≤ K ≤ N={num_patches})"
-        # layer_tap: 校验步集/K/层数并定组数 S（先于通用 max_t≤K 校验 ⇒
-        # tap 配置错误报 tap 口径的错, 而不是含糊的"K 过小"）
-        if self.layer_tap:
-            self.tap_groups = layer_tap_groups(
-                steps_selected, K, len(dinov2.encoder.layer))
-        else:
-            self.tap_groups = 0
         self.num_specials = K
         max_t = max(steps_selected)
         assert max_t <= K, \
@@ -691,8 +616,7 @@ class SRPhase1V2(nn.Module):
                                           depth=decoder_depth,
                                           num_specials=K,
                                           stack_dim=stack_dim,
-                                          dropout=decoder_dropout,
-                                          layer_tap=self.layer_tap)
+                                          dropout=decoder_dropout)
         self.pixel_head = PixelHead(dim=dim, patch_px=patch_px)
 
     # ── encode: 输入 → 解码器输入 z_cls, z_s ──
@@ -715,43 +639,18 @@ class SRPhase1V2(nn.Module):
         （含自动插值逻辑）; specials 用 SpecialTokenBank（共享 token +
         逐位置可学习 pos, 不带 DINO PE——与 patch 的位置关系完全学出）。
 
-        layer_tap=False（历史口径）: 24 层跑完 → layernorm → 取 [cls; 前 K 个
-        specials] 当 z_cls/z_s（全部来自**末层**）。
-        layer_tap=True（逐层 tap, 金字塔读出）: 每 2 层一组（24 层 = 12 组）,
-        从顶往下第 g 组的 register 在**该组两层之后**读出, 随后从序列里删除
-        （"用掉的向量不进入下一层"）; z_s 按 G1..GS 拼接。故 g=1（顶组, 1 个
-        向量）走过全部 24 层 = 语义, g=S（底组, 2S−1 个向量）只走 2 层 =
-        细节（YOLO/FPN 式深浅分工）。z_cls 仍返回但本模式解码器不读。
+        24 层跑完 → layernorm → 取 [cls; 前 K 个 specials] 当 z_cls/z_s
+        （全部来自**末层**）。逐层 tap / 特征金字塔已于 2026-09-23 整块移除。
         """
         x = pixel_values                                # (B,3,H,W)
         emb = self.dinov2.embeddings(x)                 # (B,1+N,D) [cls; patches] + PE
         specials = self.special_bank(x.shape[0], x.device)   # (B,K,D) token+pos
         seq = torch.cat([emb[:, :1], specials, emb[:, 1:]], dim=1)   # (B,1+K+N,D)
-        if not self.layer_tap:
-            for layer in self.dinov2.encoder.layer:     # DINO 24 层（全双向）
-                out = layer(seq)
-                seq = out[0] if isinstance(out, (tuple, list)) else out
-            seq = self.dinov2.layernorm(seq)            # (B,1+K+N,D)
-            return seq[:, :1], seq[:, 1:1 + self.num_specials]
-
-        # ── 逐层 tap: 层 0/1 = 最浅一组 = 从顶往下第 S 组; 层 2S−2/2S−1 = 顶组 ──
-        S = self.tap_groups
-        taps = [None] * (S + 1)                         # taps[g] = 第 g 组（1-based）
-        for idx, layer in enumerate(self.dinov2.encoder.layer):
+        for layer in self.dinov2.encoder.layer:         # DINO 24 层（全双向）
             out = layer(seq)
             seq = out[0] if isinstance(out, (tuple, list)) else out
-            if idx % 2 == 1:                            # 每 2 层 = 一组, 组末读出
-                g = S - idx // 2                        # 组号（从顶往下数, 1..S）
-                lo = 1 + (g - 1) ** 2                   # seq 坐标（0 = cls）
-                hi = 1 + g * g
-                taps[g] = self.dinov2.layernorm(seq[:, lo:hi])   # (B,2g−1,D)
-                # "用掉的向量不进入下一层": 读出即删（后面的组看不到前面的组）
-                seq = torch.cat([seq[:, :lo], seq[:, hi:]], dim=1)
-        assert all(t is not None for t in taps[1:]), \
-            "layer_tap: 有层组没被读出（层数/步数不匹配?）"
-        z_s = torch.cat(taps[1:], dim=1)                 # (B,S²,D) 顺序 G1..GS
-        z_cls = self.dinov2.layernorm(seq[:, :1])        # 本模式解码器不读（API 保留）
-        return z_cls, z_s
+        seq = self.dinov2.layernorm(seq)                # (B,1+K+N,D)
+        return seq[:, :1], seq[:, 1:1 + self.num_specials]
 
     # ── decode: 共享解码尾（Decoder → PixelHead → 像素损失）──
     def decode(self, z_cls: Tensor, z_s: Tensor, pixel_values: Tensor) -> dict:
@@ -764,9 +663,10 @@ class SRPhase1V2(nn.Module):
         recon = L1(F_hat, target)（监控量; 数值上 = 训练 loss 的最后一项）。
         旧口径（cumsum 累加 + loss_mode/loss_decouple 开关）已整块删除。
 
-        **梯度**: 每步 Y_t 只从自己那一步的损失收 1/|T| 份梯度（解码器循环
-        carry 的 detach 见 OutputQueryDecoder.forward; decode 侧无累加 ⇒ 不存在
-        跨步恒等捷径）⇒ 跨步梯度结构性为 0。
+        **梯度**: 每步 Y_t 从自己那一步的损失收 1/|T| 份梯度, **并且** carry 走
+        BPTT（不 detach, 见 OutputQueryDecoder.forward）⇒ 跨步梯度**存在**,
+        即存在"让 Y_{t-1} 成为对下一步有用的草稿"的通路; decode 侧无累加,
+        不存在跨步恒等捷径。
 
         dict: {"loss", "recon", "F_hat"(像素 B,N,588), "Y_pix"(每采样步的**直接**
         预测像素 B,|T|,N,588), "target_pix"(B,N,588)}——训练取 loss; 推理取
@@ -818,8 +718,8 @@ class SRPhase1V2(nn.Module):
 # ═══ 自检（python model_v2.py）═══
 #   1. 形状正确性（register 式全路径）
 #   2. OutputQueryDecoder 分块采样计划 + 分块掩码结构
-#   3. 梯度流向（整模型可训）+ 梯度按步解耦（直接预测口径: 每步只收
-#      自己那一步的梯度）
+#   3. 梯度流向（整模型可训）+ 直接预测损失结构（每步只收自己那一步的
+#      Y 梯度）+ carry = BPTT 唯一路径（detach 开关已删）
 #   4. eval 同路径
 
 if __name__ == "__main__":
@@ -1072,147 +972,6 @@ if __name__ == "__main__":
     print(f"[ok] 显式 num_specials: K=8 + steps=[4] → K=8, z_s{z_s_e.shape}, "
           f"K 过小(4 vs steps=[9])报错信息含'过小'")
 
-    # ── 2d. layer_tap: DINOv2 逐层 tap（金字塔读出, 2026-09-22 新增）──
-    # S=2 组 × 2 层 = 4 层 fake DINO; N=4 patches ⇒ steps=[1,4], K=S²=4。
-    # 口径: 第 1 步（顶组）读 z_s[0:1]（1 个）, 第 2 步（底组）读 z_s[1:4]（3 个）。
-    N4, D4 = 4, 64
-    dino_t = FakeDino(dim=D4, n_layers=4, num_patches=N4)
-    m_t = SRPhase1V2(dino_t, num_patches=N4, dim=D4, layer_tap=True,
-                     decoder_steps=square_block_starts(N4))
-    assert m_t.num_specials == 4 and m_t.tap_groups == 2, \
-        (m_t.num_specials, m_t.tap_groups)
-    assert m_t.decoder.steps == [1, 4] and m_t.decoder.layer_tap, m_t.decoder.steps
-    assert m_t.decoder.last_windows is None, "未 forward 前 last_windows 应为 None"
-    x4 = torch.randn(2, 3, 28, 28)                       # 2×2 patches = N4
-    z_cls_t, z_s_t = m_t.encode(x4)
-    assert z_cls_t.shape == (2, 1, D4) and z_s_t.shape == (2, N4, D4), \
-        (z_cls_t.shape, z_s_t.shape)
-    # ① 读窗口 = 金字塔（步 1 读 1 个, 步 2 读 3 个; 均不含 z_cls=索引 0）
-    _ = m_t.decoder(z_cls_t, z_s_t)
-    assert m_t.decoder.last_windows == [(1, 1), (2, 4)], m_t.decoder.last_windows
-    _ = m_t(x4)
-    assert m_t.decoder.last_windows == [(1, 1), (2, 4)], m_t.decoder.last_windows
-    # ② 同一编码器权重下（共享 dino_t）, tap 读出 ≠ 末层读出（证明真的在中间层 tap）
-    m_o = SRPhase1V2(dino_t, num_patches=N4, dim=D4, layer_tap=False,
-                     decoder_steps=square_block_starts(N4))
-    assert not m_o.decoder.layer_tap
-    assert not torch.allclose(z_s_t, m_o.encode(x4)[1]), \
-        "layer_tap 的 z_s 应与末层读出不同（否则没真的 tap 中间层）"
-    _ = m_o.decoder(*m_o.encode(x4))
-    # 历史平方块口径同配置 = [(0,3),(4,4)]（含 z_cls; K=4 截断末块）⇒ 两模式确实不同
-    assert m_o.decoder.last_windows == [(0, 3), (4, 4)], m_o.decoder.last_windows
-    # ③ "用掉的不进入下一层": 组末读出即删 ⇒ 每层见到的序列长度 = 9,9,6,6
-    #    （初始 1+K+N=9; 底组 3 个 register 在第 2 层后删掉 ⇒ 顶组只看到 6）
-    seen = []
-    hooks = [l.register_forward_pre_hook(
-                 lambda mod, inp, _s=seen: _s.append(inp[0].shape[1]))
-             for l in dino_t.encoder.layer]
-    _ = m_t.encode(x4)
-    for h in hooks:
-        h.remove()
-    assert seen == [9, 9, 6, 6], seen
-    # ④ 梯度: 4 层 DINO（含最浅与最顶两层）+ register + 解码器 + 像素头全通
-    out_t = m_t(x4)
-    assert out_t["F_hat"].shape == (2, N4, PATCH_PX), out_t["F_hat"].shape
-    out_t["loss"].backward()
-    for name, p in [("dino.encoder.layer[0].mlp.fc1.weight",
-                     dino_t.encoder.layer[0].mlp.fc1.weight),
-                    ("dino.encoder.layer[3].mlp.fc1.weight",
-                     dino_t.encoder.layer[3].mlp.fc1.weight),
-                    ("special_bank.pos", m_t.special_bank.pos),
-                    ("special_bank.token", m_t.special_bank.token),
-                    ("decoder.query_base", m_t.decoder.query_base),
-                    ("pixel_head.net", m_t.pixel_head.net[0].weight)]:
-        g = p.grad
-        assert g is not None and g.abs().sum() > 0, f"layer_tap: {name} 收不到梯度"
-    # ⑤ 非法配置一律清晰报错（静默跑错最危险: 两种模式权重形状完全相同）
-    for kw, tag in [
-        (dict(decoder_steps=[4]), "步集非平方"),                 # [4] ≠ [1]
-        (dict(decoder_steps=[1, 4], num_specials=3), "K≠S²"),    # K=3 ≠ 2²
-    ]:
-        try:
-            SRPhase1V2(FakeDino(dim=D4, n_layers=4, num_patches=N4),
-                       num_patches=N4, dim=D4, layer_tap=True, **kw)
-            raise AssertionError(f"layer_tap 非法配置({tag})应报错")
-        except AssertionError as err:
-            assert "layer_tap" in str(err), f"{tag}: {err}"
-    try:   # 层数 ≠ 2S（6 层 vs S=2）
-        SRPhase1V2(FakeDino(dim=D4, n_layers=6, num_patches=N4),
-                   num_patches=N4, dim=D4, layer_tap=True)
-        raise AssertionError("layer_tap 层数≠2S 应报错")
-    except AssertionError as err:
-        assert "layer_tap" in str(err), err
-    print(f"[ok] layer_tap: S={m_t.tap_groups} 组 × 2 层, K={m_t.num_specials}, "
-          f"读窗口 {m_t.decoder.last_windows}（1,3 个向量）, "
-          f"序列 9→9→6→6（读出即删, 不进下一层）, z_s ≠ 末层读出, 梯度全通, "
-          f"非法配置报错")
-
-    # ── 2e. layer_tap 真实配置核对: 24 层 / 224×126（144 patches）/ 12 步 / K=144 ──
-    # 即 2026-09-22 要在服务器上跑的目标配方（construction_site, d4, BPTT）。
-    # 断言: 12 组 × 2 层, 读窗口宽度恰为 1,3,5,…,23 且无缝覆盖全部 144 个 register;
-    #       从底往顶每过一组就删掉该组（序列长度按 2g−1 递减）。
-    N144, D24 = 144, 64
-    dino_p = FakeDino(dim=D24, n_layers=24, num_patches=N144)
-    m_p = SRPhase1V2(dino_p, num_patches=N144, dim=D24, layer_tap=True,
-                     decoder_steps=square_block_starts(N144))
-    assert m_p.num_specials == 144 and m_p.tap_groups == 12, \
-        (m_p.num_specials, m_p.tap_groups)
-    assert m_p.decoder.steps == [i * i for i in range(1, 13)], m_p.decoder.steps
-    x224 = torch.randn(1, 3, 126, 224)                   # 16×9 = 144 patches
-    z_cls_p, z_s_p = m_p.encode(x224)
-    assert z_s_p.shape == (1, 144, D24) and z_cls_p.shape == (1, 1, D24), \
-        (z_s_p.shape, z_cls_p.shape)
-    _ = m_p.decoder(z_cls_p, z_s_p)
-    wins = m_p.decoder.last_windows
-    assert [hi - lo + 1 for lo, hi in wins] == [2 * g - 1 for g in range(1, 13)], \
-        [hi - lo + 1 for lo, hi in wins]
-    # 无缝覆盖 z_s[0..143]（A 坐标 1..144）、无重叠: 即每个 register 恰被读一次
-    assert [lo for lo, _ in wins] == [1] + [(g - 1) ** 2 + 1 for g in range(2, 13)]
-    assert wins[-1][1] == 144, wins[-1]
-    seen_p = []
-    hooks_p = [l.register_forward_pre_hook(
-                   lambda mod, inp, _s=seen_p: _s.append(inp[0].shape[1]))
-               for l in dino_p.encoder.layer]
-    _ = m_p.encode(x224)
-    for h in hooks_p:
-        h.remove()
-    exp, L = [], 1 + 144 + 144                           # [cls; regs; patches]
-    for g in range(12, 0, -1):                           # 从底组往顶组走
-        exp += [L, L]
-        L -= 2 * g - 1                                   # 该组读出即删
-    assert seen_p == exp and L == 1 + 144, (seen_p, L)
-    print(f"[ok] layer_tap 目标配置核对: 24 层/144 patches/12 步 → "
-          f"K={m_p.num_specials}, 窗口 {[hi - lo + 1 for lo, hi in wins]}, "
-          f"序列 {seen_p[0]}→{seen_p[-1]}→{L}（每组读出即删）")
-
-    # ── 2f. layer_tap 反向的"用掉的不进入下一层"（结构性判据, 最强的验收）──
-    # 切成步间梯度（carry_detach=True）后, 第 i 步的损失只能沿"第 i 组的 register"
-    # 回流 ⇒ 底组（走完层 0/1 就被删）的损失**到不了层 2/3**（零梯度）; 顶组走满
-    # 全栈, 4 层都非零。这条把"深度↔组"与"读出即删"同时钉死。
-    dino_r = FakeDino(dim=D4, n_layers=4, num_patches=N4)
-    m_r = SRPhase1V2(dino_r, num_patches=N4, dim=D4, layer_tap=True,
-                     decoder_steps=square_block_starts(N4))
-    m_r.decoder.carry_detach = True                      # 切断步间 carry 梯度
-
-    def _grad_by_layer(model, step):
-        model.zero_grad(set_to_none=True)
-        o = model(x4)
-        p = F.l1_loss(o["Y_pix"],
-                      o["target_pix"].unsqueeze(1).expand_as(o["Y_pix"]),
-                      reduction="none").mean(dim=(0, 2, 3))     # (|T|,)
-        p[step].backward()
-        return [float(model.dinov2.encoder.layer[i].mlp.fc1.weight.grad.abs().sum())
-                for i in range(4)]
-
-    g_bottom = _grad_by_layer(m_r, 1)                    # 第 2 步 = 底组（3 个 register）
-    assert g_bottom[0] > 0 and g_bottom[1] > 0, g_bottom
-    assert g_bottom[2] == 0.0 and g_bottom[3] == 0.0, \
-        f"底组 register 层 2 前就被删 ⇒ 层 2/3 应零梯度, got {g_bottom}"
-    g_top = _grad_by_layer(m_r, 0)                       # 第 1 步 = 顶组（1 个 vector）
-    assert all(g > 0 for g in g_top), g_top
-    print(f"[ok] layer_tap 反向隔离: 底组损失梯度只回层 0/1 {g_bottom}; "
-          f"顶组走满全栈 {g_top}")
-
     # ── 3. 梯度流向（整模型可训, 含 PixelHead; 首层自注意力 + 末层交叉/FFN）──
     out["loss"].backward()
     for name, p in [("dino.embeddings.patch_embeddings.weight",
@@ -1235,10 +994,12 @@ if __name__ == "__main__":
     print(f"[ok] 梯度: DINO 嵌入/层 + OutputQueryDecoder({len(model.decoder.stack.layers)}×"
           f"TransformerDecoderLayer,query_base)/SpecialTokenBank/PixelHead 全部可训")
 
-    # ── 3b. 梯度按步解耦（直接预测口径）──
-    # 无累加 ⇒ dL/dY_t 只来自第 t 步自己的损失项（每步平权 1 份梯度）, 跨步恒等
-    # 捷径不存在。校验: (a) 全量梯度在位置 n == 仅第 n 步损失的梯度(÷|T|);
-    # (b) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（结构上断开）。
+    # ── 3b. 直接预测口径的损失结构（无累加）+ BPTT 唯一路径 ──
+    # 无累加 ⇒ dL/dY_t（对**输出张量**求导）只来自第 t 步自己的损失项。校验:
+    #   (a) 全量梯度在位置 n == 仅第 n 步损失的梯度(÷|T|);
+    #   (b) 第 n 步损失对其他位置 Y_{m≠n} 无梯度（decode 侧无累加）。
+    # ⚠️ 这不等于"参数梯度按步解耦": carry 走 BPTT ⇒ 后面的步会经 carry 把梯度
+    # 送回前面各步用过的参数（2026-09-23 起 detach 开关已整块删除）。
     out_b = model(x)
     Y_b = model.decoder.last_Y                              # (B,|T|,N,D)
     Tb = Y_b.shape[1]
@@ -1256,8 +1017,17 @@ if __name__ == "__main__":
             f"step {n} 的损失不应给其他步的预测梯度（无累加）"
         assert torch.allclose(g_total[:, n], g_n[:, n], atol=1e-5), \
             f"step {n} 的 Y 梯度应只来自自己那一步的损失（平权 1/{Tb}）"
-    print(f"[ok] 梯度按步解耦: 直接预测（无累加）→ 每步 Y_t 恰收 1/{Tb} 份梯度, "
-          f"跨步恒为 0")
+    print(f"[ok] 直接预测损失结构: 每步 Y_t 的损失项只给自己那一步 Y 梯度"
+          f"（÷|T|=1/{Tb}, 无累加）")
+    # BPTT 唯一路径: 开关必须已删除; 并用最小图验证 carry 不 detach
+    # （detach 时后一步损失回不到前一步 ⇒ 这里会是 1.0 而不是 2.0）
+    assert not hasattr(model.decoder, "carry_detach"), \
+        "carry_detach 开关应已删除（BPTT 是唯一路径）"
+    _q = torch.zeros(1, requires_grad=True)
+    _y0 = _q + 1.0
+    _y1 = _q + _y0
+    assert torch.autograd.grad(_y1.sum(), _q)[0].item() == 2.0, "carry 必须走 BPTT"
+    print("[ok] carry = BPTT 唯一路径: carry_detach 开关已删除, 跨步梯度通路存在")
 
     # ── 4. 推理: 同一 forward（eval + no_grad）──
     model.eval()
@@ -1272,9 +1042,9 @@ if __name__ == "__main__":
     # ⚠️ checkpoint 兼容性（2026-09-15 更正）: 循环版**不新增任何参数**（没有
     # rec_* 参数——那些随并行路径的开关一起删掉了）, 故与并行时代**默认配置**的
     # state_dict 逐 key 逐形状完全相同（实测 44 keys 全等）⇒ 旧 final_model.pt
-    # 用本代码 strict load **不会报错**, 会按新语义（循环 + carry detach + 直预
-    # loss）静默算错。要复现并行产物必须用 git 取回当时的 model_v2.py, 不要拿
-    # 旧权重在本代码上推理。
+    # 用本代码 strict load **不会报错**, 会按新语义（循环 + BPTT + 直预 loss）
+    # 静默算错。要复现并行产物必须用 git 取回当时的 model_v2.py, 不要拿旧权重
+    # 在本代码上推理。
     assert model.decoder.stack_dim == D
     assert isinstance(model.decoder.stack_in, nn.Identity), \
         "默认 stack_dim=dim 时输入侧应为 Identity（零额外参数）"

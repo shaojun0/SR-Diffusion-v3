@@ -12,7 +12,7 @@
 #   · 896×504 ⇒ patches 64×36 = **2304**; slice[0:12] ⇒ 12 步 [1,4,…,144],
 #     K = derive_num_specials = min((12+1)²−1, N) = **168**（序列 1+168+2304 = 2473）
 #   · 40 epoch = 8,760 优化步（全局 batch 32）, lr 1.5e-4 cosine + warmup 262 步（3%）, seed 42
-#   · carry: **BPTT**（carry_detach=False, 仓库当前默认）; 平方块读窗口; layer_tap 关
+#   · carry: **BPTT**（唯一路径, 2026-09-23 起 detach 开关已移除）; 平方块读窗口（layer_tap 已于 2026-09-23 移除）
 #   · 损失: 直接预测 mean_t L1(PixelHead(Y_t), target)
 #   · 精度: **fp16 混合精度**（autocast + GradScaler; 权重/final_model.pt 仍 fp32）
 #   · 优化器: **bitsandbytes AdamW8bit**（`--optim adamw_bnb_8bit`）

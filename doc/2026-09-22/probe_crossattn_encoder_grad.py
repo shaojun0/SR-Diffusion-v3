@@ -279,6 +279,11 @@ def main():
     model = SRPhase1V2(dino, num_patches=N, dim=D, heads=args.heads,
                        decoder_steps=steps, decoder_depth=args.dec_depth,
                        mlp_ratio=2.0, patch_px=3 * EP * EP)
+    if not hasattr(model.decoder, "carry_detach"):
+        raise SystemExit(
+            "2026-09-23: model_v2 已删除 carry_detach 开关（carry = BPTT 唯一路径）"
+            " ⇒ 本探针『只差 carry_detach 一个开关』的对照无法再跑; 需要复现请 "
+            "git checkout 当时 commit 的 model_v2.py（本文件作为历史口径保留）")
     model.decoder.carry_detach = True                     # A 相 = 单步口径
     model.decoder.steps = [steps[-1]]                     # 单步 + 全读
     optA = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)

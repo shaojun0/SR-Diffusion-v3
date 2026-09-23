@@ -63,7 +63,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out_dir", default="/root/autodl-tmp/srres/out")
     ap.add_argument("--report", default="/root/autodl-tmp/srres/out/sweep_res_report.md")
-    ap.add_argument("--arms", default="bptt,detach")
+    ap.add_argument("--arms", default="bptt")
     args = ap.parse_args()
     arms = [a for a in args.arms.split(",") if a]
 

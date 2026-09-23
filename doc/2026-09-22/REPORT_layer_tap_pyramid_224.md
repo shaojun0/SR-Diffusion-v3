@@ -1,3 +1,5 @@
+> ⚠️ **2026-09-23 归档说明**: 本文记录的「逐层 tap / 特征金字塔」已**整块从 `main` 移除**（用户口径: main 只保留主线目标, 实验性分支不进主线）。本文只作历史存档; 相关代码与脚本（`model_v2.py` / `train_v2.py` / `infer_v2_test.py` / `tools/*_tap*`）已删除, 要复现请 `git checkout` 2026-09-22 当时的 commit。
+
 # REPORT — DINOv2 逐层 tap（金字塔读出）实测: 绝对质量输 0.80 dB, 但曲线从「平线」变成真有斜率（2026-09-22）
 
 > 设计/口径：[`DESIGN_layer_tap_pyramid.md`](DESIGN_layer_tap_pyramid.md)（用户四问四答定稿）

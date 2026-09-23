@@ -113,6 +113,7 @@ import os
 import numpy as np
 import torch
 from transformers import Dinov2Model, Trainer, TrainingArguments
+from transformers import TrainerCallback
 from transformers.trainer_utils import set_seed
 
 from data_v2 import ParquetImageDataset, V2Collator
@@ -176,15 +177,16 @@ def parse_args():
                         "nhead(--heads) 须整除 stack_dim")
     p.add_argument("--decoder_dropout", type=float, default=0.0,
                    help="self.stack(nn.TransformerDecoderLayer) 的 dropout, 默认 0.0")
-    p.add_argument("--layer_tap", action="store_true",
-                   help="DINOv2 逐层 tap（金字塔读出, 2026-09-22）: 24 层按每 2 层"
-                        "一组分成 S 组（= 采样步数, 须有 2S 层）, 从顶往下第 g 组"
-                        "在该组两层之后读出 2g−1 个 register（1,3,5,…,2S−1, 合计 "
-                        "S²=K）并从序列里删除（'用掉的不进入下一层'）; 解码器第 i "
-                        "步只读第 i 组 ⇒ 顶部少向量走满全栈（语义）/底部多向量只"
-                        "走 2 层（细节）。须 steps=[1,4,…,S²] 且 K=S²（如 224×126 "
-                        "→ N=144, S=12, K=144）。与默认模式**权重形状相同**, 故"
-                        "训练侧写入 model_info.json、推理侧自动对齐。默认关")
+    p.add_argument("--warm_steps", type=int, default=0,
+                   help="A 相（单步全读热启动）的优化步数, 0=关（历史口径）。前 "
+                        "warm_steps 个优化步把 decoder.steps 设成 [K]（**只跑 1 步、"
+                        "一次读完全部 z_s + z_cls**）, 到点自动切回真采样步集跑多步"
+                        "循环。动机（实测）: 多步循环的早期步只读到 2k+1 个 token, "
+                        "其条件最优解接近'预测均值'; 从零直接训多步会停在糊区, 而单步"
+                        "全读没有这个内部冲突、梯度明确指向锐。224² 实测 A 相要 "
+                        "1500~2000 步才逃出平凡解（A=1000→3000 使 16 步曲线从平线变"
+                        "单调降, 最优 PSNR +4.43 dB）, 见 "
+                        "doc/2026-09-23/REPORT_224_A3000_verdict.md")
     # ── 模型（解码器 = 顺序循环, 2026-09-15 起唯一路径）──
     # 并行路径的 --recurrent* / --query_mask_mode 开关已随之删除。
     # 损失口径的唯一性: 每步 Y 各自直接预测像素（无累加）⇒ 无 --loss_* 开关
@@ -255,6 +257,36 @@ class SRPhase1V2Trainer(Trainer):
                                        ignore_keys=ignore_keys)
 
 
+class WarmStartSwitchCallback(TrainerCallback):
+    """A 相（单步 + 全读热启动）→ B 相（真采样步集）的自动切换（--warm_steps）。
+
+    用户口径 2026-09-23: 多步循环的早期步只读 2k+1 个 token, 条件最优解接近
+    "预测均值"; 从零直接训多步会停在该平凡解（曲线平）。A 相是**单步、一次读完全部
+    z_s + z_cls**, 信息全给、不能靠输出常量交差, 梯度明确指向"锐"。224²/旧 224 臂
+    实测: A=1000（未逃逸）时 B 相 5000 步只降 3.3 L1; A=3000（已逃逸）时降 19.7 L1,
+    曲线由平变单调降。见 doc/2026-09-23/REPORT_224_A3000_verdict.md。
+
+    实现: 只改 `decoder.steps`（前 warm_steps 个优化步 = [K] 单步全读）, 到点切回。
+    持有点是**未包装的裸模型**（DDP 下 ddp.module 即该对象）⇒ 多卡同样生效。
+    """
+
+    def __init__(self, raw_model, full_steps, warm_steps, single_steps):
+        super().__init__()
+        self.raw = raw_model
+        self.full_steps = list(full_steps)
+        self.warm_steps = int(warm_steps)
+        self.single_steps = list(single_steps)
+        self.switched = False
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.switched or state.global_step < self.warm_steps:
+            return
+        self.raw.decoder.steps = list(self.full_steps)
+        self.switched = True
+        print(f"[warm] A 相结束（{self.warm_steps} 步单步全读）→ B 相切回 "
+              f"{len(self.full_steps)} 步真轨迹 {self.full_steps}", flush=True)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -305,8 +337,7 @@ def main():
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout,
-                       layer_tap=args.layer_tap)
+                       decoder_dropout=args.decoder_dropout)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -322,20 +353,11 @@ def main():
               f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
     print(f"[model] 采样计划切片: slice_start={args.slice_start} "
           f"slice_end={args.slice_end}（只监督切片内中段采样步）")
-    if model.layer_tap:
-        print(f"[model] layer_tap=ON: DINOv2 逐层 tap（金字塔读出）— "
-              f"{len(dino.encoder.layer)} 层 = {model.tap_groups} 组 × 2 层, "
-              f"从顶往下第 g 组 {2 * model.tap_groups - 1} … 1 个 register（宽 "
-              f"1,3,…,{2 * model.tap_groups - 1}）, 读出即删（不进下一层）; "
-              f"读窗口见 OutputQueryDecoder.forward")
-    else:
-        print("[model] layer_tap=OFF: z_s 全部来自 DINOv2 末层（历史口径）")
     print(f"[model] self.stack: d_model={model.decoder.stack_dim} "
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
           f"{'  ← 加宽: 前后 Linear 投影' if model.decoder.stack_dim != dino.config.hidden_size else '  (未加宽)'}")
-    _carry = ("detach（步间梯度截断）" if getattr(model.decoder, "carry_detach", False)
-              else "BPTT（不 detach, 循环 carry 反传）")
+    _carry = "BPTT（不 detach, 循环 carry 反传; 2026-09-23 起唯一路径）"
     print(f"[model] 解码器: 顺序循环（唯一路径）| 每步只读自己那块 z_s 切片, "
           f"上一步输出以 **{_carry}** 喂回当下一步查询 ⇒ wall-clock "
           f"长于旧并行路径（以时间换跨步信息流）")
@@ -344,6 +366,16 @@ def main():
           " | F_hat = 最后一步的直接预测, recon = 其 L1 (= loss 最后一项)")
     print(f"[train] 精度: {'fp16 混合精度（autocast+GradScaler, 权重 fp32）' if args.fp16 else '纯 fp32（不套 autocast）'}"
           f" | 优化器: {args.optim or '库默认（不传 optim）'}")
+
+    # ── A 相（单步 + 全读热启动, --warm_steps）: 见该 arg 的 help ──
+    full_steps = list(model.decoder.steps)
+    single_steps = [model.num_specials]     # 首步 lo=0 ⇒ 一次读完 z_s 全部(+z_cls)
+    if args.warm_steps < 0:
+        raise SystemExit("--warm_steps 不能为负")
+    if args.warm_steps > 0:
+        model.decoder.steps = list(single_steps)
+        print(f"[warm] A 相开: 前 {args.warm_steps} 个优化步 decoder.steps="
+              f"{single_steps}（单步 + 全读）; 到点切回 {len(full_steps)} 步真轨迹")
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as f:
@@ -398,6 +430,9 @@ def main():
         data_collator=coll,
         compute_metrics=compute_metrics if eval_ds is not None else None,
     )
+    if args.warm_steps > 0:
+        trainer.add_callback(WarmStartSwitchCallback(
+            model, full_steps, args.warm_steps, single_steps))
 
     n_proc = trainer.accelerator.num_processes
     trainer.accelerator.print(
@@ -429,8 +464,7 @@ def main():
                 "decoder_dropout": args.decoder_dropout,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
                 "decoder_steps": raw.decoder.steps,
-                "layer_tap": bool(raw.layer_tap),
-                "tap_groups": int(getattr(raw, "tap_groups", 0)),
+                "warm_steps": int(args.warm_steps),
                 "loss": "mean_t L1(PixelHead(Y_t), target)（直接预测, 无累加）",
                 "target": "pixel_values (归一化空间, PixelHead 解码)",
                 "dino_dir": args.dino_dir, "dtype": "fp32"}

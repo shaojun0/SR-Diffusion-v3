@@ -44,8 +44,7 @@ def build(out_dir, dino_dir):
                    decoder_depth=info["decoder_depth"],
                    num_specials=info["num_specials"],
                    stack_dim=int(info.get("stack_dim") or 0),
-                   decoder_dropout=float(info.get("decoder_dropout") or 0.0),
-                   layer_tap=bool(info.get("layer_tap", False)))
+                   decoder_dropout=float(info.get("decoder_dropout") or 0.0))
     sd = torch.load(os.path.join(out_dir, "final_model.pt"), map_location="cpu")
     m.load_state_dict(sd)
     return m, info
@@ -87,7 +86,7 @@ def main():
     print(f"[cfg] {a.out_dir}")
     print(f"      input={W}x{H} N={info['num_patches']} K={info['num_specials']} "
           f"steps={len(steps)} depth={info['decoder_depth']} "
-          f"layer_tap={info.get('layer_tap')} n_img={B}")
+          f"K={info.get('num_specials')} n_img={B}")
     print(f"{'t':>6} {'tokens':>7} {'L1_t(GT)':>9} {'|img_t-img_last|':>18} "
           f"{'|img_t-img_t-1|':>17}")
     for i, t in enumerate(steps):
