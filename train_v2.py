@@ -117,7 +117,7 @@ from transformers import TrainerCallback
 from transformers.trainer_utils import set_seed
 
 from data_v2 import ParquetImageDataset, V2Collator
-from model_v2 import SRPhase1V2
+from model_v2 import SRPhase1V2, fixed_block_starts
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -199,6 +199,14 @@ def parse_args():
     p.add_argument("--decoder_steps", default=None,
                    help="解码器采样时刻列表(逗号分隔), 默认 square_block_starts(N) "
                         "(分块起点=平方数) 再按 slice 切片; K 自动由最终步集推导")
+    # ── 模型（读窗口计划: square=平方块历史口径 / fixed=自然数步值+固定宽度块）──
+    p.add_argument("--step_plan", default="square", choices=["square", "fixed"],
+                   help="解码器读窗口计划: square=步值 k²（历史唯一口径, 默认）; "
+                        "fixed=步值自然数 1..⌈N/block⌉、每步固定读 block 个 z_s "
+                        "（2026-09-23 res-sweep 的 fixw4 口径, K=N; 见 "
+                        "doc/2026-09-23/REPORT_fixw4_plan.md）")
+    p.add_argument("--block", type=int, default=0,
+                   help="--step_plan fixed 时每步读的 z_s 个数（如 4）; square 忽略")
     return p.parse_args()
 
 
@@ -308,6 +316,18 @@ def main():
         assert steps and all(0 <= s <= num_patches for s in steps), \
             f"decoder_steps 越界: {steps} (N={num_patches})"
 
+    # fixed 计划: 步集 = 自然数 1..⌈N/block⌉（K=N, 见 model_v2.fixed_block_starts）,
+    # 再按 slice 切片; square 计划仍交给模型内部 select_steps（square_block_starts
+    # + slice）。注意 select_steps 只认 square 基表, 故 fixed 必须在此显式算好传入。
+    if steps is None and args.step_plan == "fixed":
+        assert args.block >= 1, "--step_plan fixed 必须给 --block ≥1"
+        base = fixed_block_starts(num_patches, args.block)
+        lo = 0 if args.slice_start is None else int(args.slice_start)
+        hi = len(base) if args.slice_end is None else int(args.slice_end)
+        assert 0 <= lo < hi <= len(base), \
+            f"slice 越界: [{lo}:{hi}] of {len(base)} 个 fixed 步"
+        steps = base[lo:hi]
+
     # ── 数据（纯重建模式, tokenizer=None; data_v2.py 已提供）──
     train_files = sorted(glob.glob(os.path.join(args.data_dir, "train-*.parquet")))
     test_files = sorted(glob.glob(os.path.join(args.data_dir, "test-*.parquet")))
@@ -337,22 +357,28 @@ def main():
                        max_steps=args.slice_end,
                        num_specials=(args.num_specials or None),
                        stack_dim=args.stack_dim,
-                       decoder_dropout=args.decoder_dropout)
+                       decoder_dropout=args.decoder_dropout,
+                       step_plan=args.step_plan, block=args.block)
 
     K = model.num_specials
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _steps_brief = (str(model.decoder.steps) if len(model.decoder.steps) <= 12
+                    else f"{model.decoder.steps[:4]}...+{model.decoder.steps[-2:]}"
+                         f" (共 {len(model.decoder.steps)})")
     print(f"[model] 可训练参数 {n_train / 1e6:.1f}M (含 DINOv2-large, 不冻结); "
           f"输入 {W}x{H}, patches={num_patches}, specials={K} "
           f"(序列 {1 + K + num_patches} token), decoder 采样 "
-          f"{len(model.decoder.steps)} 步 {model.decoder.steps}")
+          f"{len(model.decoder.steps)} 步 {_steps_brief}")
     if args.num_specials:
         print(f"[model] num_specials 显式 = {K}（须 ≥ max 采样步; "
               f"复现旧 checkpoint 用, 如 K=N={num_patches}）")
     else:
         print(f"[model] num_specials 自动推导 = {K} "
-              f"(K = derive_num_specials(N, 最终采样步集), 无花瓶 register)")
-    print(f"[model] 采样计划切片: slice_start={args.slice_start} "
-          f"slice_end={args.slice_end}（只监督切片内中段采样步）")
+              f"({'fixed 计划 ⇒ K=N' if args.step_plan == 'fixed' else 'K = derive_num_specials(N, 最终采样步集)'}, 无花瓶 register)")
+    print(f"[model] 读窗口计划: step_plan={args.step_plan}"
+          + (f" block={args.block}" if args.step_plan == "fixed" else "")
+          + f" | slice_start={args.slice_start} slice_end={args.slice_end}"
+          f" | |T|={len(model.decoder.steps)}")
     print(f"[model] self.stack: d_model={model.decoder.stack_dim} "
           f"(模型 dim={dino.config.hidden_size}), heads={args.heads}, "
           f"depth={args.decoder_depth}, dropout={args.decoder_dropout}"
@@ -383,8 +409,13 @@ def main():
 
     # ── Trainer: 训练循环/梯度累积/调度/checkpoint/分布式全部交给它 ──
     n_proc = int(os.environ.get("WORLD_SIZE", "1"))      # accelerate/DDP 进程数
-    steps_per_epoch = max(1, len(train_ds) // (args.batch_size * n_proc))
-    total_steps = args.max_steps or steps_per_epoch * args.epochs
+    micro_per_epoch = max(1, len(train_ds) // (args.batch_size * n_proc))
+    # Trainer 的**优化步** = 微批步 // grad_accum（warmup/cosine 调度器都按优化步数走,
+    # 见 TrainingArguments.warmup_steps 语义）; grad_accum=1 时与历史逐位一致。
+    if args.max_steps > 0:
+        total_steps = int(args.max_steps)                      # 冒烟: 直接给优化步
+    else:
+        total_steps = max(1, micro_per_epoch * args.epochs // args.grad_accum)
     warmup_steps = int(total_steps * args.warmup_ratio)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -437,8 +468,11 @@ def main():
     n_proc = trainer.accelerator.num_processes
     trainer.accelerator.print(
         f"[train] {len(train_ds)} 样本 | 每卡 bs={args.batch_size} "
-        f"x {n_proc} 卡 | grad_accum={args.grad_accum} | "
-        f"~{steps_per_epoch} 步/epoch x {args.epochs} = {total_steps} 步 "
+        f"x {n_proc} 卡 | grad_accum={args.grad_accum} "
+        f"⇒ 全局 batch {args.batch_size * n_proc * args.grad_accum} | "
+        f"~{micro_per_epoch} 微批/epoch（优化步/epoch ≈ "
+        f"{max(1, micro_per_epoch // args.grad_accum)}）"
+        f" x {args.epochs} epoch = {total_steps} 优化步 "
         f"| warmup {warmup_steps} 步 "
         f"| 实际优化器={training_args.optim} fp16={training_args.fp16} "
         f"(真实优化步按 Trainer 口径, 与 grad_accum 有关)")
@@ -463,6 +497,7 @@ def main():
                 "stack_dim": int(raw.decoder.stack_dim),
                 "decoder_dropout": args.decoder_dropout,
                 "slice_start": args.slice_start, "slice_end": args.slice_end,
+                "step_plan": args.step_plan, "block": args.block,
                 "decoder_steps": raw.decoder.steps,
                 "warm_steps": int(args.warm_steps),
                 "loss": "mean_t L1(PixelHead(Y_t), target)（直接预测, 无累加）",

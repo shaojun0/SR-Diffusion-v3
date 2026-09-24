@@ -53,7 +53,7 @@ from torch.utils.data import DataLoader
 from transformers import Dinov2Model
 
 from data_v2 import ParquetImageDataset, V2Collator, DINO_MEAN, DINO_STD
-from model_v2 import SRPhase1V2, patches_to_image
+from model_v2 import SRPhase1V2, patches_to_image, step_windows
 
 
 def parse_args():
@@ -86,6 +86,12 @@ def parse_args():
                    help="可选挑选分块终点索引(与训练 --slice_end 一致); 默认 None = 全部分块")
     p.add_argument("--decoder_steps", default=None,
                    help="必须与训练一致(逗号分隔); 默认 square_block_starts(N) (分块起点=平方数)")
+    p.add_argument("--step_plan", default="square", choices=["square", "fixed"],
+                   help="解码器读窗口计划(必须与训练一致): square=步值 k²（历史口径）; "
+                        "fixed=步值自然数、每步固定读 block 个 z_s（2026-09-23 fixw4 口径）。"
+                        "model_info.json 有 step_plan 字段时以它为准")
+    p.add_argument("--block", type=int, default=0,
+                   help="--step_plan fixed 时每步读的 z_s 个数(必须与训练一致)")
     # ── 2026-09-22 新增: 论文口径指标（PLAN_paper_experiments.md §3 批 0）──
     p.add_argument("--no_ms_ssim", action="store_true",
                    help="跳过 MS-SSIM（自实现, 5 尺度 Gaussian/Y 通道）; 默认算")
@@ -235,6 +241,12 @@ def main():
     slice_end = _pick("slice_end", args.slice_end, None)
     stack_dim = int(_pick("stack_dim", args.stack_dim, 0))
     decoder_dropout = float(_pick("decoder_dropout", args.decoder_dropout, 0.0))
+    # 读窗口计划: fixw4 产物必须回放 step_plan=fixed + block, 否则 step_windows
+    # 会按 square 公式解释 [1..144] 的步值 ⇒ 静默读错窗口、指标全错。
+    step_plan = _pick("step_plan", args.step_plan, "square")
+    block = int(_pick("block", args.block, 0))
+    if step_plan == "fixed" and block < 1:
+        raise SystemExit("step_plan=fixed 需要 block ≥1（model_info.json 或 --block）")
     if steps is None and train_info is not None and "decoder_steps" in train_info:
         steps = [int(s) for s in train_info["decoder_steps"]]
     # num_specials(K) 解析: ① model_info.json 优先; ② --num_specials CLI;
@@ -278,7 +290,8 @@ def main():
                        max_steps=slice_end,
                        num_specials=num_specials,
                        stack_dim=stack_dim,
-                       decoder_dropout=decoder_dropout)
+                       decoder_dropout=decoder_dropout,
+                       step_plan=step_plan, block=block)
     sd = torch.load(args.final_model, map_location="cpu")
     missing, unexpected = model.load_state_dict(sd, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
@@ -286,7 +299,8 @@ def main():
     T_steps = model.decoder.steps
     print(f"[model] loaded {args.final_model}: N={num_patches}, "
           f"K(num_specials)={model.num_specials}, "
-          f"decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
+          f"plan={step_plan}" + (f"(block={block})" if step_plan == "fixed" else "")
+          + f", decoder 采样 {len(T_steps)} 步 {T_steps[:6]}...{T_steps[-3:]}")
 
     # ── model_info.json 对齐提示（加载后完整对比, 不强制）──
     if train_info is not None:
@@ -458,6 +472,13 @@ def main():
     # 逐层 tap 已于 2026-09-23 从 main 移除）⇒ 偏移恒为 1; 这决定 bpp 轴。
     TOK_OFF = 1
     bpp_of = lambda t: (t + TOK_OFF) * D_DIM * 1.0 / PX   # β=1 bit/dim 估计
+    # 实际累计读入（2026-09-24）: 步 t 读 A[:, lo:hi] ⇒ 累计列数 = hi+1（含 z_cls）。
+    # square 计划下 = (k+1)²; fixed 计划下 = min(k·block, K)。fixed 的**名义** t+1
+    # 比实际小 ~block 倍 ⇒ 画 RD 必须用 bpp_actual（见 REPORT_fixw4_plan.md §5.5）。
+    _wins = step_windows(model.num_specials, T_steps, step_plan, block)
+    win = [hi - lo + 1 for lo, hi in _wins]
+    cum_read = [hi + 1 for _, hi in _wins]
+    bpp_actual_of = lambda c: c * D_DIM * 1.0 / PX
 
     print(f"\n[full] 全量重建像素 L1 (归一化空间) = {norm_mean:.6f}")
     print(f"[full] 全量重建像素 L1 (0-255 空间) = {pix_mean:.2f} ± {pix_std:.2f}")
@@ -470,13 +491,16 @@ def main():
     print(f"       ⚠️ 最左端 (t=1) 的全画布 PSNR={step_psnr[0]:.2f} dB 必须显著高于 "
           f"{triv_psnr:.2f} dB 才算真重建, 否则曲线左端是 padding 撑的")
     print(f"       参照(旧实验): 全图平均色≈61, 每patch平均色≈?, 质心基线见 pixel_recon_check")
-    print(f"\n[steps] 渐进曲线 ({len(T_steps)} 步, 0-255; "
-          f"tokens = t+{TOK_OFF}, bpp = (t+{TOK_OFF})·{D_DIM}/{PX} @β=1):")
-    print(f"    {'t':>4}{'tokens':>8}{'bpp':>8}{'L1':>9}{'PSNR':>8}{'MS-SSIM':>9}"
+    print(f"\n[steps] 渐进曲线 ({len(T_steps)} 步, 0-255; plan={step_plan}"
+          + (f"(block={block})" if step_plan == "fixed" else "")
+          + f"; bppN = 名义 (t+{TOK_OFF})·{D_DIM}/{PX} @β=1, "
+          f"bppA = 实际累计读入·{D_DIM}/{PX}（fixed 计划必须看 bppA）):")
+    print(f"    {'t':>4}{'read':>6}{'bppN':>7}{'bppA':>7}{'L1':>9}{'PSNR':>8}{'MS-SSIM':>9}"
           f"{'L1内容区':>10}{'PSNR内容区':>11}")
     for i, t in enumerate(T_steps):
-        print(f"    {t:>4}{t + TOK_OFF:>8}{bpp_of(t):>8.3f}{step_pix_mean[i]:>9.3f}"
-              f"{step_psnr[i]:>8.2f}{step_ssim[i]:>9.4f}"
+        print(f"    {t:>4}{cum_read[i]:>6}{bpp_of(t):>7.3f}"
+              f"{bpp_actual_of(cum_read[i]):>7.3f}"
+              f"{step_pix_mean[i]:>9.3f}{step_psnr[i]:>8.2f}{step_ssim[i]:>9.4f}"
               f"{step_l1_c[i]:>10.3f}{step_psnr_c[i]:>11.2f}")
     head = step_pix_mean[:min(4, len(step_pix_mean))]
     tail = step_pix_mean[max(0, len(step_pix_mean) - 4):]
@@ -517,11 +541,17 @@ def main():
         "bpp_px": int(PX),
         "step_bpp_beta1": [float(bpp_of(t)) for t in T_steps],
         "step_tokens": [int(t + TOK_OFF) for t in T_steps],
+        # ── 2026-09-24 新增: fixed 计划的实际读窗口/累计读入（bpp_actual）──
+        "step_plan": step_plan, "block": int(block),
+        "step_win": [int(v) for v in win],
+        "step_cum_read": [int(v) for v in cum_read],
+        "step_bpp_actual_beta1": [float(bpp_actual_of(c)) for c in cum_read],
         "canvas_fill": [0, 0, 0],
         "metrics_note": ("PSNR = 10log10(255^2/mean_MSE) 由平均 MSE 反算（压缩界标准口径）；"
-                         "step_psnr_img_mean = 逐图 PSNR 的均值。bpp 为估计值 "
-                         "(t+tok_off)·D·β/(H·W)（tok_off = 1, 平方块口径首步含 z_cls），"
-                         "未量化/熵编码，真实 bpp 见 PLAN §4 E3。"
+                         "step_psnr_img_mean = 逐图 PSNR 的均值。step_bpp_beta1 为**名义**估计 "
+                         "(t+tok_off)·D·β/(H·W)（tok_off = 1）；step_bpp_actual_beta1 为**实际**"
+                         "累计读入 hi+1 列（fixed 计划下名义值小 ~block 倍，画 RD 用 actual），"
+                         "均未量化/熵编码，真实 bpp 见 PLAN §4 E3。"
                          "内容区口径用 content_mask 剔除 letterbox padding。"),
     }
     if do_per_image:
