@@ -81,7 +81,11 @@ python infer_v2_test.py --data_dir /root/autodl-tmp/construction_site \
 
 ### 3.1 进行中
 
-- **★ 448×252 主线 `warm_steps` + 「固定4」采样计划（2026-09-24 起，进行中）** —— 在**工地数据集**上跑主线的两相配方：`--step_plan fixed --block 4`（\|T\|=144 步、K=N=576）+ `--warm_steps 3504`（A 相 16 epoch 单步全读）+ B 相 40 epoch，纯 fp32 / 全局 bs32 / 2×RTX PRO 6000 96GB。**唯一变量** = 采样计划 + A 相热启动（对照历史主线臂 `output/phase1_v2_bptt`）。运行卡（含显存实测：B 相 bs4 = 75.2 GB、bs8 OOM；预计 ≈20 h）见工作区 `SRDIFF_448_warm_fixw4_RUN.md`；脚本 `tools/run_448_main_warm_fixw4.sh`。⚠️ 结论**未出**，勿引用中途数字。
+- **（当前无在跑实验）** 最近一次（2026-09-26/27 六源多分辨率微调）已收工，见下。
+
+- **★ 多分辨率版 MultiResSR：六源自然图像微调（2026-09-26/27，已跑完）** —— 新实例 2×RTX 4080S 32G：编码器**不设最大尺寸**（原生尺寸 + 长边 1280 + 面积分桶）、**解码 token 固定 144（square 12 步 0~11）**、**4 个解码器** 448×252 / 252×448 / 224×224 / 448×448、L1 权重按「原图最适配分辨率」给 **2/5 + 其余各 1/5**；数据 = ImageNet val 50k + COCO2017 train 118k + Vimeo-90k 91,701 + DIV2K 800 + Flickr2K 2,650 + OpenImages 15,000 = **278,151**。1 epoch / **40,242 步 / 12h33m** / bf16 + 编码器&解码器双梯度检查点 / 峰值 **23.52 GiB**（显存够；不用解码器检查点时最大桶 bs=4 OOM）。**逐 step 精炼 = 有但极度前置**：COCO2017 **val** 留出 5,000 张上 best-fit 像素 L1 **31.25 → 26.10 px**（单调、嵌套码），但**前 6 步已拿 91.7% 降幅**、第 7→11 步多花 **80 token（+127% 码率）只买到 0.20 px**、第 12 步 **+0.01 px 过冲**、早停 oracle 仅 **0.050 px** ⇒ [`doc/2026-09-26/RUN_multires_natural.md`](doc/2026-09-26/RUN_multires_natural.md)。⚠️ **边界**：留出集与训练**同域**（COCO train vs val），与历史 `construction_site` 的 16.42 px **不同域、不同 K、不同分辨率集合，不可直接比**。
+
+- **★ 448×252 主线 `warm_steps` + 「固定4」采样计划（2026-09-24，**已完结：负结果**）** —— 在**工地数据集**上跑两相配方：`--step_plan fixed --block 4`（\|T\|=144 步、K=N=576）+ `--warm_steps 3504`（A 相 16 epoch 单步全读）+ B 相 40 epoch，纯 fp32 / 全局 bs32 / 2×RTX PRO 6000 96GB。**结论（2026-09-25 定稿）**：A 相健康（eval 0.377→0.367）但 **step 3504 硬切到 144 步固定窗口时崩溃** —— loss 尖峰 11.36 / grad_norm 132，随后**梯度消失**（~3e-3）、eval 冻结 1.138、推理 **144 步输出逐 step 相同**（L1 恒 65.59）⇒ [`doc/2026-09-24/REPORT_448_warm_fixw4.md`](doc/2026-09-24/REPORT_448_warm_fixw4.md)；机制见 [`doc/2026-09-23/REPORT_fixw4_plan.md`](doc/2026-09-23/REPORT_fixw4_plan.md)（"窗口不增长"）。
 
 ### 3.2 已判决的主线结论（按主题）
 
